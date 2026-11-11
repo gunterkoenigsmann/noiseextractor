@@ -13,6 +13,9 @@
 //! noiseextractor-cli spectrogram in.flac --project p.json -o view.png
 //! ```
 
+// Every item, public or private, carries a doc comment (project rule).
+#![warn(missing_docs, clippy::missing_docs_in_private_items)]
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use noiseextractor_core::analysis::Selection;
@@ -29,9 +32,14 @@ use std::sync::Arc;
 
 /// Command-line arguments.
 #[derive(Parser)]
-#[command(name = "noiseextractor-cli", version, about = "Suppress or extract noises in audio files using noiseextractor projects")]
+#[command(
+    name = "noiseextractor-cli",
+    version,
+    about = "Suppress or extract noises in audio files using noiseextractor projects"
+)]
 struct Cli {
     #[command(subcommand)]
+    /// The subcommand to run.
     command: Command,
     /// Worker threads (default: number of CPU cores).
     #[arg(long, global = true)]
@@ -149,7 +157,9 @@ fn main() {
 
 /// Executes the chosen subcommand.
 fn run(cli: Cli) -> Result<()> {
-    let threads = cli.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let threads = cli
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     anyhow::ensure!(cli.chunk_frames >= 1, "--chunk-frames must be at least 1");
     match cli.command {
         Command::Process { input, project, output } => {
@@ -161,10 +171,19 @@ fn run(cli: Cli) -> Result<()> {
             project.prepare(&audio);
             write_processed(&audio, &project, cli.chunk_frames, threads, &output)
         }
-        Command::Denoise { input, output, reduction_db, rule, noise_from, save_project } => {
+        Command::Denoise {
+            input,
+            output,
+            reduction_db,
+            rule,
+            noise_from,
+            save_project,
+        } => {
             let audio = load(&input)?;
             let mut project = Project::default();
-            let FilterKind::NoiseReduction(nr) = &mut project.filters[0].kind else { unreachable!("default project starts with noise reduction") };
+            let FilterKind::NoiseReduction(nr) = &mut project.filters[0].kind else {
+                unreachable!("default project starts with noise reduction")
+            };
             nr.reduction_db = reduction_db;
             nr.rule = match rule {
                 Rule::Wiener => GainRule::Wiener,
@@ -182,7 +201,15 @@ fn run(cli: Cli) -> Result<()> {
                 None => Ok(()),
             }
         }
-        Command::Mark { input, time, freq, name, extract, project, save_project } => {
+        Command::Mark {
+            input,
+            time,
+            freq,
+            name,
+            extract,
+            project,
+            save_project,
+        } => {
             let audio = load(&input)?;
             let mut project = match project {
                 Some(p) => Project::load(&p)?,
@@ -190,8 +217,17 @@ fn run(cli: Cli) -> Result<()> {
             };
             let (start_s, end_s) = parse_range(&time)?;
             let (low, high) = parse_range(&freq)?;
-            let selection = Selection { start_s, end_s, low_hz: low as f32, high_hz: high as f32 };
-            let action = if extract { FilterAction::Extract } else { FilterAction::Suppress };
+            let selection = Selection {
+                start_s,
+                end_s,
+                low_hz: low as f32,
+                high_hz: high as f32,
+            };
+            let action = if extract {
+                FilterAction::Extract
+            } else {
+                FilterAction::Suppress
+            };
             project.filters.push(Filter::event(name, selection, action));
             project.prepare(&audio);
             print_report(&project, audio.sample_rate);
@@ -200,14 +236,35 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Spectrogram { input, project, output, width, height, max_hz, log } => {
+        Command::Spectrogram {
+            input,
+            project,
+            output,
+            width,
+            height,
+            max_hz,
+            log,
+        } => {
             let audio = load(&input)?;
             let mut project = match project {
                 Some(p) => Project::load(&p)?,
-                None => Project { filters: vec![], ..Project::default() },
+                None => Project {
+                    filters: vec![],
+                    ..Project::default()
+                },
             };
             project.prepare(&audio);
-            write_spectrogram(&audio, &project, cli.chunk_frames, threads, &output, width, height, max_hz, log)
+            write_spectrogram(
+                &audio,
+                &project,
+                cli.chunk_frames,
+                threads,
+                &output,
+                width,
+                height,
+                max_hz,
+                log,
+            )
         }
         Command::NewProject { output } => Project::default().save(&output),
     }
@@ -219,13 +276,21 @@ fn load(path: &Path) -> Result<AudioData> {
     if audio.is_empty() {
         bail!("{} contains no samples", path.display());
     }
-    eprintln!("{}: {} ch, {} Hz, {:.1} s", path.display(), audio.channels.len(), audio.sample_rate, audio.duration());
+    eprintln!(
+        "{}: {} ch, {} Hz, {:.1} s",
+        path.display(),
+        audio.channels.len(),
+        audio.sample_rate,
+        audio.duration()
+    );
     Ok(audio)
 }
 
 /// Parses "A:B" into two numbers.
 fn parse_range(s: &str) -> Result<(f64, f64)> {
-    let (a, b) = s.split_once(':').with_context(|| format!("expected START:END, got {s:?}"))?;
+    let (a, b) = s
+        .split_once(':')
+        .with_context(|| format!("expected START:END, got {s:?}"))?;
     let a: f64 = a.trim().parse().with_context(|| format!("not a number: {a:?}"))?;
     let b: f64 = b.trim().parse().with_context(|| format!("not a number: {b:?}"))?;
     Ok((a.min(b), a.max(b)))
@@ -242,7 +307,13 @@ fn learn_noise(audio: &AudioData, cfg: &noiseextractor_core::StftConfig, start_s
 }
 
 /// Processes everything and streams the result into a WAV file.
-fn write_processed(audio: &AudioData, project: &Project, chunk_frames: usize, threads: usize, output: &Path) -> Result<()> {
+fn write_processed(
+    audio: &AudioData,
+    project: &Project,
+    chunk_frames: usize,
+    threads: usize,
+    output: &Path,
+) -> Result<()> {
     let mut writer = WavStreamWriter::create(output, audio.sample_rate, audio.channels.len() as u16)?;
     let total = audio.len().max(1);
     let mut last_percent = usize::MAX;
@@ -264,17 +335,30 @@ fn print_report(project: &Project, sample_rate: u32) {
     for f in &project.filters {
         let FilterKind::Event(e) = &f.kind else { continue };
         let Some(a) = &e.analysis else { continue };
-        let track: Vec<f32> = a.pitch_track.iter().flatten().map(|&b| project.stft.bin_to_hz(b, sample_rate)).collect();
+        let track: Vec<f32> = a
+            .pitch_track
+            .iter()
+            .flatten()
+            .map(|&b| project.stft.bin_to_hz(b, sample_rate))
+            .collect();
         println!("filter {:?} ({:?})", f.name, f.action);
-        if let (Some(lo), Some(hi)) = (track.iter().cloned().reduce(f32::min), track.iter().cloned().reduce(f32::max)) {
-            println!("  dominant frequency in selection: {lo:.0} .. {hi:.0} Hz over {} frames", track.len());
+        if let (Some(lo), Some(hi)) = (
+            track.iter().cloned().reduce(f32::min),
+            track.iter().cloned().reduce(f32::max),
+        ) {
+            println!(
+                "  dominant frequency in selection: {lo:.0} .. {hi:.0} Hz over {} frames",
+                track.len()
+            );
         } else {
             println!("  nothing above the noise floor in the selection");
         }
         for p in &a.partials {
             println!("  related partial at {:.3} x pitch (score {:.2})", p.ratio, p.score);
         }
-        let comod = (0..a.bins).filter(|&k| a.comodulated.iter().any(|f| f[k] > 0.5)).count();
+        let comod = (0..a.bins)
+            .filter(|&k| a.comodulated.iter().any(|f| f[k] > 0.5))
+            .count();
         println!("  co-modulated bins: {comod}");
     }
 }
@@ -296,11 +380,18 @@ fn write_spectrogram(
     // Keep only the display layers; the audio is not needed for a picture.
     let mut chunks: HashMap<usize, Arc<ChunkResult>> = HashMap::new();
     process_all(audio, project, chunk_frames, threads, |r| {
-        let slim = ChunkResult { audio: Vec::new(), ..clone_layers(r) };
+        let slim = ChunkResult {
+            audio: Vec::new(),
+            ..clone_layers(r)
+        };
         chunks.insert(r.index, Arc::new(slim));
         Ok(())
     })?;
-    let layout = ChunkLayout { hop: project.stft.hop, chunk_frames, total_samples: audio.len() };
+    let layout = ChunkLayout {
+        hop: project.stft.hop,
+        chunk_frames,
+        total_samples: audio.len(),
+    };
     let view = View {
         start_sample: 0.0,
         samples_per_px: audio.len() as f64 / width as f64,
@@ -310,7 +401,15 @@ fn write_spectrogram(
         db_min: -100.0,
         db_max: -10.0,
     };
-    let rgb = render_rgb(&view, width, height, layout, audio.sample_rate, project.stft.fft_size, &|c| chunks.get(&c).cloned());
+    let rgb = render_rgb(
+        &view,
+        width,
+        height,
+        layout,
+        audio.sample_rate,
+        project.stft.fft_size,
+        &|c| chunks.get(&c).cloned(),
+    );
     let file = std::fs::File::create(output).with_context(|| format!("cannot write {}", output.display()))?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     enc.set_color(png::ColorType::Rgb);

@@ -182,7 +182,15 @@ mod tests {
     use super::*;
 
     fn view() -> View {
-        View { start_sample: 0.0, samples_per_px: 1.0, low_hz: 0.0, high_hz: 1000.0, log_freq: false, db_min: -100.0, db_max: 0.0 }
+        View {
+            start_sample: 0.0,
+            samples_per_px: 1.0,
+            low_hz: 0.0,
+            high_hz: 1000.0,
+            log_freq: false,
+            db_min: -100.0,
+            db_max: 0.0,
+        }
     }
 
     #[test]
@@ -202,20 +210,44 @@ mod tests {
     #[test]
     fn axis_mappings_are_inverse() {
         for log_freq in [false, true] {
-            let v = View { low_hz: 50.0, high_hz: 8000.0, log_freq, ..view() };
+            let v = View {
+                low_hz: 50.0,
+                high_hz: 8000.0,
+                log_freq,
+                ..view()
+            };
             for y in [0.0, 10.0, 99.0] {
                 let hz = v.y_to_hz(y, 100);
                 assert!((v.hz_to_y(hz, 100) - y).abs() < 1e-2);
             }
         }
-        let v = View { start_sample: 100.0, samples_per_px: 2.5, ..view() };
+        let v = View {
+            start_sample: 100.0,
+            samples_per_px: 2.5,
+            ..view()
+        };
         assert!((v.sample_to_x(v.x_to_sample(7.0)) - 7.0).abs() < 1e-6);
     }
 
     #[test]
     fn unprocessed_chunks_are_drawn_as_pending() {
-        let layout = ChunkLayout { hop: 4, chunk_frames: 4, total_samples: 64 };
-        let img = render_rgb(&View { samples_per_px: 4.0, ..view() }, 4, 2, layout, 2000, 8, &|_| None);
+        let layout = ChunkLayout {
+            hop: 4,
+            chunk_frames: 4,
+            total_samples: 64,
+        };
+        let img = render_rgb(
+            &View {
+                samples_per_px: 4.0,
+                ..view()
+            },
+            4,
+            2,
+            layout,
+            2000,
+            8,
+            &|_| None,
+        );
         assert_eq!(&img[0..3], &PENDING);
     }
 }

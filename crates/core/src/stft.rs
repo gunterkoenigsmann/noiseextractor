@@ -28,7 +28,10 @@ impl Default for StftConfig {
     /// 2048-point frames with 75 % overlap: ~43 ms at 48 kHz, a common
     /// compromise between time and frequency resolution for speech and birds.
     fn default() -> Self {
-        Self { fft_size: 2048, hop: 512 }
+        Self {
+            fft_size: 2048,
+            hop: 512,
+        }
     }
 }
 
@@ -62,8 +65,14 @@ impl StftConfig {
 
     /// Checks that the configuration can reconstruct a signal.
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.fft_size >= 16 && self.fft_size.is_multiple_of(2), "fft_size must be even and >= 16");
-        anyhow::ensure!(self.hop >= 1 && self.hop <= self.fft_size / 2, "hop must be in 1..=fft_size/2");
+        anyhow::ensure!(
+            self.fft_size >= 16 && self.fft_size.is_multiple_of(2),
+            "fft_size must be even and >= 16"
+        );
+        anyhow::ensure!(
+            self.hop >= 1 && self.hop <= self.fft_size / 2,
+            "hop must be in 1..=fft_size/2"
+        );
         Ok(())
     }
 }
@@ -80,7 +89,10 @@ pub struct Spectra {
 impl Spectra {
     /// Power |X|² of every bin of every frame.
     pub fn power(&self) -> Vec<Vec<f32>> {
-        self.frames.iter().map(|f| f.iter().map(|c| c.norm_sqr()).collect()).collect()
+        self.frames
+            .iter()
+            .map(|f| f.iter().map(|c| c.norm_sqr()).collect())
+            .collect()
     }
 }
 
@@ -89,9 +101,13 @@ impl Spectra {
 /// Creating plans is comparatively expensive, so worker threads keep one
 /// `Stft` each and reuse it for every chunk.
 pub struct Stft {
+    /// Frame geometry.
     cfg: StftConfig,
+    /// Periodic Hann window, used for analysis and synthesis.
     window: Vec<f32>,
+    /// Forward real FFT plan.
     forward: Arc<dyn RealToComplex<f32>>,
+    /// Inverse real FFT plan.
     inverse: Arc<dyn ComplexToReal<f32>>,
 }
 
@@ -109,7 +125,12 @@ impl Stft {
                 s * s
             })
             .collect();
-        Self { cfg, window, forward: planner.plan_fft_forward(n), inverse: planner.plan_fft_inverse(n) }
+        Self {
+            cfg,
+            window,
+            forward: planner.plan_fft_forward(n),
+            inverse: planner.plan_fft_inverse(n),
+        }
     }
 
     /// The configuration this transform was planned for.
@@ -131,7 +152,11 @@ impl Stft {
             let start = centre - half;
             for (i, slot) in input.iter_mut().enumerate() {
                 let idx = start + i as i64;
-                let x = if idx >= 0 && (idx as usize) < signal.len() { signal[idx as usize] } else { 0.0 };
+                let x = if idx >= 0 && (idx as usize) < signal.len() {
+                    signal[idx as usize]
+                } else {
+                    0.0
+                };
                 *slot = x * self.window[i];
             }
             let mut out = self.forward.make_output_vec();
@@ -220,7 +245,9 @@ mod tests {
     use super::*;
 
     fn test_signal(len: usize) -> Vec<f32> {
-        (0..len).map(|i| ((i as f32 * 0.031).sin() + 0.3 * (i as f32 * 0.17).cos()) * 0.5).collect()
+        (0..len)
+            .map(|i| ((i as f32 * 0.031).sin() + 0.3 * (i as f32 * 0.17).cos()) * 0.5)
+            .collect()
     }
 
     #[test]
@@ -228,7 +255,11 @@ mod tests {
         let cfg = StftConfig { fft_size: 256, hop: 64 };
         let stft = Stft::new(cfg);
         let x = test_signal(3000);
-        let spectra = stft.analyze(&x, -(cfg.overlap_frames() as i64), cfg.frame_count(x.len()) + 2 * cfg.overlap_frames());
+        let spectra = stft.analyze(
+            &x,
+            -(cfg.overlap_frames() as i64),
+            cfg.frame_count(x.len()) + 2 * cfg.overlap_frames(),
+        );
         let y = stft.synthesize(&spectra, 0, x.len());
         for (i, (a, b)) in x.iter().zip(&y).enumerate() {
             assert!((a - b).abs() < 1e-4, "sample {i}: {a} vs {b}");
@@ -255,11 +286,16 @@ mod tests {
 
     #[test]
     fn sine_lands_in_expected_bin() {
-        let cfg = StftConfig { fft_size: 512, hop: 128 };
+        let cfg = StftConfig {
+            fft_size: 512,
+            hop: 128,
+        };
         let stft = Stft::new(cfg);
         let sr = 8000;
         let hz = 1000.0;
-        let x: Vec<f32> = (0..4096).map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / sr as f32).sin()).collect();
+        let x: Vec<f32> = (0..4096)
+            .map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / sr as f32).sin())
+            .collect();
         let p = stft.analyze(&x, 10, 1).power();
         let peak = p[0].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
         assert_eq!(peak, cfg.hz_to_bin(hz, sr).round() as usize);
@@ -267,9 +303,19 @@ mod tests {
 
     #[test]
     fn invalid_configs_are_rejected() {
-        assert!(StftConfig { fft_size: 1023, hop: 256 }.validate().is_err());
+        assert!(StftConfig {
+            fft_size: 1023,
+            hop: 256
+        }
+        .validate()
+        .is_err());
         assert!(StftConfig { fft_size: 1024, hop: 0 }.validate().is_err());
-        assert!(StftConfig { fft_size: 1024, hop: 600 }.validate().is_err());
+        assert!(StftConfig {
+            fft_size: 1024,
+            hop: 600
+        }
+        .validate()
+        .is_err());
         assert!(StftConfig::default().validate().is_ok());
     }
 }

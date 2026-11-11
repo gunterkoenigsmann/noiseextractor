@@ -39,7 +39,10 @@ pub enum GainRule {
 pub enum NoiseEstimate {
     /// Estimated automatically from the quietest frames around each chunk.
     /// `quantile` is the fraction of frames assumed to contain only noise.
-    Adaptive { quantile: f32 },
+    Adaptive {
+        /// Fraction (0..1) of the quietest frames treated as noise.
+        quantile: f32,
+    },
     /// A fixed noise power spectrum (one value per bin), for example learned
     /// from a selection that contains only background noise.
     Profile(Vec<f32>),
@@ -139,7 +142,11 @@ fn lsa_gain(xi: f32, gamma: f32) -> f32 {
     let wiener = xi / (1.0 + xi);
     let v = (wiener * gamma).max(1e-8) as f64;
     // For large v the correction factor tends to 1; E1 underflows anyway.
-    let corr = if v > 30.0 { 1.0 } else { (0.5 * expint_e1(v)).exp() as f32 };
+    let corr = if v > 30.0 {
+        1.0
+    } else {
+        (0.5 * expint_e1(v)).exp() as f32
+    };
     (wiener * corr).min(1.0)
 }
 
@@ -202,7 +209,10 @@ mod tests {
     impl Lcg {
         /// Uniform value in [-1, 1).
         pub fn next(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         }
     }
@@ -212,7 +222,11 @@ mod tests {
     fn noise_frames(frames: usize, bins: usize, mean: f32, seed: u64) -> Vec<Vec<f32>> {
         let mut rng = Lcg(seed);
         (0..frames)
-            .map(|_| (0..bins).map(|_| -mean * (1.0 - (rng.next() * 0.5 + 0.5)).max(1e-9).ln()).collect())
+            .map(|_| {
+                (0..bins)
+                    .map(|_| -mean * (1.0 - (rng.next() * 0.5 + 0.5)).max(1e-9).ln())
+                    .collect()
+            })
             .collect()
     }
 
@@ -258,18 +272,26 @@ mod tests {
         // Two partials 12 dB apart, both well above the noise: a soft mask
         // must keep their ratio (a gate at the noise level would too, but
         // here we also check the decaying tail below).
-        let nr = NoiseReduction { rule: GainRule::Wiener, ..Default::default() };
+        let nr = NoiseReduction {
+            rule: GainRule::Wiener,
+            ..Default::default()
+        };
         let noise = vec![1.0; 2];
-        let power: Vec<Vec<f32>> = (0..60).map(|t| {
-            let env = 10000.0 * (-(t as f32) / 15.0).exp(); // decaying sound
-            vec![env, env / 16.0]
-        }).collect();
+        let power: Vec<Vec<f32>> = (0..60)
+            .map(|t| {
+                let env = 10000.0 * (-(t as f32) / 15.0).exp(); // decaying sound
+                vec![env, env / 16.0]
+            })
+            .collect();
         let g = nr.gains(&power, &noise);
         for t in 5..25 {
             let ratio_in = power[t][0] / power[t][1];
             let ratio_out = (power[t][0] * g[t][0] * g[t][0]) / (power[t][1] * g[t][1] * g[t][1]);
             let change_db = 10.0 * (ratio_out / ratio_in).log10();
-            assert!(change_db.abs() < 1.5, "frame {t}: partial ratio changed by {change_db} dB");
+            assert!(
+                change_db.abs() < 1.5,
+                "frame {t}: partial ratio changed by {change_db} dB"
+            );
         }
         // The gain falls smoothly with the decay instead of jumping to the
         // floor at a threshold.
@@ -287,7 +309,10 @@ mod tests {
 
     #[test]
     fn profile_is_resampled_when_bin_count_differs() {
-        let nr = NoiseReduction { estimate: NoiseEstimate::Profile(vec![0.0, 1.0, 2.0]), ..Default::default() };
+        let nr = NoiseReduction {
+            estimate: NoiseEstimate::Profile(vec![0.0, 1.0, 2.0]),
+            ..Default::default()
+        };
         let n = nr.noise_power(&[], 5);
         assert_eq!(n, vec![0.0, 0.5, 1.0, 1.5, 2.0]);
     }

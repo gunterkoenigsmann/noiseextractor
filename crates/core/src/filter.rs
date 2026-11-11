@@ -4,7 +4,7 @@
 //! ## Masks and how filters combine
 //!
 //! Every filter describes its *target* – the part of the sound it is about –
-//! as a soft mask m(t,k) ∈ [0,1]:
+//! as a soft mask m(t,k) with values in 0..=1:
 //!
 //! * a noise-reduction filter targets the stationary background noise,
 //! * an event filter targets the marked sound plus everything the analysis
@@ -115,7 +115,13 @@ impl Filter {
 
     /// An event filter for `selection`.
     pub fn event(name: impl Into<String>, selection: Selection, action: FilterAction) -> Self {
-        Self { name: name.into(), enabled: true, visible: true, action, kind: FilterKind::Event(EventFilter::new(selection)) }
+        Self {
+            name: name.into(),
+            enabled: true,
+            visible: true,
+            action,
+            kind: FilterKind::Event(EventFilter::new(selection)),
+        }
     }
 
     /// Names and on/off state of the filter's parts, in display order.
@@ -134,7 +140,9 @@ impl Filter {
     /// The single part of a noise-reduction filter cannot be switched; use
     /// [`Filter::enabled`] instead. Returns whether anything changed.
     pub fn set_part_enabled(&mut self, index: usize, on: bool) -> bool {
-        let FilterKind::Event(e) = &mut self.kind else { return false };
+        let FilterKind::Event(e) = &mut self.kind else {
+            return false;
+        };
         let slot = match index {
             0 => &mut e.use_selection,
             1 => &mut e.use_harmonics,
@@ -151,7 +159,9 @@ impl Filter {
 /// parts. Returns `None` outside the analysed time span or before analysis.
 pub fn event_target(e: &EventFilter, frame: i64, out: &mut [f32]) -> bool {
     let Some(a) = &e.analysis else { return false };
-    let Some((sel, harm, comod)) = a.frame(frame) else { return false };
+    let Some((sel, harm, comod)) = a.frame(frame) else {
+        return false;
+    };
     for (k, o) in out.iter_mut().enumerate() {
         let mut m = 0.0f32;
         if e.use_selection {
@@ -191,7 +201,12 @@ pub struct Project {
 impl Default for Project {
     /// A project with one enabled background noise reduction filter.
     fn default() -> Self {
-        Self { version: 1, stft: StftConfig::default(), filters: vec![Filter::noise_reduction("Background noise")], preview: None }
+        Self {
+            version: 1,
+            stft: StftConfig::default(),
+            filters: vec![Filter::noise_reduction("Background noise")],
+            preview: None,
+        }
     }
 }
 
@@ -199,14 +214,16 @@ impl Project {
     /// Reads a project file.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-        let p: Project = serde_json::from_str(&text).with_context(|| format!("invalid project file {}", path.display()))?;
+        let p: Project =
+            serde_json::from_str(&text).with_context(|| format!("invalid project file {}", path.display()))?;
         p.stft.validate()?;
         Ok(p)
     }
 
     /// Writes the project as pretty-printed JSON.
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, serde_json::to_string_pretty(self)?).with_context(|| format!("cannot write {}", path.display()))
+        std::fs::write(path, serde_json::to_string_pretty(self)?)
+            .with_context(|| format!("cannot write {}", path.display()))
     }
 
     /// Noise estimate the analysis should use: that of the first enabled
@@ -230,7 +247,14 @@ impl Project {
         for f in self.filters.iter_mut().chain(self.preview.as_mut()) {
             if let FilterKind::Event(e) = &mut f.kind {
                 if e.analysis.is_none() {
-                    e.analysis = Some(Arc::new(analyze_selection(&mono, audio.sample_rate, &stft, &e.selection, &noise, &e.params)));
+                    e.analysis = Some(Arc::new(analyze_selection(
+                        &mono,
+                        audio.sample_rate,
+                        &stft,
+                        &e.selection,
+                        &noise,
+                        &e.params,
+                    )));
                 }
             }
         }
@@ -252,7 +276,13 @@ pub struct Gains {
 /// `first_frame - warmup .. first_frame + n` (the warm-up frames only prime
 /// the recursive noise-reduction estimator) and the extra `context` power
 /// frames used for adaptive noise estimation.
-pub fn compute_gains(project: &Project, power_with_warmup: &[Vec<f32>], warmup: usize, context: &[Vec<f32>], first_frame: i64) -> Gains {
+pub fn compute_gains(
+    project: &Project,
+    power_with_warmup: &[Vec<f32>],
+    warmup: usize,
+    context: &[Vec<f32>],
+    first_frame: i64,
+) -> Gains {
     let bins = project.stft.bins();
     let n = power_with_warmup.len() - warmup;
     let mut extract: Option<Vec<Vec<f32>>> = None;
@@ -289,7 +319,10 @@ pub fn compute_gains(project: &Project, power_with_warmup: &[Vec<f32>], warmup: 
                         continue;
                     }
                     match f.action {
-                        FilterAction::Suppress => scratch.iter().zip(&mut suppress[t]).for_each(|(m, s)| *s *= complement(*m)),
+                        FilterAction::Suppress => scratch
+                            .iter()
+                            .zip(&mut suppress[t])
+                            .for_each(|(m, s)| *s *= complement(*m)),
                         FilterAction::Extract => {
                             let ex = extract.as_mut().expect("created above");
                             scratch.iter().zip(&mut ex[t]).for_each(|(m, e)| *e = e.max(*m));
@@ -308,7 +341,9 @@ pub fn compute_gains(project: &Project, power_with_warmup: &[Vec<f32>], warmup: 
         }
         let Some(a) = &e.analysis else { continue };
         for t in 0..n {
-            let Some((sel, harm, comod)) = a.frame(first_frame + t as i64) else { continue };
+            let Some((sel, harm, comod)) = a.frame(first_frame + t as i64) else {
+                continue;
+            };
             for k in 0..bins {
                 if e.use_selection {
                     selected[t][k] = selected[t][k].max(sel[k]);
@@ -326,10 +361,18 @@ pub fn compute_gains(project: &Project, power_with_warmup: &[Vec<f32>], warmup: 
     }
 
     let gain = match extract {
-        Some(ex) => ex.into_iter().zip(suppress).map(|(e, s)| e.iter().zip(&s).map(|(a, b)| a * b).collect()).collect(),
+        Some(ex) => ex
+            .into_iter()
+            .zip(suppress)
+            .map(|(e, s)| e.iter().zip(&s).map(|(a, b)| a * b).collect())
+            .collect(),
         None => suppress,
     };
-    Gains { gain, selected, inferred }
+    Gains {
+        gain,
+        selected,
+        inferred,
+    }
 }
 
 #[cfg(test)]
@@ -337,7 +380,16 @@ mod tests {
     use super::*;
 
     fn analysed_event(action: FilterAction, value: f32) -> Filter {
-        let mut f = Filter::event("e", Selection { start_s: 0.0, end_s: 1.0, low_hz: 0.0, high_hz: 1.0 }, action);
+        let mut f = Filter::event(
+            "e",
+            Selection {
+                start_s: 0.0,
+                end_s: 1.0,
+                low_hz: 0.0,
+                high_hz: 1.0,
+            },
+            action,
+        );
         if let FilterKind::Event(e) = &mut f.kind {
             e.analysis = Some(Arc::new(RegionAnalysis {
                 first_frame: 0,
@@ -353,14 +405,31 @@ mod tests {
     }
 
     fn project(filters: Vec<Filter>) -> Project {
-        Project { version: 1, stft: StftConfig { fft_size: 4, hop: 2 }, filters, preview: None }
+        Project {
+            version: 1,
+            stft: StftConfig { fft_size: 4, hop: 2 },
+            filters,
+            preview: None,
+        }
     }
 
     #[test]
     fn suppress_and_extract_are_power_complements() {
         let power = vec![vec![1.0; 3]; 2];
-        let s = compute_gains(&project(vec![analysed_event(FilterAction::Suppress, 0.6)]), &power, 0, &power, 0);
-        let e = compute_gains(&project(vec![analysed_event(FilterAction::Extract, 0.6)]), &power, 0, &power, 0);
+        let s = compute_gains(
+            &project(vec![analysed_event(FilterAction::Suppress, 0.6)]),
+            &power,
+            0,
+            &power,
+            0,
+        );
+        let e = compute_gains(
+            &project(vec![analysed_event(FilterAction::Extract, 0.6)]),
+            &power,
+            0,
+            &power,
+            0,
+        );
         for k in 0..3 {
             let sum = s.gain[0][k].powi(2) + e.gain[0][k].powi(2);
             assert!((sum - 1.0).abs() < 1e-6);
@@ -413,7 +482,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p.json");
         let mut p = Project::default();
-        p.filters.push(Filter::event("bird", Selection { start_s: 1.0, end_s: 2.0, low_hz: 2000.0, high_hz: 4000.0 }, FilterAction::Extract));
+        p.filters.push(Filter::event(
+            "bird",
+            Selection {
+                start_s: 1.0,
+                end_s: 2.0,
+                low_hz: 2000.0,
+                high_hz: 4000.0,
+            },
+            FilterAction::Extract,
+        ));
         p.filters[1].set_part_enabled(2, false);
         p.save(&path).unwrap();
         let q = Project::load(&path).unwrap();

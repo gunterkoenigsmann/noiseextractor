@@ -25,6 +25,8 @@
 //! amplitude ratios inside a sound intact, which is exactly what a hard
 //! "remove everything below the noise floor" gate destroys.
 
+// Every item, public or private, carries a doc comment (project rule).
+#![warn(missing_docs, clippy::missing_docs_in_private_items)]
 // Index loops over (frame, bin) grids read more like the maths they
 // implement than iterator chains, so this lint is off crate-wide.
 #![allow(clippy::needless_range_loop)]

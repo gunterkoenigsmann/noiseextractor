@@ -76,10 +76,7 @@ impl AudioData {
             .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
             .with_context(|| format!("unsupported audio format: {}", path.display()))?;
         let mut format = probed.format;
-        let track = format
-            .default_track()
-            .context("file contains no audio track")?
-            .clone();
+        let track = format.default_track().context("file contains no audio track")?.clone();
         let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
         let mut sample_rate = track.codec_params.sample_rate.unwrap_or(0);
         let mut channels: Vec<Vec<f32>> = Vec::new();
@@ -142,14 +139,22 @@ impl AudioData {
 /// Incremental WAV writer used for exporting long recordings chunk by chunk
 /// without holding the whole result in memory.
 pub struct WavStreamWriter {
+    /// Underlying writer; the header is fixed up in `finish`.
     writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
 }
 
 impl WavStreamWriter {
     /// Creates a 32-bit float WAV file.
     pub fn create(path: &Path, sample_rate: u32, channels: u16) -> Result<Self> {
-        let spec = hound::WavSpec { channels, sample_rate, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
-        Ok(Self { writer: hound::WavWriter::create(path, spec).with_context(|| format!("cannot write {}", path.display()))? })
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        Ok(Self {
+            writer: hound::WavWriter::create(path, spec).with_context(|| format!("cannot write {}", path.display()))?,
+        })
     }
 
     /// Appends channel-major samples (all channels equally long).

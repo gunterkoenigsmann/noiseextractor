@@ -129,7 +129,12 @@ mod tests {
     #[test]
     fn expint_matches_reference_values() {
         // Reference values from Abramowitz & Stegun table 5.1.
-        for (x, e) in [(0.1, 1.822_923_958), (0.5, 0.559_773_595), (1.0, 0.219_383_934), (5.0, 0.001_148_296)] {
+        for (x, e) in [
+            (0.1, 1.822_923_958),
+            (0.5, 0.559_773_595),
+            (1.0, 0.219_383_934),
+            (5.0, 0.001_148_296),
+        ] {
             let got = expint_e1(x);
             assert!(((got - e) / e).abs() < 1e-6, "E1({x}) = {got}, want {e}");
         }

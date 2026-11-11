@@ -42,7 +42,11 @@ impl Default for EngineConfig {
     /// worker per core except one for the GUI, and ~400 MB worth of cache.
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-        Self { chunk_frames: 256, workers: cores.saturating_sub(1).max(1), max_cached_chunks: 160 }
+        Self {
+            chunk_frames: 256,
+            workers: cores.saturating_sub(1).max(1),
+            max_cached_chunks: 160,
+        }
     }
 }
 
@@ -115,7 +119,10 @@ impl ChunkLayout {
     /// Sample range `[start, end)` produced by chunk `c`.
     pub fn sample_range(&self, c: usize) -> (usize, usize) {
         let start = c * self.chunk_samples();
-        (start.min(self.total_samples), (start + self.chunk_samples()).min(self.total_samples))
+        (
+            start.min(self.total_samples),
+            (start + self.chunk_samples()).min(self.total_samples),
+        )
     }
 
     /// Chunk containing `sample`.
@@ -136,7 +143,15 @@ impl ChunkLayout {
 ///   applied              [cC-P ......................... (c+1)C+P)
 ///   displayed                 [cC ............. (c+1)C)
 /// ```
-pub fn process_chunk(audio: &AudioData, mono: &[f32], stft: &Stft, project: &Project, layout: ChunkLayout, index: usize, generation: u64) -> ChunkResult {
+pub fn process_chunk(
+    audio: &AudioData,
+    mono: &[f32],
+    stft: &Stft,
+    project: &Project,
+    layout: ChunkLayout,
+    index: usize,
+    generation: u64,
+) -> ChunkResult {
     let cfg = stft.config();
     let bins = cfg.bins();
     let c = layout.chunk_frames as i64;
@@ -158,7 +173,13 @@ pub fn process_chunk(audio: &AudioData, mono: &[f32], stft: &Stft, project: &Pro
 
     let g_start = ctx as usize; // offset of frame cC-P-W in `power`
     let g_len = (c + 2 * pad + warm) as usize;
-    let gains = compute_gains(project, &power[g_start..g_start + g_len], WARMUP_FRAMES, context, first - pad);
+    let gains = compute_gains(
+        project,
+        &power[g_start..g_start + g_len],
+        WARMUP_FRAMES,
+        context,
+        first - pad,
+    );
 
     let (start_sample, end_sample) = layout.sample_range(index);
     let out_len = end_sample - start_sample;
@@ -175,10 +196,17 @@ pub fn process_chunk(audio: &AudioData, mono: &[f32], stft: &Stft, project: &Pro
     let audio_out: Vec<Vec<f32>> = if audio.channels.len() == 1 {
         // Mono: the mix *is* the channel, reuse its spectra.
         let off = (pad + warm + ctx - pad) as usize; // == warm + ctx
-        let spectra = crate::stft::Spectra { first_frame: applied_first, frames: mono_spec.frames[off..off + applied_len].to_vec() };
+        let spectra = crate::stft::Spectra {
+            first_frame: applied_first,
+            frames: mono_spec.frames[off..off + applied_len].to_vec(),
+        };
         vec![apply(spectra)]
     } else {
-        audio.channels.iter().map(|ch| apply(stft.analyze(ch, applied_first, applied_len))).collect()
+        audio
+            .channels
+            .iter()
+            .map(|ch| apply(stft.analyze(ch, applied_first, applied_len)))
+            .collect()
     };
 
     // Display layers for frames cC .. (c+1)C.
@@ -202,7 +230,19 @@ pub fn process_chunk(audio: &AudioData, mono: &[f32], stft: &Stft, project: &Pro
         }
     }
 
-    ChunkResult { index, generation, first_frame: first, frames, bins, start_sample, audio: audio_out, original_db, output_db, selected, inferred }
+    ChunkResult {
+        index,
+        generation,
+        first_frame: first,
+        frames,
+        bins,
+        start_sample,
+        audio: audio_out,
+        original_db,
+        output_db,
+        selected,
+        inferred,
+    }
 }
 
 /// Processes the whole recording with `threads` threads and hands the
@@ -216,7 +256,11 @@ pub fn process_all(
     mut sink: impl FnMut(&ChunkResult) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mono = audio.mono();
-    let layout = ChunkLayout { hop: project.stft.hop, chunk_frames, total_samples: audio.len() };
+    let layout = ChunkLayout {
+        hop: project.stft.hop,
+        chunk_frames,
+        total_samples: audio.len(),
+    };
     let threads = threads.max(1);
     let count = layout.chunk_count();
     let mut next = 0;
@@ -230,7 +274,10 @@ pub fn process_all(
                     s.spawn(move || process_chunk(audio, mono, &Stft::new(project.stft), project, layout, i, 0))
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("worker panicked")).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worker panicked"))
+                .collect()
         });
         for r in &results {
             sink(r)?;
@@ -270,7 +317,13 @@ impl Focus {
         };
         let mut best = f64::INFINITY;
         if let Some(p) = self.playhead {
-            let d = if b <= p { (p - b) as f64 * BEHIND_PENALTY } else if a > p { (a - p) as f64 } else { 0.0 };
+            let d = if b <= p {
+                (p - b) as f64 * BEHIND_PENALTY
+            } else if a > p {
+                (a - p) as f64
+            } else {
+                0.0
+            };
             best = best.min(d);
         }
         if let Some((lo, hi)) = self.selection {
@@ -289,21 +342,33 @@ impl Focus {
 
 /// Mutable engine state, guarded by one mutex.
 struct State {
+    /// Project the workers process (prepared, with analyses).
     project: Arc<Project>,
+    /// Bumped on every project change; results carry the generation they were computed for.
     generation: u64,
+    /// Current focus used for prioritising chunks.
     focus: Focus,
+    /// Latest result per chunk (`None`: never computed or evicted).
     slots: Vec<Option<Arc<ChunkResult>>>,
+    /// Chunks a worker is computing right now.
     in_progress: HashSet<usize>,
+    /// Set when the engine is dropped; workers exit.
     shutdown: bool,
 }
 
 /// Data shared between the engine handle and its workers.
 struct Shared {
+    /// The recording.
     audio: Arc<AudioData>,
+    /// Mono mix used for analysis and masks.
     mono: Arc<Vec<f32>>,
+    /// Chunk geometry.
     layout: ChunkLayout,
+    /// Engine tuning.
     config: EngineConfig,
+    /// Everything mutable.
     state: Mutex<State>,
+    /// Wakes idle workers when there may be new work.
     wake: Condvar,
     /// Incremented whenever a result is stored; lets the GUI poll cheaply
     /// whether it needs to repaint.
@@ -312,7 +377,9 @@ struct Shared {
 
 /// Handle to the background workers. Dropping it stops them.
 pub struct Engine {
+    /// State shared with the workers.
     shared: Arc<Shared>,
+    /// Worker threads, joined on drop.
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -321,7 +388,11 @@ impl Engine {
     /// ([`Project::prepare`]) so its event filters carry their analysis.
     pub fn new(audio: Arc<AudioData>, project: Project, config: EngineConfig) -> Self {
         let mono = Arc::new(audio.mono());
-        let layout = ChunkLayout { hop: project.stft.hop, chunk_frames: config.chunk_frames, total_samples: audio.len() };
+        let layout = ChunkLayout {
+            hop: project.stft.hop,
+            chunk_frames: config.chunk_frames,
+            total_samples: audio.len(),
+        };
         let shared = Arc::new(Shared {
             audio,
             mono,
@@ -341,7 +412,10 @@ impl Engine {
         let workers = (0..shared.config.workers.max(1))
             .map(|i| {
                 let s = shared.clone();
-                std::thread::Builder::new().name(format!("nx-worker-{i}")).spawn(move || worker(s)).expect("cannot spawn worker thread")
+                std::thread::Builder::new()
+                    .name(format!("nx-worker-{i}"))
+                    .spawn(move || worker(s))
+                    .expect("cannot spawn worker thread")
             })
             .collect();
         Self { shared, workers }
@@ -396,7 +470,11 @@ impl Engine {
 
     /// Like [`Engine::chunk`] but never blocks; for the audio callback.
     pub fn try_chunk(&self, c: usize) -> Option<Option<Arc<ChunkResult>>> {
-        self.shared.state.try_lock().ok().map(|st| st.slots.get(c).cloned().flatten())
+        self.shared
+            .state
+            .try_lock()
+            .ok()
+            .map(|st| st.slots.get(c).cloned().flatten())
     }
 
     /// Counter that changes whenever a new result has been stored.
@@ -408,14 +486,22 @@ impl Engine {
     pub fn progress(&self) -> (usize, usize, usize) {
         let st = self.lock();
         let cached = st.slots.iter().flatten().count();
-        let current = st.slots.iter().flatten().filter(|r| r.generation == st.generation).count();
+        let current = st
+            .slots
+            .iter()
+            .flatten()
+            .filter(|r| r.generation == st.generation)
+            .count();
         (current, cached, st.slots.len())
     }
 
     /// Whether chunk `c` holds a result for the current project.
     pub fn is_current(&self, c: usize) -> bool {
         let st = self.lock();
-        st.slots.get(c).and_then(|s| s.as_ref()).is_some_and(|r| r.generation == st.generation)
+        st.slots
+            .get(c)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|r| r.generation == st.generation)
     }
 
     /// Locks the state; a poisoned lock (a worker panicked) is still usable
@@ -486,7 +572,15 @@ fn worker(shared: Arc<Shared>) {
             }
         };
         let stft = stft.get_or_insert_with(|| Stft::new(project.stft));
-        let result = process_chunk(&shared.audio, &shared.mono, stft, &project, shared.layout, job, generation);
+        let result = process_chunk(
+            &shared.audio,
+            &shared.mono,
+            stft,
+            &project,
+            shared.layout,
+            job,
+            generation,
+        );
         let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         st.in_progress.remove(&job);
         // A result from an older project only replaces something even older.
@@ -503,8 +597,8 @@ fn worker(shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::{Filter, FilterAction};
     use crate::analysis::Selection;
+    use crate::filter::{Filter, FilterAction};
     use crate::stft::StftConfig;
     use std::time::{Duration, Instant};
 
@@ -524,7 +618,13 @@ mod tests {
     }
 
     fn small_project() -> Project {
-        Project { stft: StftConfig { fft_size: 512, hop: 128 }, ..Project::default() }
+        Project {
+            stft: StftConfig {
+                fft_size: 512,
+                hop: 128,
+            },
+            ..Project::default()
+        }
     }
 
     #[test]
@@ -561,7 +661,11 @@ mod tests {
         let (a, b) = (run(32), run(48));
         let err: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32;
         let sig: f32 = a.iter().map(|x| x * x).sum::<f32>() / a.len() as f32;
-        assert!(err < sig * 0.01, "chunking changed the output by {} dB", 10.0 * (err / sig).log10());
+        assert!(
+            err < sig * 0.01,
+            "chunking changed the output by {} dB",
+            10.0 * (err / sig).log10()
+        );
     }
 
     #[test]
@@ -577,7 +681,10 @@ mod tests {
         // 0.30–0.45 s is noise only, 0.02–0.10 s is inside a burst.
         let quiet_in = rms(&audio.channels[0][2400..3600]);
         let quiet_out = rms(&out[2400..3600]);
-        assert!(quiet_out < quiet_in * 0.3, "noise only reduced from {quiet_in} to {quiet_out}");
+        assert!(
+            quiet_out < quiet_in * 0.3,
+            "noise only reduced from {quiet_in} to {quiet_out}"
+        );
         let loud_in = rms(&audio.channels[0][4100..4800]);
         let loud_out = rms(&out[4100..4800]);
         assert!((loud_out / loud_in) > 0.9, "burst lost energy: {loud_in} -> {loud_out}");
@@ -608,7 +715,16 @@ mod tests {
         let audio = noisy_tone(8000, 2.0);
         let mut p = small_project();
         p.filters.clear();
-        p.filters.push(Filter::event("tone", Selection { start_s: 0.5, end_s: 0.75, low_hz: 380.0, high_hz: 500.0 }, FilterAction::Suppress));
+        p.filters.push(Filter::event(
+            "tone",
+            Selection {
+                start_s: 0.5,
+                end_s: 0.75,
+                low_hz: 380.0,
+                high_hz: 500.0,
+            },
+            FilterAction::Suppress,
+        ));
         p.prepare(&audio);
         let mut out = Vec::new();
         process_all(&audio, &p, 32, 2, |r| {
@@ -624,22 +740,36 @@ mod tests {
 
     #[test]
     fn focus_priorities_prefer_ahead_of_playhead() {
-        let f = Focus { playhead: Some(1000), ..Default::default() };
+        let f = Focus {
+            playhead: Some(1000),
+            ..Default::default()
+        };
         assert_eq!(f.priority(900, 1100), 0.0);
         assert!(f.priority(1100, 1200) < f.priority(800, 900));
         let none = Focus::default();
         assert!(none.priority(0, 10) < none.priority(10, 20));
-        let sel = Focus { selection: Some((5000, 6000)), playhead: Some(0), ..Default::default() };
+        let sel = Focus {
+            selection: Some((5000, 6000)),
+            playhead: Some(0),
+            ..Default::default()
+        };
         assert_eq!(sel.priority(5500, 5600), 0.0);
     }
 
     #[test]
     fn pick_job_respects_cache_limit_and_evicts_far_chunks() {
-        let layout = ChunkLayout { hop: 1, chunk_frames: 10, total_samples: 100 };
+        let layout = ChunkLayout {
+            hop: 1,
+            chunk_frames: 10,
+            total_samples: 100,
+        };
         let mut st = State {
             project: Arc::new(small_project()),
             generation: 1,
-            focus: Focus { playhead: Some(55), ..Default::default() },
+            focus: Focus {
+                playhead: Some(55),
+                ..Default::default()
+            },
             slots: vec![None; 10],
             in_progress: HashSet::new(),
             shutdown: false,
@@ -649,14 +779,36 @@ mod tests {
         assert_eq!(pick_job(&mut st, layout, 2), Some(6));
         st.in_progress.clear();
         // Cache holds 0 and 9 (far away); chunk 5 is more urgent -> evict 0.
-        let dummy = |i| Some(Arc::new(ChunkResult { index: i, generation: 1, first_frame: 0, frames: 0, bins: 0, start_sample: 0, audio: vec![], original_db: vec![], output_db: vec![], selected: vec![], inferred: vec![] }));
+        let dummy = |i| {
+            Some(Arc::new(ChunkResult {
+                index: i,
+                generation: 1,
+                first_frame: 0,
+                frames: 0,
+                bins: 0,
+                start_sample: 0,
+                audio: vec![],
+                original_db: vec![],
+                output_db: vec![],
+                selected: vec![],
+                inferred: vec![],
+            }))
+        };
         st.slots[0] = dummy(0);
         st.slots[9] = dummy(9);
         assert_eq!(pick_job(&mut st, layout, 2), Some(5));
-        assert!(st.slots[0].is_none(), "the chunk furthest behind the play head goes first");
+        assert!(
+            st.slots[0].is_none(),
+            "the chunk furthest behind the play head goes first"
+        );
         // Everything near the focus cached and current: nothing to do.
-        st.slots = (0..10).map(|i| if (4..6).contains(&i) { dummy(i) } else { None }).collect();
-        st.focus = Focus { view: Some((40, 60)), ..Default::default() };
+        st.slots = (0..10)
+            .map(|i| if (4..6).contains(&i) { dummy(i) } else { None })
+            .collect();
+        st.focus = Focus {
+            view: Some((40, 60)),
+            ..Default::default()
+        };
         assert_eq!(pick_job(&mut st, layout, 2), None);
     }
 
@@ -665,9 +817,20 @@ mod tests {
         let audio = Arc::new(noisy_tone(8000, 6.0));
         let mut p = small_project();
         p.filters.clear();
-        let engine = Engine::new(audio.clone(), p, EngineConfig { chunk_frames: 16, workers: 2, max_cached_chunks: 1000 });
+        let engine = Engine::new(
+            audio.clone(),
+            p,
+            EngineConfig {
+                chunk_frames: 16,
+                workers: 2,
+                max_cached_chunks: 1000,
+            },
+        );
         let total = engine.layout().chunk_count();
-        engine.set_focus(Focus { playhead: Some(audio.len() - 10), ..Default::default() });
+        engine.set_focus(Focus {
+            playhead: Some(audio.len() - 10),
+            ..Default::default()
+        });
         let deadline = Instant::now() + Duration::from_secs(20);
         while engine.progress().0 < total {
             assert!(Instant::now() < deadline, "engine did not finish");

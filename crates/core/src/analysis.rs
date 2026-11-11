@@ -170,7 +170,11 @@ pub fn analyze_selection(
     let ctx_start = (f0 - ctx).max(0).min(f0);
     let ctx_end = (f1 + ctx).min(total_frames).max(f1);
     let power = stft.analyze(mono, ctx_start, (ctx_end - ctx_start) as usize).power();
-    let noise_power = crate::noise::NoiseReduction { estimate: noise.clone(), ..Default::default() }.noise_power(&power, bins);
+    let noise_power = crate::noise::NoiseReduction {
+        estimate: noise.clone(),
+        ..Default::default()
+    }
+    .noise_power(&power, bins);
     let off = (f0 - ctx_start) as usize;
     let span = &power[off..off + (f1 - f0) as usize];
     let (k0, k1) = selection.bins(cfg, sample_rate);
@@ -195,7 +199,12 @@ pub fn analyze_power(
     // keeps random noise peaks from looking like signal.
     let presence: Vec<Vec<f32>> = power
         .iter()
-        .map(|f| f.iter().zip(noise).map(|(&p, &n)| (1.0 - 2.0 * n / p.max(1e-20)).max(0.0)).collect())
+        .map(|f| {
+            f.iter()
+                .zip(noise)
+                .map(|(&p, &n)| (1.0 - 2.0 * n / p.max(1e-20)).max(0.0))
+                .collect()
+        })
         .collect();
     // Magnitude weighted by presence: the "signal part" of each bin.
     let weighted: Vec<Vec<f32>> = power
@@ -214,7 +223,9 @@ pub fn analyze_power(
     // Envelope of the marked part and the frames in which it is active.
     let envelope: Vec<f32> = weighted.iter().map(|f| f[k0..=k1.min(bins - 1)].iter().sum()).collect();
     let peak = envelope.iter().cloned().fold(0.0f32, f32::max);
-    let active: Vec<usize> = (0..frames).filter(|&t| peak > 0.0 && envelope[t] > 0.1 * peak).collect();
+    let active: Vec<usize> = (0..frames)
+        .filter(|&t| peak > 0.0 && envelope[t] > 0.1 * peak)
+        .collect();
     let env_active: Vec<f32> = active.iter().map(|&t| envelope[t]).collect();
 
     // Pitch track: dominant bin inside the rectangle, refined by parabolic
@@ -234,7 +245,11 @@ pub fn analyze_power(
         }
         let mut pos = best as f32;
         if best > 0 && best + 1 < bins {
-            let (a, b, c) = ((row[best - 1] + 1e-12).ln(), (best_v + 1e-12).ln(), (row[best + 1] + 1e-12).ln());
+            let (a, b, c) = (
+                (row[best - 1] + 1e-12).ln(),
+                (best_v + 1e-12).ln(),
+                (row[best + 1] + 1e-12).ln(),
+            );
             let denom = a - 2.0 * b + c;
             if denom.abs() > 1e-9 {
                 pos += (0.5 * (a - c) / denom).clamp(-0.5, 0.5);
@@ -243,9 +258,21 @@ pub fn analyze_power(
         pitch_track[t] = Some(pos);
     }
 
+    // If the tracked peak is mostly not above the noise, the selection holds
+    // no tonal sound and every "partial" found would be a noise artefact.
+    let tracked: Vec<f32> = (0..frames)
+        .filter_map(|t| pitch_track[t].map(|p| presence[t][(p.round() as usize).min(bins - 1)]))
+        .collect();
+    let tonal = !tracked.is_empty() && tracked.iter().sum::<f32>() / tracked.len() as f32 >= 0.6;
+
     let mut harmonics = vec![vec![0.0f32; bins]; frames];
     let mut partials = Vec::new();
-    for ratio in candidate_ratios(params.max_harmonic, params.max_subharmonic) {
+    let ratios = if tonal {
+        candidate_ratios(params.max_harmonic, params.max_subharmonic)
+    } else {
+        Vec::new()
+    };
+    for ratio in ratios {
         let tol = |centre: f32| (centre * params.harmonic_tolerance).max(2.0);
         // Strength along the predicted track, and how often the track is
         // actually occupied by energy above the noise.
@@ -325,13 +352,26 @@ pub fn analyze_power(
         }
     }
 
-    RegionAnalysis { first_frame, frames, bins, selected, harmonics, comodulated, pitch_track, partials }
+    RegionAnalysis {
+        first_frame,
+        frames,
+        bins,
+        selected,
+        harmonics,
+        comodulated,
+        pitch_track,
+        partials,
+    }
 }
 
 /// All reduced fractions m/n ≠ 1 with m ≤ `max_m` and n ≤ `max_n`, sorted.
 pub fn candidate_ratios(max_m: u32, max_n: u32) -> Vec<f32> {
     fn gcd(a: u32, b: u32) -> u32 {
-        if b == 0 { a } else { gcd(b, a % b) }
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
     }
     let mut r = Vec::new();
     for n in 1..=max_n.max(1) {
@@ -394,11 +434,26 @@ mod tests {
     fn finds_harmonics_of_a_gliding_fundamental_but_not_unrelated_tone() {
         let sr = 16000;
         let x = gliding_voice(sr, 2.0);
-        let cfg = StftConfig { fft_size: 1024, hop: 256 };
+        let cfg = StftConfig {
+            fft_size: 1024,
+            hop: 256,
+        };
         let stft = Stft::new(cfg);
         // Mark the fundamental only.
-        let sel = Selection { start_s: 0.3, end_s: 1.7, low_hz: 280.0, high_hz: 470.0 };
-        let a = analyze_selection(&x, sr, &stft, &sel, &NoiseEstimate::default(), &AnalysisParams::default());
+        let sel = Selection {
+            start_s: 0.3,
+            end_s: 1.7,
+            low_hz: 280.0,
+            high_hz: 470.0,
+        };
+        let a = analyze_selection(
+            &x,
+            sr,
+            &stft,
+            &sel,
+            &NoiseEstimate::default(),
+            &AnalysisParams::default(),
+        );
         let ratios: Vec<f32> = a.partials.iter().map(|p| p.ratio).collect();
         assert!(ratios.contains(&2.0), "octave not found: {ratios:?}");
         assert!(ratios.contains(&3.0), "fifth above octave not found: {ratios:?}");
@@ -416,12 +471,53 @@ mod tests {
     }
 
     #[test]
+    fn noise_only_selection_finds_no_partials() {
+        let sr = 16000;
+        let x = gliding_voice(sr, 2.0);
+        let stft = Stft::new(StftConfig {
+            fft_size: 1024,
+            hop: 256,
+        });
+        // 5–6 kHz contains only the white noise.
+        let sel = Selection {
+            start_s: 0.3,
+            end_s: 1.7,
+            low_hz: 5000.0,
+            high_hz: 6000.0,
+        };
+        let a = analyze_selection(
+            &x,
+            sr,
+            &stft,
+            &sel,
+            &NoiseEstimate::default(),
+            &AnalysisParams::default(),
+        );
+        assert!(a.partials.is_empty(), "found {:?} in noise", a.partials);
+    }
+
+    #[test]
     fn selected_mask_stays_inside_rectangle() {
         let sr = 16000;
         let x = gliding_voice(sr, 1.0);
-        let stft = Stft::new(StftConfig { fft_size: 512, hop: 128 });
-        let sel = Selection { start_s: 0.2, end_s: 0.8, low_hz: 250.0, high_hz: 500.0 };
-        let a = analyze_selection(&x, sr, &stft, &sel, &NoiseEstimate::default(), &AnalysisParams::default());
+        let stft = Stft::new(StftConfig {
+            fft_size: 512,
+            hop: 128,
+        });
+        let sel = Selection {
+            start_s: 0.2,
+            end_s: 0.8,
+            low_hz: 250.0,
+            high_hz: 500.0,
+        };
+        let a = analyze_selection(
+            &x,
+            sr,
+            &stft,
+            &sel,
+            &NoiseEstimate::default(),
+            &AnalysisParams::default(),
+        );
         let (k0, k1) = sel.bins(stft.config(), sr);
         for row in &a.selected {
             for (k, &v) in row.iter().enumerate() {
@@ -463,9 +559,18 @@ mod tests {
 
     #[test]
     fn selection_normalizes_drag_direction() {
-        let s = Selection { start_s: 2.0, end_s: 1.0, low_hz: 900.0, high_hz: 100.0 }.normalized();
+        let s = Selection {
+            start_s: 2.0,
+            end_s: 1.0,
+            low_hz: 900.0,
+            high_hz: 100.0,
+        }
+        .normalized();
         assert_eq!((s.start_s, s.end_s, s.low_hz, s.high_hz), (1.0, 2.0, 100.0, 900.0));
-        let cfg = StftConfig { fft_size: 1000, hop: 100 };
+        let cfg = StftConfig {
+            fft_size: 1000,
+            hop: 100,
+        };
         assert_eq!(s.frames(cfg, 1000), (10, 20));
         assert_eq!(s.bins(cfg, 1000), (100, 500));
     }

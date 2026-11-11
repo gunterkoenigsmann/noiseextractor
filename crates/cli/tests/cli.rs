@@ -44,7 +44,13 @@ fn denoise_reduces_noise_and_keeps_tone() {
     let input = dir.path().join("in.wav");
     let output = dir.path().join("out.wav");
     let audio = write_test_audio(&input);
-    let st = bin().args(["denoise"]).arg(&input).arg("-o").arg(&output).status().unwrap();
+    let st = bin()
+        .args(["denoise"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .unwrap();
     assert!(st.success());
     let out = AudioData::load(&output).unwrap();
     assert_eq!(out.len(), audio.len());
@@ -63,19 +69,39 @@ fn mark_finds_overtone_and_extract_keeps_only_the_tone() {
     let out = bin()
         .args(["mark"])
         .arg(&input)
-        .args(["--time", "1.1:1.9", "--freq", "550:780", "--name", "tone", "--extract", "--save-project"])
+        .args([
+            "--time",
+            "1.1:1.9",
+            "--freq",
+            "550:780",
+            "--name",
+            "tone",
+            "--extract",
+            "--save-project",
+        ])
         .arg(&project)
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let report = String::from_utf8_lossy(&out.stdout);
-    assert!(report.contains("2.000 x pitch"), "octave missing from report:\n{report}");
+    assert!(
+        report.contains("2.000 x pitch"),
+        "octave missing from report:\n{report}"
+    );
 
     // Only extract the tone: switch off the default noise reduction.
     let mut p = Project::load(&project).unwrap();
     p.filters[0].enabled = false;
     p.save(&project).unwrap();
-    let st = bin().arg("process").arg(&input).arg("--project").arg(&project).arg("-o").arg(&output).status().unwrap();
+    let st = bin()
+        .arg("process")
+        .arg(&input)
+        .arg("--project")
+        .arg(&project)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .unwrap();
     assert!(st.success());
     let b = AudioData::load(&output).unwrap().channels.remove(0);
     let a = &audio.channels[0];
@@ -91,7 +117,14 @@ fn spectrogram_and_new_project_write_files() {
     let input = dir.path().join("in.wav");
     write_test_audio(&input);
     let png = dir.path().join("s.png");
-    let st = bin().arg("spectrogram").arg(&input).arg("-o").arg(&png).args(["--width", "200", "--height", "100"]).status().unwrap();
+    let st = bin()
+        .arg("spectrogram")
+        .arg(&input)
+        .arg("-o")
+        .arg(&png)
+        .args(["--width", "200", "--height", "100"])
+        .status()
+        .unwrap();
     assert!(st.success());
     assert!(std::fs::metadata(&png).unwrap().len() > 100);
     let proj = dir.path().join("new.json");
@@ -101,7 +134,10 @@ fn spectrogram_and_new_project_write_files() {
 
 #[test]
 fn bad_input_gives_an_error_not_a_panic() {
-    let out = bin().args(["process", "/nonexistent.wav", "-o", "/tmp/x.wav"]).output().unwrap();
+    let out = bin()
+        .args(["process", "/nonexistent.wav", "-o", "/tmp/x.wav"])
+        .output()
+        .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("error:"));
 }
