@@ -18,7 +18,8 @@
 //! [`process_chunk`]). Memory stays bounded by an LRU-like cache that keeps
 //! the chunks closest to the focus.
 
-use crate::filter::{compute_gains, Project};
+use crate::filter::{compute_gains, FilterKind, Project};
+use crate::similar::{find_in_range, Occurrence};
 use crate::stft::Stft;
 use crate::AudioData;
 use std::collections::HashSet;
@@ -173,12 +174,14 @@ pub fn process_chunk(
 
     let g_start = ctx as usize; // offset of frame cC-P-W in `power`
     let g_len = (c + 2 * pad + warm) as usize;
+    let occurrences = find_occurrences(project, mono, stft, (first - pad)..(first + c + pad));
     let gains = compute_gains(
         project,
         &power[g_start..g_start + g_len],
         WARMUP_FRAMES,
         context,
         first - pad,
+        &occurrences,
     );
 
     let (start_sample, end_sample) = layout.sample_range(index);
@@ -243,6 +246,31 @@ pub fn process_chunk(
         selected,
         inferred,
     }
+}
+
+/// Searches, for every event filter (and the preview, last) whose "same
+/// sound elsewhere" part matters (enabled filter or visible overlay), the
+/// other occurrences overlapping the global frame range `range`.
+pub fn find_occurrences(
+    project: &Project,
+    mono: &[f32],
+    stft: &Stft,
+    range: std::ops::Range<i64>,
+) -> Vec<Vec<Occurrence>> {
+    project
+        .filters
+        .iter()
+        .chain(project.preview.as_ref())
+        .map(|f| match &f.kind {
+            FilterKind::Event(e) if e.use_similar && (f.enabled || f.visible) => e
+                .analysis
+                .as_ref()
+                .and_then(|a| a.template.as_ref())
+                .map(|tpl| find_in_range(tpl, mono, stft, range.clone(), &e.similar))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// Processes the whole recording with `threads` threads and hands the
@@ -711,31 +739,48 @@ mod tests {
     }
 
     #[test]
-    fn suppress_event_filter_removes_marked_burst() {
+    fn suppress_event_filter_removes_marked_burst_and_its_repetitions() {
         let audio = noisy_tone(8000, 2.0);
-        let mut p = small_project();
-        p.filters.clear();
-        p.filters.push(Filter::event(
-            "tone",
-            Selection {
-                start_s: 0.5,
-                end_s: 0.75,
-                low_hz: 380.0,
-                high_hz: 500.0,
-            },
-            FilterAction::Suppress,
-        ));
-        p.prepare(&audio);
-        let mut out = Vec::new();
-        process_all(&audio, &p, 32, 2, |r| {
-            out.extend_from_slice(&r.audio[0]);
-            Ok(())
-        })
-        .unwrap();
+        let run = |use_similar: bool| {
+            let mut p = small_project();
+            p.filters.clear();
+            let mut f = Filter::event(
+                "tone",
+                Selection {
+                    start_s: 0.5,
+                    end_s: 0.75,
+                    low_hz: 380.0,
+                    high_hz: 500.0,
+                },
+                FilterAction::Suppress,
+            );
+            f.set_part_enabled(3, use_similar);
+            p.filters.push(f);
+            p.prepare(&audio);
+            let mut out = Vec::new();
+            process_all(&audio, &p, 32, 2, |r| {
+                out.extend_from_slice(&r.audio[0]);
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
         let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
-        // Marked burst (0.5–0.75 s) is gone, the next one (1.0–1.25 s) is not.
-        assert!(rms(&out[4300..5600]) < 0.3 * rms(&audio.channels[0][4300..5600]));
-        assert!(rms(&out[8300..9600]) > 0.9 * rms(&audio.channels[0][8300..9600]));
+        let original = &audio.channels[0];
+        // Without "same sound elsewhere": the marked burst (0.5–0.75 s) is
+        // gone, the next identical one (1.0–1.25 s) is not.
+        let only_marked = run(false);
+        assert!(rms(&only_marked[4300..5600]) < 0.3 * rms(&original[4300..5600]));
+        assert!(rms(&only_marked[8300..9600]) > 0.9 * rms(&original[8300..9600]));
+        // With it, every repetition of the burst is removed too.
+        let all = run(true);
+        for start in [300, 4300, 8300, 12300] {
+            let range = start..start + 1300;
+            assert!(
+                rms(&all[range.clone()]) < 0.3 * rms(&original[range.clone()]),
+                "burst at sample {start} survived"
+            );
+        }
     }
 
     #[test]

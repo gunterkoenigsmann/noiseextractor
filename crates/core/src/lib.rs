@@ -37,6 +37,7 @@ pub mod engine;
 pub mod filter;
 pub mod noise;
 pub mod render;
+pub mod similar;
 pub mod stats;
 pub mod stft;
 

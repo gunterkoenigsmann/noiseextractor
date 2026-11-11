@@ -3,7 +3,7 @@
 Interactively mark noises in the spectrogram of an audio file, then suppress or
 extract them, together with everything the program finds to belong to them.
 
-![noiseextractor: a marked bird call (green) and its overtones found by the analysis (red)](docs/screenshot.png)
+![noiseextractor: a marked bird call (green), its overtones and its repetitions found by the analysis (red)](docs/screenshot.png)
 
 ## What it does
 
@@ -16,6 +16,12 @@ extract them, together with everything the program finds to belong to them.
   ratios (overtones, and sub-harmonics if you marked an overtone), so a
   drifting pitch is no problem. Resonances that do not move with the pitch
   but swell and fade together with it are found by common modulation.
+* **Find the same sound elsewhere.** The marked sound, together with
+  everything found to belong to it, becomes a spectro-temporal template. It
+  is matched against the whole recording (normalised cross-correlation,
+  tolerating a small frequency shift), so marking one bird call also catches
+  its repetitions. Each repetition gets the same soft mask, weighted by how
+  well it matches and by how far it stands above the noise there.
 * **Background noise removal that keeps the sound intact.** Instead of a gate
   that deletes everything below the noise floor (which eats attack and decay
   and changes the balance of partials), the noise filter uses a soft spectral
@@ -26,7 +32,8 @@ extract them, together with everything the program finds to belong to them.
 * **A filter building kit.** Filters are listed on the right; each can be
   named, switched on and off, shown or hidden in the spectrogram, set to
   *suppress* or *extract*, and its parts (marked area, harmonics,
-  co-modulated resonances) can be disabled temporarily.
+  co-modulated resonances, the same sound elsewhere) can be disabled
+  temporarily.
 * **Responsive with long recordings.** Processing runs on background threads
   in chunks of a few seconds, nearest to the play head, the selection and the
   visible area first. A one-hour recording is usable immediately; the rest is
@@ -80,8 +87,9 @@ noiseextractor-cli process in.flac --project p.json -o out.wav
 noiseextractor-cli spectrogram in.flac --project p.json -o view.png --max-hz 10000
 ```
 
-`mark` prints which harmonic ratios it found, so you can check what a filter
-will grab before applying it.
+`mark` prints which harmonic ratios it found and where else in the recording
+the same sound occurs, so you can check what a filter will grab before
+applying it.
 
 ## How filters combine
 
@@ -101,8 +109,8 @@ extracting the same target therefore add up (in power) to the original.
 
 ## Planned
 
-* Learn a spectral template (NMF) from a marked sound and find its other
-  occurrences in the whole recording.
+* Tolerate repetitions that are faster/slower or transposed by more than a
+  few bins (time-stretch and pitch-scale invariant matching).
 * Smoother adaptive noise estimate across chunk borders.
 * Undo/redo and editing a filter's rectangle after creating it.
 

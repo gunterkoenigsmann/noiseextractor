@@ -24,6 +24,7 @@ use noiseextractor_core::engine::{process_all, ChunkLayout, ChunkResult};
 use noiseextractor_core::filter::{Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::{mean_power, GainRule, NoiseEstimate};
 use noiseextractor_core::render::{render_rgb, View};
+use noiseextractor_core::similar::find_in_range;
 use noiseextractor_core::stft::Stft;
 use noiseextractor_core::AudioData;
 use std::collections::HashMap;
@@ -230,7 +231,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             project.filters.push(Filter::event(name, selection, action));
             project.prepare(&audio);
-            print_report(&project, audio.sample_rate);
+            print_report(&project, &audio);
             if let Some(p) = save_project {
                 project.save(&p)?;
             }
@@ -331,7 +332,11 @@ fn write_processed(
 }
 
 /// Prints what the analysis found for each event filter.
-fn print_report(project: &Project, sample_rate: u32) {
+fn print_report(project: &Project, audio: &AudioData) {
+    let sample_rate = audio.sample_rate;
+    let mono = audio.mono();
+    let stft = Stft::new(project.stft);
+    let total_frames = project.stft.frame_count(mono.len()) as i64;
     for f in &project.filters {
         let FilterKind::Event(e) = &f.kind else { continue };
         let Some(a) = &e.analysis else { continue };
@@ -360,6 +365,19 @@ fn print_report(project: &Project, sample_rate: u32) {
             .filter(|&k| a.comodulated.iter().any(|f| f[k] > 0.5))
             .count();
         println!("  co-modulated bins: {comod}");
+        match (&a.template, e.use_similar) {
+            (Some(tpl), true) => {
+                let found = find_in_range(tpl, &mono, &stft, 0..total_frames, &e.similar);
+                println!("  same sound found {} times:", found.len());
+                for o in found {
+                    let t = o.frame as f64 * project.stft.hop as f64 / sample_rate as f64;
+                    let note = if o.is_original(tpl) { ", the marked one" } else { "" };
+                    println!("    at {t:.3} s (match {:.2}, shifted {} bins{note})", o.score, o.shift);
+                }
+            }
+            (None, _) => println!("  nothing distinctive to search for elsewhere"),
+            (_, false) => {}
+        }
     }
 }
 
