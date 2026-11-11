@@ -265,7 +265,7 @@ fn build_ui() -> Ui {
     let action = Choice::builder(&side)
         .with_choices(vec!["Suppress".into(), "Extract".into()])
         .build();
-    let parts = CheckListBox::builder(&side).with_size(Size::new(280, 80)).build();
+    let parts = CheckListBox::builder(&side).with_size(Size::new(280, 104)).build();
     let reduction_label = StaticText::builder(&side).with_label("Max. reduction: 18 dB").build();
     let reduction = Slider::builder(&side)
         .with_value(18)
@@ -275,7 +275,7 @@ fn build_ui() -> Ui {
     let learn = Button::builder(&side).with_label("Learn noise from selection").build();
     let adaptive = Button::builder(&side).with_label("Adaptive noise estimate").build();
     let legend = StaticText::builder(&side)
-        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it\nOrange: both\n\nDrag to select, click to set play head,\nwheel zooms (Shift scrolls, Ctrl: frequency),\nSpace plays.")
+        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere\nOrange: both\n\nDrag to select, click to set play head,\nwheel zooms (Shift scrolls, Ctrl: frequency),\nSpace plays.")
         .build();
 
     let s = BoxSizer::builder(Orientation::Vertical).build();

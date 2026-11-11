@@ -141,3 +141,71 @@ fn bad_input_gives_an_error_not_a_panic() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("error:"));
 }
+
+/// Three identical rising chirps (with an overtone) at 0.4, 1.4 and 2.4 s
+/// in light noise.
+fn write_repeated_calls(path: &Path) -> AudioData {
+    let sr = 16000;
+    let mut rng = 9u64;
+    let mut x: Vec<f32> = (0..3 * sr)
+        .map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.01
+        })
+        .collect();
+    for start in [0.4f32, 1.4, 2.4] {
+        let s = (start * sr as f32) as usize;
+        let n = (0.35 * sr as f32) as usize;
+        let mut phase = 0.0f32;
+        for i in 0..n {
+            let t = i as f32 / n as f32;
+            phase += 2.0 * std::f32::consts::PI * (900.0 + 700.0 * t) / sr as f32;
+            let env = (std::f32::consts::PI * t).sin();
+            x[s + i] += env * (0.3 * phase.sin() + 0.12 * (2.0 * phase).sin());
+        }
+    }
+    let audio = AudioData::new(sr as u32, vec![x]);
+    audio.save_wav(path).unwrap();
+    audio
+}
+
+#[test]
+fn marking_one_call_suppresses_all_repetitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("calls.wav");
+    let project = dir.path().join("p.json");
+    let output = dir.path().join("out.wav");
+    let audio = write_repeated_calls(&input);
+    let out = bin()
+        .arg("mark")
+        .arg(&input)
+        .args(["--time", "0.4:0.75", "--freq", "850:1650", "--save-project"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("same sound found 3 times"), "report:\n{report}");
+    assert!(report.contains("the marked one"), "report:\n{report}");
+
+    let st = bin()
+        .arg("process")
+        .arg(&input)
+        .arg("--project")
+        .arg(&project)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let b = AudioData::load(&output).unwrap().channels.remove(0);
+    let a = &audio.channels[0];
+    for start in [0.4f32, 1.4, 2.4] {
+        // middle of each call
+        let r = ((start + 0.1) * 16000.0) as usize..((start + 0.25) * 16000.0) as usize;
+        assert!(
+            rms(&b[r.clone()]) < 0.2 * rms(&a[r.clone()]),
+            "call at {start} s survived"
+        );
+    }
+}

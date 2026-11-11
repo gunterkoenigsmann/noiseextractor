@@ -21,9 +21,9 @@
 //!
 //! The result is a set of *soft* masks (0..1 per time-frequency bin) so that
 //! both the display and the processing can weight membership instead of
-//! making hard decisions. Learning a spectral template (NMF) so the same
-//! sound can be found elsewhere in the recording is planned as a third kind
-//! of evidence.
+//! making hard decisions. The union of these masks also yields a
+//! [`Template`](crate::similar::Template) for finding the same sound elsewhere
+//! in the recording (see [`crate::similar`]).
 
 use crate::noise::NoiseEstimate;
 use crate::stats::{pearson, smoothstep};
@@ -132,6 +132,9 @@ pub struct RegionAnalysis {
     pub pitch_track: Vec<Option<f32>>,
     /// Partials accepted by the harmonic search.
     pub partials: Vec<FoundPartial>,
+    /// Spectro-temporal pattern of the whole sound, for finding it
+    /// elsewhere (`None` if nothing above the noise was marked).
+    pub template: Option<crate::similar::Template>,
 }
 
 impl RegionAnalysis {
@@ -352,6 +355,16 @@ pub fn analyze_power(
         }
     }
 
+    // Template from everything the analysis attributes to the sound.
+    let members: Vec<Vec<f32>> = (0..frames)
+        .map(|t| {
+            (0..bins)
+                .map(|k| selected[t][k].max(harmonics[t][k]).max(comodulated[t][k]))
+                .collect()
+        })
+        .collect();
+    let template = crate::similar::Template::build(power, first_frame, noise, &members);
+
     RegionAnalysis {
         first_frame,
         frames,
@@ -361,6 +374,7 @@ pub fn analyze_power(
         comodulated,
         pitch_track,
         partials,
+        template,
     }
 }
 

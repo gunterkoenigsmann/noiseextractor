@@ -26,6 +26,7 @@
 
 use crate::analysis::{analyze_selection, AnalysisParams, RegionAnalysis, Selection};
 use crate::noise::{NoiseEstimate, NoiseReduction};
+use crate::similar::{add_occurrence_mask, Occurrence, SimilarParams};
 use crate::stft::{Stft, StftConfig};
 use crate::AudioData;
 use anyhow::{Context, Result};
@@ -57,6 +58,13 @@ pub struct EventFilter {
     pub use_harmonics: bool,
     /// Part switch: co-modulated resonances.
     pub use_comodulation: bool,
+    /// Part switch: other occurrences of the same sound in the recording.
+    /// Defaults to off for projects saved before this part existed.
+    #[serde(default)]
+    pub use_similar: bool,
+    /// Tuning of the search for other occurrences.
+    #[serde(default)]
+    pub similar: SimilarParams,
     /// Analysis result; recomputed after loading (see [`Project::prepare`]).
     #[serde(skip)]
     pub analysis: Option<Arc<RegionAnalysis>>,
@@ -71,6 +79,8 @@ impl EventFilter {
             use_selection: true,
             use_harmonics: true,
             use_comodulation: true,
+            use_similar: true,
+            similar: SimilarParams::default(),
             analysis: None,
         }
     }
@@ -132,6 +142,7 @@ impl Filter {
                 ("Marked area", e.use_selection),
                 ("Harmonics (follow the pitch)", e.use_harmonics),
                 ("Co-modulated resonances", e.use_comodulation),
+                ("Same sound elsewhere", e.use_similar),
             ],
         }
     }
@@ -147,6 +158,7 @@ impl Filter {
             0 => &mut e.use_selection,
             1 => &mut e.use_harmonics,
             2 => &mut e.use_comodulation,
+            3 => &mut e.use_similar,
             _ => return false,
         };
         let changed = *slot != on;
@@ -155,27 +167,73 @@ impl Filter {
     }
 }
 
-/// Target mask of an event filter at one frame: the maximum of its enabled
-/// parts. Returns `None` outside the analysed time span or before analysis.
-pub fn event_target(e: &EventFilter, frame: i64, out: &mut [f32]) -> bool {
+/// Masks of an event filter at global frame `frame`: the marked area goes
+/// to `selected`, everything inferred (harmonics, co-modulation, other
+/// occurrences) to `inferred`; only enabled parts contribute. `power` is the
+/// mono power of that frame (needed to weight other occurrences) and
+/// `occurrences` are the places where the sound was found again. Returns
+/// `false` (leaving the outputs untouched) when nothing applies to the frame.
+pub fn event_masks(
+    e: &EventFilter,
+    frame: i64,
+    power: &[f32],
+    occurrences: &[Occurrence],
+    selected: &mut [f32],
+    inferred: &mut [f32],
+) -> bool {
     let Some(a) = &e.analysis else { return false };
-    let Some((sel, harm, comod)) = a.frame(frame) else {
-        return false;
-    };
-    for (k, o) in out.iter_mut().enumerate() {
-        let mut m = 0.0f32;
-        if e.use_selection {
-            m = m.max(sel[k]);
+    let mut any = false;
+    if let Some((sel, harm, comod)) = a.frame(frame) {
+        any = true;
+        for k in 0..selected.len() {
+            selected[k] = if e.use_selection { sel[k] } else { 0.0 };
+            let mut m = 0.0f32;
+            if e.use_harmonics {
+                m = m.max(harm[k]);
+            }
+            if e.use_comodulation {
+                m = m.max(comod[k]);
+            }
+            inferred[k] = m;
         }
-        if e.use_harmonics {
-            m = m.max(harm[k]);
-        }
-        if e.use_comodulation {
-            m = m.max(comod[k]);
-        }
-        *o = m;
     }
-    true
+    if e.use_similar {
+        if let Some(tpl) = &a.template {
+            // Membership of a template cell: the enabled parts of the
+            // original, so switching off e.g. harmonics also removes them
+            // from every copy.
+            let member = |rel: usize, k: usize| -> f32 {
+                let Some((sel, harm, comod)) = a.frame(tpl.first_frame + rel as i64) else {
+                    return 0.0;
+                };
+                let mut m = 0.0f32;
+                if e.use_selection {
+                    m = m.max(sel[k]);
+                }
+                if e.use_harmonics {
+                    m = m.max(harm[k]);
+                }
+                if e.use_comodulation {
+                    m = m.max(comod[k]);
+                }
+                m
+            };
+            // The original is already covered by the parts above; matching
+            // it again would only turn the green marked area orange.
+            let relevant = occurrences
+                .iter()
+                .filter(|o| !o.is_original(tpl) && frame >= o.frame && frame < o.frame + tpl.frames as i64);
+            for occ in relevant {
+                if !any {
+                    selected.iter_mut().for_each(|v| *v = 0.0);
+                    inferred.iter_mut().for_each(|v| *v = 0.0);
+                    any = true;
+                }
+                add_occurrence_mask(tpl, occ, &e.similar, frame, power, &member, inferred);
+            }
+        }
+    }
+    any
 }
 
 /// Power complement √(1 − m²) of a mask value.
@@ -276,12 +334,16 @@ pub struct Gains {
 /// `first_frame - warmup .. first_frame + n` (the warm-up frames only prime
 /// the recursive noise-reduction estimator) and the extra `context` power
 /// frames used for adaptive noise estimation.
+///
+/// `occurrences[i]` lists where the sound of filter `i` was found again
+/// (index `filters.len()` is the preview); missing entries mean none.
 pub fn compute_gains(
     project: &Project,
     power_with_warmup: &[Vec<f32>],
     warmup: usize,
     context: &[Vec<f32>],
     first_frame: i64,
+    occurrences: &[Vec<Occurrence>],
 ) -> Gains {
     let bins = project.stft.bins();
     let n = power_with_warmup.len() - warmup;
@@ -289,9 +351,13 @@ pub fn compute_gains(
     let mut suppress = vec![vec![1.0f32; bins]; n];
     let mut selected = vec![vec![0.0f32; bins]; n];
     let mut inferred = vec![vec![0.0f32; bins]; n];
+    let mut scratch_sel = vec![0.0f32; bins];
+    let mut scratch_inf = vec![0.0f32; bins];
     let mut scratch = vec![0.0f32; bins];
+    let no_occurrences: Vec<Occurrence> = Vec::new();
+    let occ_of = |i: usize| occurrences.get(i).unwrap_or(&no_occurrences);
 
-    for f in &project.filters {
+    for (fi, f) in project.filters.iter().enumerate() {
         if !f.enabled {
             continue;
         }
@@ -315,8 +381,13 @@ pub fn compute_gains(
                     extract.get_or_insert_with(|| vec![vec![0.0; bins]; n]);
                 }
                 for t in 0..n {
-                    if !event_target(e, first_frame + t as i64, &mut scratch) {
+                    let frame = first_frame + t as i64;
+                    let power = &power_with_warmup[warmup + t];
+                    if !event_masks(e, frame, power, occ_of(fi), &mut scratch_sel, &mut scratch_inf) {
                         continue;
+                    }
+                    for k in 0..bins {
+                        scratch[k] = scratch_sel[k].max(scratch_inf[k]);
                     }
                     match f.action {
                         FilterAction::Suppress => scratch
@@ -334,28 +405,26 @@ pub fn compute_gains(
     }
 
     // Overlays of visible event filters, including the live preview.
-    for f in project.filters.iter().chain(project.preview.as_ref()) {
+    for (fi, f) in project.filters.iter().chain(project.preview.as_ref()).enumerate() {
         let FilterKind::Event(e) = &f.kind else { continue };
         if !f.visible {
             continue;
         }
-        let Some(a) = &e.analysis else { continue };
         for t in 0..n {
-            let Some((sel, harm, comod)) = a.frame(first_frame + t as i64) else {
+            let power = &power_with_warmup[warmup + t];
+            if !event_masks(
+                e,
+                first_frame + t as i64,
+                power,
+                occ_of(fi),
+                &mut scratch_sel,
+                &mut scratch_inf,
+            ) {
                 continue;
-            };
+            }
             for k in 0..bins {
-                if e.use_selection {
-                    selected[t][k] = selected[t][k].max(sel[k]);
-                }
-                let mut i = 0.0f32;
-                if e.use_harmonics {
-                    i = i.max(harm[k]);
-                }
-                if e.use_comodulation {
-                    i = i.max(comod[k]);
-                }
-                inferred[t][k] = inferred[t][k].max(i);
+                selected[t][k] = selected[t][k].max(scratch_sel[k]);
+                inferred[t][k] = inferred[t][k].max(scratch_inf[k]);
             }
         }
     }
@@ -422,6 +491,7 @@ mod tests {
             0,
             &power,
             0,
+            &[],
         );
         let e = compute_gains(
             &project(vec![analysed_event(FilterAction::Extract, 0.6)]),
@@ -429,6 +499,7 @@ mod tests {
             0,
             &power,
             0,
+            &[],
         );
         for k in 0..3 {
             let sum = s.gain[0][k].powi(2) + e.gain[0][k].powi(2);
@@ -442,10 +513,10 @@ mod tests {
         let mut f = analysed_event(FilterAction::Suppress, 1.0);
         assert!(f.set_part_enabled(1, false));
         assert!(!f.set_part_enabled(1, false));
-        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0);
+        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0, &[]);
         assert_eq!(g.gain[0], vec![0.0, 1.0, 0.0]);
         f.enabled = false;
-        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0);
+        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0, &[]);
         assert_eq!(g.gain[0], vec![1.0, 1.0, 1.0]);
     }
 
@@ -458,7 +529,7 @@ mod tests {
         let mut b = analysed_event(FilterAction::Extract, 1.0);
         b.set_part_enabled(0, false);
         b.set_part_enabled(2, false);
-        let g = compute_gains(&project(vec![a, b]), &power, 0, &power, 0);
+        let g = compute_gains(&project(vec![a, b]), &power, 0, &power, 0, &[]);
         assert_eq!(g.gain[0], vec![1.0, 1.0, 0.0]);
         // Frames 2 and 3 lie outside the analysed span: nothing to extract.
         assert_eq!(g.gain[3], vec![0.0, 0.0, 0.0]);
@@ -469,11 +540,11 @@ mod tests {
         let power = vec![vec![1.0; 3]; 2];
         let mut f = analysed_event(FilterAction::Suppress, 0.8);
         f.enabled = false;
-        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0);
+        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0, &[]);
         assert_eq!(g.selected[0][0], 0.8);
         assert_eq!(g.inferred[0][1], 0.8);
         f.visible = false;
-        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0);
+        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0, &[]);
         assert_eq!(g.selected[0][0], 0.0);
     }
 
