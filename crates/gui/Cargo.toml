@@ -1,0 +1,13 @@
+[package]
+name = "noiseextractor"
+description = "Interactive spectrogram editor for marking, suppressing and extracting noises"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+noiseextractor-core.workspace = true
+anyhow.workspace = true
+wxdragon = { version = "0.9.24", default-features = false }
+cpal = "0.15"
