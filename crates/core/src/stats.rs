@@ -58,7 +58,7 @@ pub fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 /// small arguments and a continued fraction (modified Lentz) for large ones,
 /// following Numerical Recipes §6.3. Accurate to ~1e-7 relative.
 pub fn expint_e1(x: f64) -> f64 {
-    const EULER: f64 = 0.577_215_664_901_532_9;
+    const EULER: f64 = std::f64::consts::EULER_GAMMA;
     if x <= 0.0 {
         return f64::INFINITY;
     }
