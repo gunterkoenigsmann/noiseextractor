@@ -1,0 +1,183 @@
+# Weekly `cargo update`: refreshes every crate in Cargo.lock, including the
+# transitive ones, to the newest semver-compatible version, and offers the
+# result as a pull request that the full CI tests (issue #58).
+#
+# Why not only Dependabot (.github/dependabot.yml)? Its cargo updates bump
+# direct dependencies; the crates further down the tree, where most RustSec
+# advisories land, stay pinned in Cargo.lock until someone runs
+# `cargo update`. Dependabot is therefore left with the major bumps (which
+# may need code changes) and the GitHub Actions; this workflow does the rest.
+#
+# Timing: Saturdays, so that a green update is merged well before the weekly
+# snap rebuild (snap-publish.yml, Mondays 03:17 UTC) and a red one leaves a
+# weekend to look at it.
+#
+# How the PR gets tested and merged without a personal token:
+#
+# 1. The job pushes the branch `deps/cargo-update` (always rebuilt from the
+#    current main, force-pushed) and opens or updates the PR.
+#    A PR or push made with GITHUB_TOKEN triggers no `pull_request` or `push`
+#    workflows (GitHub's guard against recursive runs), but it may start
+#    workflows by `workflow_dispatch`. So the job dispatches CI (and the
+#    snap build) on the branch; their checks attach to the branch's head
+#    commit and show up on the PR.
+# 2. The same job then waits for those runs (`gh run watch`). When every
+#    one finished green and the branch still contains the current main, it
+#    merges the PR, following the project's early-phase rule of merging
+#    green PRs. A red run leaves the PR open for a human.
+#
+#    An earlier version merged from a second job triggered by
+#    `workflow_run`. That never fired (issue #114): runs started with
+#    GITHUB_TOKEN, here by `gh workflow run`, raise no `workflow_run`
+#    events either. Waiting in the job costs runner minutes, but needs no
+#    secret and no branch protection.
+#
+# Repository setting needed once: Settings -> Actions -> General ->
+# Workflow permissions -> "Allow GitHub Actions to create and approve pull
+# requests". Without it `gh pr create` fails with a 403 and the run says so.
+name: Cargo update
+
+on:
+  schedule:
+    # Saturdays 04:41 UTC: off the full hour, when the schedulers are busiest.
+    - cron: "41 4 * * 6"
+  # Run it by hand, e.g. right after a RustSec advisory.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BRANCH: deps/cargo-update
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    # Mostly waiting: CI takes about 15 minutes, the snap build longer.
+    timeout-minutes: 150
+    # A second update (by hand) must not merge while this one waits.
+    concurrency:
+      group: cargo-update
+    permissions:
+      contents: write
+      pull-requests: write
+      # gh workflow run (workflow_dispatch) needs write access to Actions,
+      # gh run list / watch read access.
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+      # cargo update prints one "Updating foo v1.2.3 -> v1.2.4" line per
+      # crate on stderr; they become the PR description.
+      - name: cargo update
+        id: update
+        run: |
+          cargo update 2>&1 | tee "$RUNNER_TEMP/update.log"
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock is up to date."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Push branch
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git commit -m "Update Cargo.lock (cargo update)" -- Cargo.lock
+          # The branch is ours alone and rebuilt from main every week.
+          git push --force origin "$BRANCH"
+      - name: Open or update the pull request
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          {
+            echo "Weekly \`cargo update\` of all crates in \`Cargo.lock\` to the newest"
+            echo "semver-compatible versions (issue #58, workflow \`cargo-update.yml\`)."
+            echo
+            echo "CI was started on this branch by the workflow. When every run is green"
+            echo "the PR is merged automatically; a red run leaves it open."
+            echo
+            echo '```'
+            grep -E '^ *(Updating|Adding|Removing|Downgrading) ' "$RUNNER_TEMP/update.log" || true
+            echo '```'
+          } > "$RUNNER_TEMP/body.md"
+          if number="$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number')" && [ -n "$number" ]; then
+            gh pr edit "$number" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --head "$BRANCH" --base main \
+              --title "Weekly cargo update" --body-file "$RUNNER_TEMP/body.md" || {
+              echo "::error::Could not open the PR. Enable Settings -> Actions -> General -> 'Allow GitHub Actions to create and approve pull requests'."
+              exit 1
+            }
+          fi
+      # Runs started by workflow_dispatch attach their checks to the head
+      # commit of the given ref, so they show on the PR.
+      - name: Start CI on the branch
+        id: dispatch
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          workflows="ci.yml"
+          # The snap build (snap.yml) normally runs for PRs that touch
+          # Cargo.lock, because a new crate may need a system library the
+          # snap lacks. Start it too where it exists.
+          if gh workflow view snap.yml > /dev/null 2>&1; then
+            workflows="$workflows snap.yml"
+          fi
+          for w in $workflows; do
+            gh workflow run "$w" --ref "$BRANCH"
+          done
+          echo "workflows=$workflows" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Wait for the runs and merge when all are green
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ steps.dispatch.outputs.sha }}
+          WORKFLOWS: ${{ steps.dispatch.outputs.workflows }}
+        run: |
+          # A dispatched run takes a few seconds to show up.
+          ids=""
+          for w in $WORKFLOWS; do
+            id=""
+            for _ in $(seq 30); do
+              id="$(gh run list --workflow "$w" --commit "$SHA" --event workflow_dispatch \
+                --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+              [ -n "$id" ] && break
+              sleep 10
+            done
+            if [ -z "$id" ]; then
+              echo "::warning::No $w run on $SHA showed up; leaving the PR open."
+              exit 0
+            fi
+            ids="$ids $id"
+          done
+          for id in $ids; do
+            if ! gh run watch "$id" --exit-status --interval 60 > /dev/null; then
+              echo "::warning::Run $id failed; leaving the PR open for a human."
+              exit 0
+            fi
+            echo "Run $id passed."
+          done
+          number="$(gh pr list --head "$BRANCH" --base main --state open --json number,headRefOid \
+            --jq ".[] | select(.headRefOid == \"$SHA\") | .number")"
+          if [ -z "$number" ]; then
+            echo "No open PR with head $SHA (superseded or already merged)."
+            exit 0
+          fi
+          # Only merge what was tested: the branch must still contain the
+          # current main. If main moved on, next week's run rebuilds the
+          # branch (or run the workflow by hand).
+          status="$(gh api "repos/$GH_REPO/compare/main...$SHA" --jq .status)"
+          if [ "$status" != "ahead" ]; then
+            echo "::warning::main has moved since the update ($status); not merging untested combinations. Run the workflow again."
+            exit 0
+          fi
+          gh pr merge "$number" --squash
+          # Through the API rather than --delete-branch, which would also
+          # try to delete the checked-out local branch.
+          gh api -X DELETE "repos/$GH_REPO/git/refs/heads/$BRANCH" || true
