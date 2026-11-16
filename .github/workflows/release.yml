@@ -1,0 +1,360 @@
+# Release packages for Linux, Windows and macOS (modelled on
+# losslessaudiocut's release workflow; keep them alike).
+#
+# Pushing a tag vX.Y.Z (matching `version` in Cargo.toml) builds
+#
+#   - Linux x86_64 and aarch64: a Debian package (.deb, for Debian 13 /
+#     Ubuntu 24.04 and newer) and an AppImage (any distribution with
+#     glibc 2.39 or newer),
+#   - Windows x64 and arm64: a zip to run without installing, and an
+#     installer (Inno Setup),
+#   - macOS arm64 (Apple silicon) and x86_64 (Intel): a .dmg with the .app,
+#
+# smoke-tests each package on a clean path (CLI on packaging/smoke-test.wav,
+# GUI start), and attaches all of them plus SHA256SUMS.txt to the GitHub
+# release of the tag, creating the release if it does not exist yet. A tag
+# with a suffix (v1.2.0-rc1) becomes a pre-release. docs/release.md has the
+# steps.
+#
+# On pull requests that touch the packaging, and when started by hand, the
+# same packages are built and tested and kept as workflow artifacts, but
+# nothing is released.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - packaging/**
+      - crates/gui/build.rs
+      - crates/gui/build/**
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# One run per tag or PR; a newer push to the same PR replaces the old run,
+# a tag run is never cancelled halfway through a release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+      # Fails a tag that does not match Cargo.toml before anything is built.
+      - id: version
+        run: |
+          version="$(packaging/version.sh "$GITHUB_REF")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case "$version" in *-*) pre=true ;; *) pre=false ;; esac
+          echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
+          echo "Version $version (pre-release: $pre)"
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    # Cold build including wxWidgets is about 10 minutes; packaging 2.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Its own cache: release builds share nothing with CI's debug builds.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      # Build dependencies as in ci.yml; librsvg2-bin renders the icon,
+      # dpkg-dev computes the .deb's dependencies, xvfb runs the GUI smoke
+      # test. The packages need the glibc of Ubuntu 24.04 (2.39) or newer.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libasound2-dev libpng-dev libjpeg-dev libtiff-dev \
+            libexpat1-dev libxkbcommon-dev libgl1-mesa-dev libglu1-mesa-dev \
+            libclang-dev pkg-config cmake ninja-build \
+            librsvg2-bin dpkg-dev xvfb
+      - run: cargo build --release --locked -p noiseextractor -p noiseextractor-cli
+      - name: AppImage
+        run: packaging/linux/appimage.sh "${{ needs.version.outputs.version }}" dist
+      - name: Debian package
+        run: packaging/linux/deb.sh "${{ needs.version.outputs.version }}" dist
+      # The CLI from inside the AppImage (it finds the bundled libraries by
+      # its rpath), then the GUI: it must come up with the recording loaded
+      # and keep running until `timeout` ends it with status 124. Both run
+      # in a scratch directory so nothing from the build tree is picked up.
+      - name: Smoke test (AppImage)
+        run: |
+          set -x
+          image="$(realpath dist/*.AppImage)"
+          wav="$(realpath packaging/smoke-test.wav)"
+          cd "$(mktemp -d)"
+          "$image" --appimage-extract > /dev/null
+          ldd squashfs-root/usr/bin/noiseextractor-cli
+          squashfs-root/usr/bin/noiseextractor-cli --version
+          squashfs-root/usr/bin/noiseextractor-cli denoise "$wav" -o out.wav
+          squashfs-root/usr/bin/noiseextractor-cli spectrogram "$wav" -o spec.png
+          test -s out.wav && test -s spec.png
+          grep -q '^MimeType=audio/x-wav;' squashfs-root/noiseextractor.desktop
+          # The command line tool through the AppImage itself: with --cli,
+          # and through a symlink named noiseextractor-cli
+          # (packaging/linux/AppRun).
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          "$image" --cli --version
+          ln -s "$image" noiseextractor-cli
+          ./noiseextractor-cli denoise "$wav" -o out2.wav
+          cmp out.wav out2.wav
+          set +e
+          xvfb-run -a timeout 20 "$image" "$wav"
+          status=$?
+          echo "exit status: $status"
+          test "$status" -eq 124
+      # Installs the .deb with apt in clean containers of the oldest
+      # distributions it is meant for, which checks that its Depends line
+      # pulls in every library the programs need, then runs both programs.
+      - name: Smoke test (Debian package)
+        run: |
+          set -x
+          for image in ubuntu:24.04 debian:trixie; do
+            docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD/packaging:/packaging:ro" "$image" sh -exc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -q
+              apt-get install -y -q --no-install-recommends /dist/*.deb xvfb xauth
+              cd "$(mktemp -d)"
+              noiseextractor-cli --version
+              noiseextractor-cli denoise /packaging/smoke-test.wav -o out.wav
+              test -s out.wav
+              test -s /usr/share/applications/noiseextractor.desktop
+              set +e
+              xvfb-run -a timeout 20 noiseextractor /packaging/smoke-test.wav
+              status=$?
+              echo "exit status: $status"
+              test "$status" -eq 124
+            '
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: DMG (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-latest }
+          - { arch: x86_64, runner: macos-15-intel }
+    runs-on: ${{ matrix.runner }}
+    # macOS runners sometimes wait long for capacity; this counts running
+    # time only.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      # librsvg (rsvg-convert) renders the icon.
+      - name: Install build dependencies
+        run: brew install librsvg
+      - run: cargo build --release --locked -p noiseextractor -p noiseextractor-cli
+      - name: Package
+        run: packaging/macos/dmg.sh "${{ needs.version.outputs.version }}" dist
+      # Runs the programs from the mounted disk image, the way a user gets
+      # them. dmg.sh already checked that only system libraries are linked.
+      - name: Smoke test
+        run: |
+          set -x
+          wav="$(pwd)/packaging/smoke-test.wav"
+          mnt="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" dist/*.dmg
+          app="$mnt/noiseextractor.app/Contents/MacOS"
+          cd "$(mktemp -d)"
+          "$app/noiseextractor-cli" --version
+          "$app/noiseextractor-cli" denoise "$wav" -o out.wav
+          "$app/noiseextractor-cli" spectrogram "$wav" -o spec.png
+          test -s out.wav && test -s spec.png
+          plutil -extract CFBundleDocumentTypes.0.LSItemContentTypes xml1 -o - "$app/../Info.plist"
+          # The GUI must still be running after 15 s (macOS has no
+          # `timeout`): a missing library or a crash ends it earlier.
+          "$app/noiseextractor" "$wav" &
+          pid=$!
+          sleep 15
+          kill -0 "$pid"
+          kill "$pid"
+          wait "$pid" || true
+          hdiutil detach "$mnt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: windows-latest }
+          - { arch: arm64, runner: windows-11-arm }
+    runs-on: ${{ matrix.runner }}
+    # A cold wxWidgets build on Windows takes longest of all.
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Link the C runtime statically (wxdragon builds wxWidgets with the
+      # matching /MT then), so users need no Visual C++ redistributable.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      # bindgen (wxdragon-sys) loads libclang.dll into the build script,
+      # so it must be built for the runner's own architecture. The x64
+      # image has LLVM; on arm64 install the native (woa64) build.
+      - name: libclang
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ("${{ matrix.arch }}" -eq "arm64") {
+            $llvm = "20.1.8"
+            gh release download "llvmorg-$llvm" -R llvm/llvm-project -p "LLVM-$llvm-woa64.exe" -O llvm.exe
+            # NSIS installer: /S silent, /D target folder (must come last).
+            Start-Process -Wait -FilePath .\llvm.exe -ArgumentList '/S', '/D=C:\llvm-arm64'
+            $bin = 'C:\llvm-arm64\bin'
+          } else {
+            $bin = 'C:\Program Files\LLVM\bin'
+          }
+          if (-not (Test-Path "$bin\libclang.dll")) { throw "libclang.dll not found in $bin" }
+          "LIBCLANG_PATH=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+      # wxdragon builds wxWidgets with CMake and Ninja.
+      - name: Ninja
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            $zip = if ("${{ matrix.arch }}" -eq "arm64") { 'ninja-winarm64.zip' } else { 'ninja-win.zip' }
+            Invoke-WebRequest "https://github.com/ninja-build/ninja/releases/download/v1.12.1/$zip" -OutFile ninja.zip
+            Expand-Archive ninja.zip -DestinationPath "$env:RUNNER_TEMP\ninja"
+            "$env:RUNNER_TEMP\ninja" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+      - name: Inno Setup
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            Invoke-WebRequest 'https://jrsoftware.org/download.php/is.exe' -OutFile is.exe
+            Start-Process -Wait -FilePath .\is.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/ALLUSERS'
+          }
+      - run: cargo build --release --locked -p noiseextractor -p noiseextractor-cli
+      - name: Package
+        run: |
+          packaging/windows/package.ps1 -Version "${{ needs.version.outputs.version }}" `
+            -Arch ${{ matrix.arch }} -OutDir dist
+      # Unzips the zip and installs the installer silently, and runs the CLI
+      # on the test recording and starts the GUI from each.
+      - name: Smoke test
+        run: |
+          $wav = Resolve-Path packaging\smoke-test.wav
+          $work = Join-Path $env:RUNNER_TEMP smoke
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Expand-Archive (Get-Item dist\*.zip).FullName -DestinationPath $work
+          $zipDir = (Get-ChildItem $work -Directory | Select-Object -First 1).FullName
+
+          $setup = (Get-Item dist\*-setup.exe).FullName
+          $installDir = Join-Path $env:RUNNER_TEMP installed
+          Start-Process -Wait -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$installDir"
+          if (-not (Test-Path "$installDir\noiseextractor.exe")) { throw "installer did not install to $installDir" }
+          # The "Open with" task is on by default. The runner is admin, so
+          # the installation is per machine: HKLM.
+          $openWith = Get-ItemProperty 'HKLM:\Software\Classes\.wav\OpenWithProgids'
+          if ($null -eq $openWith.'noiseextractor.audio') { throw "no Open with entry for .wav" }
+          Get-ItemProperty 'HKLM:\Software\Classes\noiseextractor.audio\shell\open\command'
+
+          foreach ($dir in @($zipDir, $installDir)) {
+            Write-Host "--- $dir"
+            Push-Location $work
+            & "$dir\noiseextractor-cli.exe" --version; if ($LASTEXITCODE -ne 0) { throw "--version failed" }
+            & "$dir\noiseextractor-cli.exe" denoise $wav -o out.wav; if ($LASTEXITCODE -ne 0) { throw "denoise failed" }
+            if (-not (Test-Path out.wav)) { throw "denoise wrote nothing" }
+            Remove-Item out.wav
+            Pop-Location
+            # The GUI must still be running after 15 s: a crash at start-up
+            # ends it.
+            $gui = Start-Process -FilePath "$dir\noiseextractor.exe" -ArgumentList "`"$wav`"" -PassThru
+            Start-Sleep -Seconds 15
+            if ($gui.HasExited) { throw "GUI exited with code $($gui.ExitCode)" }
+            Stop-Process -Id $gui.Id
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, linux, macos, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Create the release and upload its files.
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+    steps:
+      # For the hand-written notes in docs/release-notes/.
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      # A release that someone already created for the tag keeps its text
+      # and only gets the files. Otherwise it is created with notes
+      # generated from the merged PRs; if docs/release-notes/<tag>.md
+      # exists, its text comes first and the generated list is appended.
+      - name: Publish
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*
+          else
+            flags=()
+            if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+            notes="docs/release-notes/$TAG.md"
+            if [ -f "$notes" ]; then flags+=(--notes-file "$notes"); fi
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag \
+              --title "noiseextractor $VERSION" --generate-notes "${flags[@]}" dist/*
+          fi

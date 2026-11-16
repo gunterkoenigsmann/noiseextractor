@@ -11,3 +11,8 @@ noiseextractor-core.workspace = true
 anyhow.workspace = true
 wxdragon = { version = "0.9.24", default-features = false, features = ["aui"] }
 cpal = "0.15"
+
+[build-dependencies]
+# Compiles the Windows resources (icon, version, manifest) with rc.exe or
+# windres; see build.rs. Unused on other targets.
+embed-resource = "3.0.12"

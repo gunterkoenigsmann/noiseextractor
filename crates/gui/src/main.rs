@@ -33,6 +33,9 @@
 //! picked. They can be kept, renamed, merged, split or discarded; their
 //! parts are the spectral patterns found.
 
+// A release build is a GUI program on Windows: started from Explorer it
+// gets no console window. Debug builds keep the console for their output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 // Every item, public or private, carries a doc comment (project rule).
 #![warn(missing_docs, clippy::missing_docs_in_private_items)]
 
@@ -86,8 +89,15 @@ const ID_LOG_FREQ: i32 = ID_HIGHEST + 7;
 /// File > Quit.
 const ID_QUIT: i32 = ID_HIGHEST + 8;
 
-/// Supported input formats for the open dialog.
-const AUDIO_WILDCARD: &str = "Audio files|*.wav;*.flac;*.ogg;*.mp3;*.m4a;*.aac;*.WAV;*.FLAC;*.OGG;*.MP3|All files|*";
+/// Supported input formats for the open dialog (from
+/// `noiseextractor_core::audio::FILE_TYPES`, which the packages' file
+/// associations are checked against).
+fn audio_wildcard() -> String {
+    format!(
+        "Audio files|{}|All files|*",
+        noiseextractor_core::audio::file_dialog_patterns()
+    )
+}
 /// Project files.
 const PROJECT_WILDCARD: &str = "noiseextractor projects (*.nxp.json)|*.nxp.json;*.json|All files|*";
 
@@ -536,7 +546,7 @@ fn bind_events(state: &Shared, ui: Ui) {
     let st = state.clone();
     ui.frame.on_menu(move |e| match e.get_id() {
         ID_OPEN_AUDIO => {
-            if let Some(path) = file_dialog(ui, "Open audio", AUDIO_WILDCARD, false) {
+            if let Some(path) = file_dialog(ui, "Open audio", &audio_wildcard(), false) {
                 start_loading(&mut st.borrow_mut(), path);
             }
         }
@@ -1807,6 +1817,12 @@ fn paint_overview(s: &State, ui: Ui, dc: &AutoBufferedPaintDC) {
     dc.set_pen(Colour::rgb(255, 230, 80), 1, PenStyle::Solid);
     dc.draw_line(px, 0, px, h);
 }
+
+/// The Windows resource script that `build.rs` compiles, included here so
+/// that its unit tests run on every platform.
+#[cfg(test)]
+#[path = "../build/resources.rs"]
+mod resources;
 
 #[cfg(test)]
 mod tests {

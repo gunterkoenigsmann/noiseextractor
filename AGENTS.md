@@ -30,6 +30,15 @@
   losslessaudiocut (gunterkoenigsmann/losslessaudiocut) on purpose; keep
   them alike.
 
+## Releases
+
+Pushing a tag `vX.Y.Z` builds, smoke-tests and publishes Debian packages,
+AppImages, Windows zips/installers and macOS DMGs
+(`.github/workflows/release.yml`, scripts in `packaging/`, steps in
+`docs/release.md`). Adding an input format means adding it to `FILE_TYPES`
+in `crates/core/src/audio.rs` and to the three packages' file associations;
+`crates/core/tests/packaging.rs` fails until they agree.
+
 ## Commands
 
 ```sh
