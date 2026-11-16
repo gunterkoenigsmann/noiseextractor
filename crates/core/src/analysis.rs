@@ -149,6 +149,9 @@ pub struct RegionAnalysis {
     /// Spectro-temporal pattern of the whole sound, for finding it
     /// elsewhere (`None` if nothing above the noise was marked).
     pub template: Option<crate::similar::Template>,
+    /// How loud the parts are relative to the fundamental, for sharing
+    /// bins with other filters (`None` without a pitch track).
+    pub model: Option<crate::share::SourceModel>,
 }
 
 impl RegionAnalysis {
@@ -223,6 +226,7 @@ pub fn analyze_selection(
     if channels.len() >= 2 && apply_direction(&mut analysis, channels, stft, (k0, k1), params) {
         // The membership changed, so the template has to follow.
         analysis.template = crate::similar::Template::build(span, f0, &noise_power, &analysis.members());
+        analysis.model = crate::share::SourceModel::build(span, &noise_power, &analysis, params.harmonic_tolerance);
     }
     if let Some(template) = analysis.template.as_mut() {
         template.attach_spatial(channels, stft, params.max_delay_samples);
@@ -473,9 +477,11 @@ pub fn analyze_power(
         pitch_track,
         partials,
         template: None,
+        model: None,
     };
     // Template from everything the analysis attributes to the sound.
     analysis.template = crate::similar::Template::build(power, first_frame, noise, &analysis.members());
+    analysis.model = crate::share::SourceModel::build(power, noise, &analysis, params.harmonic_tolerance);
     analysis
 }
 

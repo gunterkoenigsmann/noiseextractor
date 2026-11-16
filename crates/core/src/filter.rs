@@ -338,6 +338,13 @@ pub struct Gains {
 ///
 /// `occurrences[i]` lists where the sound of filter `i` was found again
 /// (index `filters.len()` is the preview); missing entries mean none.
+///
+/// Where an extract and a suppress filter claim the same bin, the bin's
+/// energy is shared out between them (see [`crate::share`]); `channels`
+/// are the spectra of the individual channels for the same frames
+/// (`first_frame ..`), used there to tell sounds apart by direction. Pass
+/// `&[]` for mono recordings or when they are not at hand.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_gains(
     project: &Project,
     power_with_warmup: &[Vec<f32>],
@@ -345,6 +352,7 @@ pub fn compute_gains(
     context: &[Vec<f32>],
     first_frame: i64,
     occurrences: &[Vec<Occurrence>],
+    channels: &[crate::stft::Spectra],
 ) -> Gains {
     let bins = project.stft.bins();
     let n = power_with_warmup.len() - warmup;
@@ -354,10 +362,14 @@ pub fn compute_gains(
     let mut inferred = vec![vec![0.0f32; bins]; n];
     let mut scratch_sel = vec![0.0f32; bins];
     let mut scratch_inf = vec![0.0f32; bins];
-    let mut scratch = vec![0.0f32; bins];
     let no_occurrences: Vec<Occurrence> = Vec::new();
     let occ_of = |i: usize| occurrences.get(i).unwrap_or(&no_occurrences);
 
+    // Event filters' masks first (frame by frame), so that bins claimed by
+    // both an extract and a suppress filter can be shared out before the
+    // masks are applied.
+    let mut events: EventMasks = Vec::new();
+    let mut share_noise: Option<Vec<f32>> = None;
     for (fi, f) in project.filters.iter().enumerate() {
         if !f.enabled {
             continue;
@@ -376,30 +388,54 @@ pub fn compute_gains(
                         }
                     }
                 }
+                share_noise.get_or_insert(noise);
             }
             FilterKind::Event(e) => {
                 if f.action == FilterAction::Extract {
                     extract.get_or_insert_with(|| vec![vec![0.0; bins]; n]);
                 }
-                for t in 0..n {
-                    let frame = first_frame + t as i64;
-                    let power = &power_with_warmup[warmup + t];
-                    if !event_masks(e, frame, power, occ_of(fi), &mut scratch_sel, &mut scratch_inf) {
-                        continue;
-                    }
-                    for k in 0..bins {
-                        scratch[k] = scratch_sel[k].max(scratch_inf[k]);
-                    }
-                    match f.action {
-                        FilterAction::Suppress => scratch
-                            .iter()
-                            .zip(&mut suppress[t])
-                            .for_each(|(m, s)| *s *= complement(*m)),
-                        FilterAction::Extract => {
-                            let ex = extract.as_mut().expect("created above");
-                            scratch.iter().zip(&mut ex[t]).for_each(|(m, e)| *e = e.max(*m));
-                        }
-                    }
+                let masks = (0..n)
+                    .map(|t| {
+                        let frame = first_frame + t as i64;
+                        let power = &power_with_warmup[warmup + t];
+                        event_masks(e, frame, power, occ_of(fi), &mut scratch_sel, &mut scratch_inf)
+                            .then(|| (0..bins).map(|k| scratch_sel[k].max(scratch_inf[k])).collect())
+                    })
+                    .collect();
+                events.push((fi, f, e, masks));
+            }
+        }
+    }
+    let both = |extract: bool| {
+        events
+            .iter()
+            .any(|(_, f, _, _)| (f.action == FilterAction::Extract) == extract)
+    };
+    if both(true) && both(false) {
+        let noise = share_noise.unwrap_or_else(|| {
+            events
+                .iter()
+                .find_map(|(_, _, e, _)| e.analysis.as_ref()?.template.as_ref().map(|t| t.noise.clone()))
+                .unwrap_or_else(|| vec![0.0; bins])
+        });
+        share_bins(
+            &mut events,
+            &power_with_warmup[warmup..],
+            &noise,
+            first_frame,
+            occurrences,
+            channels,
+            project.stft.fft_size,
+        );
+    }
+    for (_, f, _, masks) in &events {
+        for (t, m) in masks.iter().enumerate() {
+            let Some(m) = m else { continue };
+            match f.action {
+                FilterAction::Suppress => m.iter().zip(&mut suppress[t]).for_each(|(m, s)| *s *= complement(*m)),
+                FilterAction::Extract => {
+                    let ex = extract.as_mut().expect("created above");
+                    m.iter().zip(&mut ex[t]).for_each(|(m, e)| *e = e.max(*m));
                 }
             }
         }
@@ -442,6 +478,119 @@ pub fn compute_gains(
         gain,
         selected,
         inferred,
+    }
+}
+
+/// Event filters with their masks per frame, as collected in
+/// [`compute_gains`]: `(index in the list, filter, event part, masks)`.
+type EventMasks<'a> = Vec<(usize, &'a Filter, &'a EventFilter, Vec<Option<Vec<f32>>>)>;
+
+/// Shares contested bins between extract and suppress filters (see
+/// [`crate::share`]): predicts each sound's shape in every frame from its
+/// source model, measures its loudness on its uncontested bins (borrowing
+/// from neighbouring frames where none is free), and replaces the masks
+/// in contested bins by the shares. In contested bins the suppress masks
+/// are then dropped, because the extract masks already hold only what is
+/// to be kept.
+fn share_bins(
+    events: &mut EventMasks,
+    power: &[Vec<f32>],
+    noise: &[f32],
+    first_frame: i64,
+    occurrences: &[Vec<Occurrence>],
+    channels: &[crate::stft::Spectra],
+    fft_size: usize,
+) {
+    use crate::share::{contested, fill_gaps, loudness, share_frame, Claimant};
+    let n = power.len();
+    let bins = noise.len();
+    // Contested bins per frame (from the masks alone).
+    let contested_bins: Vec<Option<Vec<bool>>> = (0..n)
+        .map(|t| {
+            let masks: Vec<(bool, &[f32])> = events
+                .iter()
+                .filter_map(|(_, f, _, m)| Some((f.action == FilterAction::Extract, m[t].as_deref()?)))
+                .collect();
+            let c = contested(&masks);
+            c.iter().any(|&b| b).then_some(c)
+        })
+        .collect();
+    if contested_bins.iter().all(Option::is_none) {
+        return;
+    }
+    // Predicted shapes and loudness of every filter's sound per frame.
+    let mut shapes: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(events.len());
+    let mut loud: Vec<Vec<Option<f32>>> = Vec::with_capacity(events.len());
+    let mut scratch = vec![0.0f32; bins];
+    for (fi, _, e, masks) in events.iter() {
+        let a = e.analysis.as_ref();
+        let model = a.and_then(|a| a.model.as_ref());
+        let (mut sh, mut lo) = (vec![None; n], vec![None; n]);
+        if let (Some(a), Some(model)) = (a, model) {
+            for t in 0..n {
+                if masks[t].is_none() {
+                    continue;
+                }
+                let frame = first_frame + t as i64;
+                let mut placements = Vec::new();
+                if a.frame(frame).is_some() {
+                    placements.push(((frame - a.first_frame) as usize, 0.0f32));
+                }
+                if let (true, Some(tpl)) = (e.use_similar, &a.template) {
+                    for o in occurrences.get(*fi).map_or(&[][..], Vec::as_slice) {
+                        if !o.is_original(tpl) && frame >= o.frame && frame < o.frame + tpl.frames as i64 {
+                            let idx = tpl.first_frame - a.first_frame + (frame - o.frame);
+                            placements.push((idx as usize, o.shift as f32));
+                        }
+                    }
+                }
+                if placements.is_empty() {
+                    continue;
+                }
+                let mut shape = vec![0.0f32; bins];
+                for (idx, shift) in placements {
+                    let pitch = a.pitch_track.get(idx).copied().flatten();
+                    model.shape(pitch, shift, &mut scratch);
+                    shape.iter_mut().zip(&scratch).for_each(|(s, v)| *s += v);
+                }
+                let free = vec![false; bins];
+                let c = contested_bins[t].as_deref().unwrap_or(&free);
+                lo[t] = loudness(&shape, &power[t], noise, c);
+                sh[t] = Some(shape);
+            }
+            fill_gaps(&mut lo);
+        }
+        shapes.push(sh);
+        loud.push(lo);
+    }
+    // Share every contested bin.
+    for t in 0..n {
+        let Some(c) = &contested_bins[t] else { continue };
+        let mut claimants: Vec<Claimant> = Vec::new();
+        for (i, (_, f, e, masks)) in events.iter_mut().enumerate() {
+            let Some(mask) = masks[t].as_mut() else { continue };
+            let direction = e
+                .analysis
+                .as_ref()
+                .and_then(|a| a.template.as_ref())
+                .and_then(|tpl| tpl.spatial.as_ref())
+                .map(|sig| (sig, e.similar.level_tolerance_db, e.similar.delay_tolerance_samples));
+            claimants.push(Claimant {
+                extract: f.action == FilterAction::Extract,
+                mask: mask.as_mut_slice(),
+                shape: shapes[i][t].clone(),
+                loudness: loud[i][t],
+                direction,
+            });
+        }
+        share_frame(&mut claimants, c, &power[t], noise, channels, t, fft_size);
+        // The extract shares hold what is kept; suppressing again would
+        // remove the kept share a second time.
+        for cl in claimants.iter_mut().filter(|cl| !cl.extract) {
+            for k in (0..bins).filter(|&k| c[k]) {
+                cl.mask[k] = 0.0;
+            }
+        }
     }
 }
 
@@ -493,6 +642,7 @@ mod tests {
             &power,
             0,
             &[],
+            &[],
         );
         let e = compute_gains(
             &project(vec![analysed_event(FilterAction::Extract, 0.6)]),
@@ -500,6 +650,7 @@ mod tests {
             0,
             &power,
             0,
+            &[],
             &[],
         );
         for k in 0..3 {
@@ -514,10 +665,10 @@ mod tests {
         let mut f = analysed_event(FilterAction::Suppress, 1.0);
         assert!(f.set_part_enabled(1, false));
         assert!(!f.set_part_enabled(1, false));
-        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0, &[]);
+        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0, &[], &[]);
         assert_eq!(g.gain[0], vec![0.0, 1.0, 0.0]);
         f.enabled = false;
-        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0, &[]);
+        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0, &[], &[]);
         assert_eq!(g.gain[0], vec![1.0, 1.0, 1.0]);
     }
 
@@ -530,7 +681,7 @@ mod tests {
         let mut b = analysed_event(FilterAction::Extract, 1.0);
         b.set_part_enabled(0, false);
         b.set_part_enabled(2, false);
-        let g = compute_gains(&project(vec![a, b]), &power, 0, &power, 0, &[]);
+        let g = compute_gains(&project(vec![a, b]), &power, 0, &power, 0, &[], &[]);
         assert_eq!(g.gain[0], vec![1.0, 1.0, 0.0]);
         // Frames 2 and 3 lie outside the analysed span: nothing to extract.
         assert_eq!(g.gain[3], vec![0.0, 0.0, 0.0]);
@@ -541,11 +692,11 @@ mod tests {
         let power = vec![vec![1.0; 3]; 2];
         let mut f = analysed_event(FilterAction::Suppress, 0.8);
         f.enabled = false;
-        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0, &[]);
+        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0, &[], &[]);
         assert_eq!(g.selected[0][0], 0.8);
         assert_eq!(g.inferred[0][1], 0.8);
         f.visible = false;
-        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0, &[]);
+        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0, &[], &[]);
         assert_eq!(g.selected[0][0], 0.0);
     }
 
