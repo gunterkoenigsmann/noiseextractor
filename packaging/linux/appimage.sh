@@ -15,7 +15,7 @@
 # AppDir, except the ones its excludelist says must come from the host, such
 # as glibc, libGL and libasound) and its GTK plugin (GTK 3 modules, themes,
 # GSettings schemas and the environment to find them). Both are downloaded
-# from their "continuous" releases.
+# at a pinned version and checked against committed hashes (see "Tools").
 set -euo pipefail
 
 version="$1"
@@ -27,15 +27,31 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 # --- Tools -----------------------------------------------------------------
+# Pinned to a release tag and a commit and checked against the hashes below,
+# because they run in the job that builds the published packages: a changed
+# upstream file must fail the build, not end up in a release. To update,
+# change the version or commit, download the files and put their
+# `sha256sum` here.
+linuxdeploy_version="1-alpha-20251107-1"
+gtk_plugin_commit="7a3fbc31a9e5075073ff8790f26effbac5f84453"
+case "$arch" in
+x86_64) linuxdeploy_sha256="c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d" ;;
+aarch64) linuxdeploy_sha256="620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff" ;;
+*) echo "error: no linuxdeploy for $arch" >&2; exit 1 ;;
+esac
+gtk_plugin_sha256="b0f4cbc684a0103a9651f0955b635eaea0096b3a66c0f5a2c2aa337960375171"
+
 tools="$work/tools"
 mkdir -p "$tools"
 curl -sSfL -o "$tools/linuxdeploy" \
-    "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$arch.AppImage"
+    "https://github.com/linuxdeploy/linuxdeploy/releases/download/$linuxdeploy_version/linuxdeploy-$arch.AppImage"
 curl -sSfL -o "$tools/linuxdeploy-plugin-gtk.sh" \
-    "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
+    "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/$gtk_plugin_commit/linuxdeploy-plugin-gtk.sh"
+sha256sum -c - <<EOF
+$linuxdeploy_sha256  $tools/linuxdeploy
+$gtk_plugin_sha256  $tools/linuxdeploy-plugin-gtk.sh
+EOF
 chmod +x "$tools"/*
-# For the log: which tool versions built this package.
-sha256sum "$tools"/*
 # CI runners (and containers) have no FUSE; AppImages can unpack themselves
 # to a temporary directory instead. This covers linuxdeploy and the
 # appimagetool inside it.
