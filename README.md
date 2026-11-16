@@ -74,9 +74,13 @@ libraries.
 | Open a recording | File > Open audio (Ctrl+O), or pass it on the command line |
 | Mark a sound | Drag a rectangle in the spectrogram |
 | Turn it into a filter | *Suppress selection* or *Extract selection* |
+| Tune what belongs to it and what counts as a repetition | Sliders in the *Detection settings* pane (they edit the fresh selection, or the selected sound filter; hover a slider for an explanation) |
 | Set the play head | Click |
 | Play / pause | Space (plays the selection if there is one), or Ctrl+P |
+| Scrub (hear the audio under the pointer) | Drag with the right mouse button |
 | Zoom time / scroll / zoom frequency | Wheel / Shift+wheel / Ctrl+wheel |
+| Jump elsewhere in a long recording | Drag the frame in the waveform overview, or click beside it |
+| Show / hide panes (filters, detection settings, overview, log) | View menu, or the pane's close button; panes can be dragged to other edges or floated, and the layout is remembered |
 | Learn the background noise | Mark a noise-only stretch, *Learn noise from selection* |
 | Save the filter list | File > Save project (Ctrl+S) |
 | Write the result | File > Export processed audio (Ctrl+E) |

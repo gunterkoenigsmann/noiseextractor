@@ -17,8 +17,13 @@
   Start reading at `src/lib.rs` (signal flow), `filter.rs` (how filters
   combine), `engine.rs` (chunked background processing).
 * `crates/cli`: thin front end; `tests/cli.rs` holds end-to-end tests.
-* `crates/gui`: wxDragon front end. `view.rs` is pure and unit-tested; keep
-  logic out of event handlers where possible.
+* `crates/gui`: wxDragon front end with AUI panes (`panes.rs`). The view
+  models are pure and unit-tested (`view.rs`, `overview.rs`, `scrub.rs`,
+  `detection.rs`, the `Log` in `log.rs`, `Declick` in `player.rs`); keep
+  logic out of event handlers where possible. Status messages go through
+  `report()` so they also reach the log pane. Scrubbing and overview follow
+  losslessaudiocut (gunterkoenigsmann/losslessaudiocut) on purpose; keep
+  them alike.
 
 ## Commands
 

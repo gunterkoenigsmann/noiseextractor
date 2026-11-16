@@ -5,6 +5,10 @@
 //! play head has not been processed yet, it falls back to the original
 //! recording for that moment. The engine prioritises the chunks ahead of the
 //! play head, so in practice the fallback is only heard right after a seek.
+//!
+//! A jump while playing (a click into the spectrogram, every grain of a
+//! scrub) fades out for a few milliseconds, moves, and fades in again
+//! ([`Declick`]), so it does not click.
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -22,6 +26,67 @@ pub struct PlayShared {
     position: AtomicU64,
     /// Sample at which playback stops (`u64::MAX`: end of file).
     stop_at: AtomicU64,
+    /// Where to jump to, as `f64` bits, once the fade-out is done
+    /// ([`NO_JUMP`]: nowhere). Set by the GUI, taken by the callback.
+    jump: AtomicU64,
+}
+
+/// Value of [`PlayShared::jump`] when no jump is requested (not the bits
+/// of any position the GUI asks for, which are finite and non-negative).
+const NO_JUMP: u64 = u64::MAX;
+
+/// Length of the fades around a jump, in output frames (≈ 3 ms at 48 kHz).
+const FADE_FRAMES: u32 = 144;
+
+/// Gain envelope around jumps: fades out, tells the caller to jump, fades
+/// in. Runs in the audio callback, one call per output frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Declick {
+    /// Current gain, 0..1.
+    gain: f32,
+    /// Gain change per frame.
+    step: f32,
+    /// Where to jump once the gain reaches 0.
+    pending: Option<f64>,
+}
+
+impl Declick {
+    /// Silent at first (playback starts with a fade-in), fading over
+    /// `frames` output frames.
+    pub fn new(frames: u32) -> Self {
+        Declick {
+            gain: 0.0,
+            step: 1.0 / frames.max(1) as f32,
+            pending: None,
+        }
+    }
+
+    /// Asks for a jump to `to`; a later request replaces an earlier one
+    /// that has not happened yet.
+    pub fn request(&mut self, to: f64) {
+        self.pending = Some(to);
+    }
+
+    /// Playback stopped: the next start fades in.
+    pub fn silence(&mut self) {
+        self.gain = 0.0;
+        self.pending = None;
+    }
+
+    /// Gain for the next frame, and the position to jump to before
+    /// producing it (once the fade-out is complete).
+    pub fn next(&mut self) -> (f32, Option<f64>) {
+        if self.pending.is_some() {
+            self.gain -= self.step;
+            if self.gain <= 0.0 {
+                self.gain = 0.0;
+                return (0.0, self.pending.take());
+            }
+            return (self.gain, None);
+        }
+        self.gain = (self.gain + self.step).min(1.0);
+        (self.gain, None)
+    }
 }
 
 impl PlayShared {
@@ -57,6 +122,7 @@ impl Player {
             playing: AtomicBool::new(false),
             position: AtomicU64::new(0f64.to_bits()),
             stop_at: AtomicU64::new(u64::MAX),
+            jump: AtomicU64::new(NO_JUMP),
         });
         let config: cpal::StreamConfig = supported.config();
         let stream = match supported.sample_format() {
@@ -74,12 +140,17 @@ impl Player {
     }
 
     /// Starts playing at `from` until `until` (exclusive), both in samples.
+    /// While already playing, the move is faded (see [`Declick`]).
     pub fn play(&self, from: usize, until: Option<usize>) {
-        self.shared.set_position(from as f64);
         self.shared
             .stop_at
             .store(until.map_or(u64::MAX, |u| u as u64), Ordering::Relaxed);
-        self.shared.playing.store(true, Ordering::Release);
+        if self.is_playing() {
+            self.shared.jump.store((from as f64).to_bits(), Ordering::Release);
+        } else {
+            self.shared.set_position(from as f64);
+            self.shared.playing.store(true, Ordering::Release);
+        }
     }
 
     /// Stops playback, keeping the play head where it is.
@@ -115,19 +186,31 @@ where
         engine,
         chunk: None,
     };
+    let mut declick = Declick::new(FADE_FRAMES);
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _| {
             let playing = shared.playing.load(Ordering::Acquire);
             let mut pos = shared.position();
             let stop = shared.stop_at.load(Ordering::Relaxed).min(source.audio.len() as u64) as f64;
+            let jump = shared.jump.swap(NO_JUMP, Ordering::AcqRel);
+            if jump != NO_JUMP {
+                declick.request(f64::from_bits(jump));
+            }
+            if !playing {
+                declick.silence();
+            }
             for frame in data.chunks_mut(out_channels) {
                 if !playing || pos >= stop {
                     frame.iter_mut().for_each(|s| *s = T::from_sample(0.0));
                     continue;
                 }
+                let (gain, to) = declick.next();
+                if let Some(to) = to {
+                    pos = to;
+                }
                 for (c, s) in frame.iter_mut().enumerate() {
-                    *s = T::from_sample(source.interpolate(c, pos));
+                    *s = T::from_sample(gain * source.interpolate(c, pos));
                 }
                 pos += step;
             }
@@ -184,5 +267,36 @@ impl Source {
             return a;
         }
         a + (self.sample(out_ch, i + 1) - a) * frac
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starts_with_a_fade_in() {
+        let mut d = Declick::new(4);
+        let gains: Vec<f32> = (0..6).map(|_| d.next().0).collect();
+        assert_eq!(gains, vec![0.25, 0.5, 0.75, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_jump_fades_out_moves_and_fades_in() {
+        let mut d = Declick::new(4);
+        (0..4).for_each(|_| {
+            d.next();
+        });
+        d.request(100.0);
+        d.request(200.0); // the later request wins
+        assert_eq!(d.next(), (0.75, None));
+        assert_eq!(d.next(), (0.5, None));
+        assert_eq!(d.next(), (0.25, None));
+        assert_eq!(d.next(), (0.0, Some(200.0)));
+        assert_eq!(d.next(), (0.25, None));
+        // Stopping forgets a jump and makes the next start fade in.
+        d.request(5.0);
+        d.silence();
+        assert_eq!(d.next(), (0.25, None));
     }
 }

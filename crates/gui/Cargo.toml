@@ -9,5 +9,5 @@ repository.workspace = true
 [dependencies]
 noiseextractor-core.workspace = true
 anyhow.workspace = true
-wxdragon = { version = "0.9.24", default-features = false }
+wxdragon = { version = "0.9.24", default-features = false, features = ["aui"] }
 cpal = "0.15"
