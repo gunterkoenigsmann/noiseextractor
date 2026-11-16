@@ -175,6 +175,19 @@ pub fn process_chunk(
     let g_start = ctx as usize; // offset of frame cC-P-W in `power`
     let g_len = (c + 2 * pad + warm) as usize;
     let occurrences = find_occurrences(project, mono, &audio.channels, stft, (first - pad)..(first + c + pad));
+    let applied_first = first - pad;
+    let applied_len = (c + 2 * pad) as usize;
+    // Multi-channel: the channels are transformed anyway to apply the
+    // gains; the same spectra tell the gains where sounds come from.
+    let channel_spectra: Vec<crate::stft::Spectra> = if audio.channels.len() > 1 {
+        audio
+            .channels
+            .iter()
+            .map(|ch| stft.analyze(ch, applied_first, applied_len))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let gains = compute_gains(
         project,
         &power[g_start..g_start + g_len],
@@ -182,12 +195,11 @@ pub fn process_chunk(
         context,
         first - pad,
         &occurrences,
+        &channel_spectra,
     );
 
     let (start_sample, end_sample) = layout.sample_range(index);
     let out_len = end_sample - start_sample;
-    let applied_first = first - pad;
-    let applied_len = (c + 2 * pad) as usize;
     let apply = |mut spectra: crate::stft::Spectra| {
         for (frame, g) in spectra.frames.iter_mut().zip(&gains.gain) {
             for (x, &g) in frame.iter_mut().zip(g) {
@@ -205,11 +217,7 @@ pub fn process_chunk(
         };
         vec![apply(spectra)]
     } else {
-        audio
-            .channels
-            .iter()
-            .map(|ch| apply(stft.analyze(ch, applied_first, applied_len)))
-            .collect()
+        channel_spectra.into_iter().map(apply).collect()
     };
 
     // Display layers for frames cC .. (c+1)C.
@@ -720,6 +728,123 @@ mod tests {
         let loud_in = rms(&audio.channels[0][4100..4800]);
         let loud_out = rms(&out[4100..4800]);
         assert!((loud_out / loud_in) > 0.9, "burst lost energy: {loud_in} -> {loud_out}");
+    }
+
+    /// A gliding call (fundamental 900 → 1500 Hz from 0.2 to 1.3 s, with
+    /// 2nd and 3rd harmonics) and a whistle at 2400 Hz from 0.5 to 1.0 s
+    /// that the 2nd harmonic crosses around 0.75 s. Returns the call alone and the mix.
+    fn call_and_whistle(sr: u32) -> (Vec<f32>, Vec<f32>) {
+        let n = (1.5 * sr as f32) as usize;
+        let mut phase = 0.0f32;
+        let call: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                if !(0.2..1.3).contains(&t) {
+                    return 0.0;
+                }
+                let u = (t - 0.2) / 1.1;
+                phase += 2.0 * std::f32::consts::PI * (900.0 + 600.0 * u) / sr as f32;
+                let env = (std::f32::consts::PI * u).sin();
+                env * (0.4 * phase.sin() + 0.2 * (2.0 * phase).sin() + 0.12 * (3.0 * phase).sin())
+            })
+            .collect();
+        let mut rng = 3u64;
+        let mix = call
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let noise = ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.002;
+                let t = i as f32 / sr as f32;
+                // The whistle sounds from 0.5 to 1.0 s, with soft edges.
+                let w = if (0.5..1.0).contains(&t) {
+                    (std::f32::consts::PI * (t - 0.5) / 0.5).sin().sqrt()
+                } else {
+                    0.0
+                };
+                c + 0.3 * w * (2.0 * std::f32::consts::PI * 2400.0 * t).sin() + noise
+            })
+            .collect();
+        (call, mix)
+    }
+
+    /// Extracts the call and suppresses the whistle of [`call_and_whistle`],
+    /// in mono or with the call on the left and the whistle on the right.
+    /// Returns how far (dB) the overtone at the crossing is from the call
+    /// alone (in the call's louder channel, the first), and what fraction of
+    /// the whistle's power is left where it sounds alone (in its louder
+    /// channel, the last).
+    fn crossing(stereo: bool) -> (f32, f32) {
+        let sr = 16000;
+        let (call, mix) = call_and_whistle(sr);
+        let whistle: Vec<f32> = mix.iter().zip(&call).map(|(m, c)| m - c).collect();
+        let audio = if stereo {
+            let delayed = |x: &[f32], d: usize, g: f32| -> Vec<f32> {
+                (0..x.len()).map(|i| if i >= d { g * x[i - d] } else { 0.0 }).collect()
+            };
+            let (wl, cr) = (delayed(&whistle, 4, 0.5), delayed(&call, 3, 0.5));
+            let left = call.iter().zip(&wl).map(|(c, w)| c + w).collect();
+            let right = cr.iter().zip(&whistle).map(|(c, w)| c + w).collect();
+            AudioData::new(sr, vec![left, right])
+        } else {
+            AudioData::new(sr, vec![mix])
+        };
+        let mut p = small_project();
+        p.filters = vec![
+            Filter::event(
+                "call",
+                Selection {
+                    start_s: 0.2,
+                    end_s: 1.3,
+                    low_hz: 850.0,
+                    high_hz: 1550.0,
+                },
+                FilterAction::Extract,
+            ),
+            Filter::event(
+                "whistle",
+                Selection {
+                    start_s: 0.5,
+                    end_s: 1.0,
+                    low_hz: 2300.0,
+                    high_hz: 2500.0,
+                },
+                FilterAction::Suppress,
+            ),
+        ];
+        p.prepare(&audio);
+        let last = audio.channels.len() - 1;
+        let (mut out, mut out_last) = (Vec::new(), Vec::new());
+        process_all(&audio, &p, 32, 2, |r| {
+            out.extend_from_slice(&r.audio[0]);
+            out_last.extend_from_slice(&r.audio[last]);
+            Ok(())
+        })
+        .unwrap();
+        // Power around 2400 Hz in a time window, from an STFT of `x`.
+        let stft = Stft::new(p.stft);
+        let band = |x: &[f32], t0: f32, t1: f32| -> f32 {
+            let (a, b) = ((t0 * sr as f32 / 128.0) as i64, (t1 * sr as f32 / 128.0) as i64);
+            let power = stft.analyze(x, a, (b - a) as usize).power();
+            let k = p.stft.hz_to_bin(2400.0, sr).round() as usize;
+            power.iter().map(|f| f[k - 3..=k + 3].iter().sum::<f32>()).sum()
+        };
+        let db = 10.0 * (band(&out, 0.65, 0.85) / band(&call, 0.65, 0.85)).log10();
+        let left = band(&out_last, 0.55, 0.65) / band(&audio.channels[last], 0.55, 0.65);
+        (db, left)
+    }
+
+    #[test]
+    fn crossing_whistle_is_removed_but_the_kept_calls_overtone_stays() {
+        // Without sharing the bins, the overtone lost ~28 dB at the crossing.
+        for stereo in [false, true] {
+            let (db, left) = crossing(stereo);
+            assert!(
+                db.abs() < 4.0,
+                "stereo {stereo}: overtone {db:.1} dB off the call alone"
+            );
+            assert!(left < 0.05, "stereo {stereo}: whistle only reduced to {left:.3}");
+        }
     }
 
     #[test]

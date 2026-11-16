@@ -111,6 +111,17 @@ target's share of the energy), *extract* keeps m. All active extract filters
 are combined as a union, then every suppress filter is applied. Suppressing and
 extracting the same target therefore add up (in power) to the original.
 
+Where a sound you extract and a sound you suppress claim the same bins (a
+bird's overtone crossing a whistle), the bin is shared out instead of being
+judged by each mask alone: every marked sound knows how loud its partials and
+co-modulated bands are relative to its fundamental, so its loudness in each
+frame is measured on the bins nobody else claims, and its expected power in
+the shared bins follows from that. The extracted sound keeps its share, the
+suppressed one loses its share. In stereo recordings, how well a shared bin's
+level ratio and phase between the channels fit each sound's direction weighs
+in as well. In a test where a whistle crosses a kept call's overtone, the
+overtone now keeps its level (−0.3 dB) instead of losing 28 dB.
+
 ## Project layout
 
 | Crate | Purpose |
