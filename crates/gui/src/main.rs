@@ -1,8 +1,10 @@
 //! noiseextractor GUI: an interactive spectrogram in which noises can be
 //! marked, inspected and suppressed or extracted with a list of filters.
 //!
-//! Layout: the spectrogram fills the window; the filter list ("building
-//! kit") sits on the right. All heavy lifting happens in
+//! Layout: dockable panes (wxWidgets AUI, see `panes.rs`) around the
+//! spectrogram: the filter list ("building kit") and the detection
+//! settings of the selected sound on the right, a waveform overview on
+//! top, a log at the bottom. All heavy lifting happens in
 //! `noiseextractor-core` on background threads; this crate only wires the
 //! widgets to it. A 40 ms timer polls the background work (file loading,
 //! selection analysis, chunk processing, playback position) and repaints
@@ -12,30 +14,46 @@
 //! * drag: mark a rectangle (time × frequency); the analysis immediately
 //!   shows what it thinks belongs to it (red / orange),
 //! * click: move the play head,
+//! * right-button drag: scrub (hear short pieces of audio under the
+//!   pointer, see `scrub.rs`),
 //! * wheel: zoom time, Shift+wheel: scroll, Ctrl+wheel: zoom frequency,
 //! * Space: play / pause (the selection, if there is one), Esc: clear the
 //!   selection.
+//!
+//! In the overview, dragging the frame (or clicking beside it) scrolls the
+//! spectrogram.
 
 // Every item, public or private, carries a doc comment (project rule).
 #![warn(missing_docs, clippy::missing_docs_in_private_items)]
 
+mod detection;
+mod log;
+mod overview;
+mod panes;
 mod player;
+mod scrub;
 mod view;
 
-use noiseextractor_core::analysis::{analyze_selection, RegionAnalysis, Selection};
+use detection::{Group, Param};
+use noiseextractor_core::analysis::{analyze_selection, AnalysisParams, RegionAnalysis, Selection};
 use noiseextractor_core::audio::WavStreamWriter;
 use noiseextractor_core::engine::process_all;
-use noiseextractor_core::filter::{Filter, FilterAction, FilterKind, Project};
+use noiseextractor_core::filter::{EventFilter, Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::{mean_power, NoiseEstimate};
 use noiseextractor_core::render::render_rgb;
+use noiseextractor_core::similar::SimilarParams;
 use noiseextractor_core::stft::Stft;
 use noiseextractor_core::{AudioData, Engine, EngineConfig, Focus};
+use overview::{Overview, Peaks};
+use panes::{Contents, Pane, Panes};
 use player::Player;
+use scrub::Scrubber;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use view::{format_time, Viewport};
 use wxdragon::prelude::*;
 
@@ -72,14 +90,17 @@ struct Doc {
     player: Option<Player>,
     /// File name for the title bar.
     name: String,
+    /// Block peaks of the mono mix, for the overview.
+    peaks: Peaks,
 }
 
 /// Messages from background threads to the GUI thread.
 enum Background {
-    /// A file finished loading (or failed).
-    Loaded(PathBuf, anyhow::Result<AudioData>),
-    /// The analysis of selection number `.0` finished.
-    Analysed(u64, Arc<RegionAnalysis>),
+    /// A file finished loading (or failed), with the overview's peaks.
+    Loaded(PathBuf, anyhow::Result<(AudioData, Peaks)>),
+    /// An analysis finished. It belongs to every event filter (and the
+    /// preview) that still has this selection and these settings.
+    Analysed(Selection, AnalysisParams, Arc<RegionAnalysis>),
     /// Export progress in percent, or the final result.
     ExportProgress(usize),
     /// Export finished.
@@ -100,9 +121,16 @@ struct State {
     selection: Option<Selection>,
     /// Mouse drag in progress: start and current pixel positions.
     drag: Option<((f32, f32), (f32, f32))>,
-    /// Counter identifying the latest selection, so stale analyses that
-    /// finish late are ignored.
-    selection_serial: u64,
+    /// When the selected object is to be analysed again after its
+    /// detection settings changed (debounced while a slider moves).
+    reanalyse_at: Option<Instant>,
+    /// Detection settings last chosen with the sliders; new selections
+    /// start with them.
+    last_params: (AnalysisParams, SimilarParams),
+    /// The scrub in progress while the right button is held.
+    scrub: Option<Scrub>,
+    /// The overview strip's view model (exists with a recording).
+    overview: Option<Overview>,
     /// Sender handed to background threads.
     tx: Sender<Background>,
     /// Receiver polled by the timer.
@@ -119,13 +147,33 @@ struct State {
     busy: Option<String>,
 }
 
+/// A scrub: dragging with the right button plays short pieces of audio at
+/// the pointer (see [`scrub`]).
+struct Scrub {
+    /// Decides when to restart where.
+    scrubber: Scrubber,
+    /// Whether playback ran before; if not, it stops when the scrub ends.
+    was_playing: bool,
+}
+
+/// Debounce of re-analysis while a detection slider moves.
+const REANALYSE_DELAY: Duration = Duration::from_millis(200);
+
 /// Handles to the widgets. wxDragon widgets are cheap `Copy` handles.
 #[derive(Clone, Copy)]
 struct Ui {
     /// Main window.
     frame: Frame,
+    /// The dockable panes.
+    panes: Panes,
     /// Spectrogram drawing area.
     canvas: Panel,
+    /// Waveform overview drawing area.
+    overview: Panel,
+    /// Which object the detection sliders edit.
+    detection_title: StaticText,
+    /// One slider and value label per [`Param::ALL`] entry.
+    detection: [(Slider, StaticText); Param::ALL.len()],
     /// The filter list; checked = enabled.
     filters: CheckListBox,
     /// Name of the current filter.
@@ -183,7 +231,10 @@ fn main() {
             viewport: None,
             selection: None,
             drag: None,
-            selection_serial: 0,
+            reanalyse_at: None,
+            last_params: Default::default(),
+            scrub: None,
+            overview: None,
             tx,
             rx,
             current_filter: Some(0),
@@ -203,11 +254,12 @@ fn main() {
     });
 }
 
-/// Creates the frame, menus, spectrogram canvas and filter side panel.
+/// Creates the frame, menus, and the panes: spectrogram canvas, filter
+/// list, detection sliders, overview and log.
 fn build_ui() -> Ui {
     let frame = Frame::builder()
         .with_title("noiseextractor")
-        .with_size(Size::new(1280, 760))
+        .with_size(panes::stored_size())
         .build();
 
     let file_menu = Menu::builder()
@@ -223,7 +275,7 @@ fn build_ui() -> Ui {
         .append_separator()
         .append_item(ID_QUIT, "&Quit\tCtrl+Q", "Leave noiseextractor")
         .build();
-    let view_menu = Menu::builder()
+    let mut view_menu = Menu::builder()
         .append_item(
             ID_PLAY,
             "&Play / pause\tCtrl+P",
@@ -235,11 +287,14 @@ fn build_ui() -> Ui {
             "&Logarithmic frequency axis\tCtrl+L",
             "Toggle linear / logarithmic frequency axis",
         )
-        .build();
+        .append_separator();
+    for pane in Pane::ALL {
+        view_menu = view_menu.append_check_item(pane.menu_id(), pane.menu_label(), pane.menu_help());
+    }
     frame.set_menu_bar(
         MenuBar::builder()
             .append(file_menu, "&File")
-            .append(view_menu, "&View")
+            .append(view_menu.build(), "&View")
             .build(),
     );
     StatusBar::builder(&frame)
@@ -248,13 +303,17 @@ fn build_ui() -> Ui {
         .add_initial_text(0, "Open an audio file to start (Ctrl+O)")
         .build();
 
-    let root = Panel::builder(&frame).build();
-    let canvas = Panel::builder(&root).build();
+    let canvas = Panel::builder(&frame).build();
     canvas.set_background_style(BackgroundStyle::Paint);
-    canvas.set_min_size(Size::new(400, 200));
+    let overview = Panel::builder(&frame).build();
+    overview.set_background_style(BackgroundStyle::Paint);
+    let log = log::create(&frame);
 
-    let side = Panel::builder(&root).build();
-    let filters = CheckListBox::builder(&side).with_size(Size::new(280, 160)).build();
+    // Scrolled, so the docked pane works at any height.
+    let side = ScrolledWindow::builder(&frame).build();
+    side.set_scroll_rate(0, 10);
+    let filters = CheckListBox::builder(&side).with_size(Size::new(280, 140)).build();
+    filters.set_min_size(Size::new(200, 90));
     let add_suppress = Button::builder(&side).with_label("Suppress selection").build();
     let add_extract = Button::builder(&side).with_label("Extract selection").build();
     let delete = Button::builder(&side).with_label("Delete").build();
@@ -265,7 +324,7 @@ fn build_ui() -> Ui {
     let action = Choice::builder(&side)
         .with_choices(vec!["Suppress".into(), "Extract".into()])
         .build();
-    let parts = CheckListBox::builder(&side).with_size(Size::new(280, 104)).build();
+    let parts = CheckListBox::builder(&side).with_size(Size::new(280, 90)).build();
     let reduction_label = StaticText::builder(&side).with_label("Max. reduction: 18 dB").build();
     let reduction = Slider::builder(&side)
         .with_value(18)
@@ -275,7 +334,7 @@ fn build_ui() -> Ui {
     let learn = Button::builder(&side).with_label("Learn noise from selection").build();
     let adaptive = Button::builder(&side).with_label("Adaptive noise estimate").build();
     let legend = StaticText::builder(&side)
-        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere\nOrange: both\n\nDrag to select, click to set play head,\nwheel zooms (Shift scrolls, Ctrl: frequency),\nSpace plays.")
+        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere\nOrange: both\n\nDrag to select, click to set play head,\nright-drag to scrub, wheel zooms\n(Shift scrolls, Ctrl: frequency), Space plays.")
         .build();
 
     let s = BoxSizer::builder(Orientation::Vertical).build();
@@ -309,14 +368,26 @@ fn build_ui() -> Ui {
     s.add(&legend, 0, SizerFlag::All, 6);
     side.set_sizer(s, true);
 
-    let main = BoxSizer::builder(Orientation::Horizontal).build();
-    main.add(&canvas, 1, SizerFlag::Expand, 0);
-    main.add(&side, 0, SizerFlag::Expand, 0);
-    root.set_sizer(main, true);
+    let (detection_panel, detection_title, detection) = build_detection(&frame);
+
+    let panes = Panes::new(
+        &frame,
+        &Contents {
+            spectrogram: &canvas,
+            filters: &side,
+            detection: &detection_panel,
+            overview: &overview,
+            log: &log,
+        },
+    );
 
     Ui {
         frame,
+        panes,
         canvas,
+        overview,
+        detection_title,
+        detection,
         filters,
         name,
         visible,
@@ -332,6 +403,51 @@ fn build_ui() -> Ui {
         learn,
         adaptive,
     }
+}
+
+/// Builds the detection settings pane: a title naming the object being
+/// edited, then one labelled slider per [`Param`], grouped into "parts of
+/// this sound" and "repetitions elsewhere".
+fn build_detection(frame: &Frame) -> (ScrolledWindow, StaticText, [(Slider, StaticText); Param::ALL.len()]) {
+    let panel = ScrolledWindow::builder(frame).build();
+    panel.set_scroll_rate(0, 10);
+    let s = BoxSizer::builder(Orientation::Vertical).build();
+    let title = StaticText::builder(&panel)
+        .with_label("Mark a sound or pick a sound filter")
+        .build();
+    s.add(&title, 0, SizerFlag::All | SizerFlag::Expand, 6);
+    let mut group = None;
+    let controls = Param::ALL.map(|p| {
+        if group != Some(p.group()) {
+            group = Some(p.group());
+            let heading = match p.group() {
+                Group::Parts => "What else belongs to this sound",
+                Group::Repetitions => "Where else it occurs",
+            };
+            let h = StaticText::builder(&panel).with_label(heading).build();
+            s.add(&h, 0, SizerFlag::Left | SizerFlag::Top, 8);
+        }
+        // The name on its own line, below it the slider with its value.
+        let name = StaticText::builder(&panel).with_label(p.label()).build();
+        name.set_tooltip(p.help());
+        s.add(&name, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 6);
+        let row = BoxSizer::builder(Orientation::Horizontal).build();
+        let slider = Slider::builder(&panel)
+            .with_value(0)
+            .with_min_value(0)
+            .with_max_value(p.steps())
+            .build();
+        slider.set_tooltip(p.help());
+        let value = StaticText::builder(&panel).with_label("").build();
+        // Room for the longest value text, so it is not cut off later.
+        value.set_min_size(Size::new(95, -1));
+        row.add(&slider, 1, SizerFlag::AlignCenterVertical, 0);
+        row.add(&value, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 4);
+        s.add_sizer(&row, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 4);
+        (slider, value)
+    });
+    panel.set_sizer(s, true);
+    (panel, title, controls)
 }
 
 /// Connects all widget events to the state.
@@ -354,7 +470,7 @@ fn bind_events(state: &Shared, ui: Ui) {
                 let mut s = st.borrow_mut();
                 match s.project.save(&path) {
                     Ok(()) => {
-                        ui.frame.set_status_text(&format!("Saved {}", path.display()), 0);
+                        report(ui, &format!("Saved {}", path.display()));
                         s.project_path = Some(path);
                     }
                     Err(err) => error_box(ui, &format!("{err:#}")),
@@ -389,7 +505,17 @@ fn bind_events(state: &Shared, ui: Ui) {
             request_repaint();
         }
         ID_QUIT => ui.frame.close(true),
-        _ => e.skip(true),
+        id => match Pane::for_menu_id(id) {
+            Some(pane) => ui.panes.toggle(pane),
+            None => e.skip(true),
+        },
+    });
+    // Remember the layout for the next start; detach the panes before the
+    // frame goes away, as wxWidgets asks.
+    ui.frame.on_close(move |e| {
+        ui.panes.save();
+        ui.panes.uninit();
+        e.skip(true);
     });
 
     // --- spectrogram canvas ---
@@ -425,6 +551,9 @@ fn bind_events(state: &Shared, ui: Ui) {
             s.drag = Some((start, p));
             request_repaint();
         }
+        if s.scrub.is_some() {
+            scrub_to(&mut s, p.0);
+        }
         if let Some(vp) = &s.viewport {
             let (_, h) = canvas_size(ui);
             let t = vp.sample_at(p.0) as f64 / vp.sample_rate as f64;
@@ -444,6 +573,24 @@ fn bind_events(state: &Shared, ui: Ui) {
         let end = p.unwrap_or(cur);
         finish_drag(&mut s, ui, start, end);
         request_repaint();
+    });
+    // Right button: scrub.
+    let st = state.clone();
+    ui.canvas.on_mouse_right_down(move |e| {
+        let Some(p) = mouse_pos(&e) else { return };
+        ui.canvas.capture_mouse();
+        if let Ok(mut s) = st.try_borrow_mut() {
+            begin_scrub(&mut s, p.0);
+        }
+    });
+    let st = state.clone();
+    ui.canvas.on_mouse_right_up(move |_| {
+        if ui.canvas.has_capture() {
+            ui.canvas.release_mouse();
+        }
+        if let Ok(mut s) = st.try_borrow_mut() {
+            end_scrub(&mut s);
+        }
     });
     let st = state.clone();
     ui.canvas.on_mouse_wheel(move |e| {
@@ -477,12 +624,66 @@ fn bind_events(state: &Shared, ui: Ui) {
                 s.selection = None;
                 s.project.preview = None;
                 push_project(&s);
+                refresh_detection(&s, ui);
                 request_repaint();
             }
             Some(WXK_HOME) => s.playhead = 0,
             _ => e.skip(true),
         }
     });
+
+    // --- overview ---
+    let st = state.clone();
+    ui.overview.on_paint(move |_| {
+        let dc = AutoBufferedPaintDC::new(&ui.overview);
+        match st.try_borrow() {
+            Ok(s) => paint_overview(&s, ui, &dc),
+            Err(_) => REPAINT_PENDING.with(|p| p.set(true)),
+        }
+    });
+    ui.overview.on_size(move |_| ui.overview.refresh(false, None));
+    let st = state.clone();
+    ui.overview.on_mouse_left_down(move |e| {
+        let Some(p) = mouse_pos(&e) else { return };
+        ui.overview.capture_mouse();
+        let Ok(mut s) = st.try_borrow_mut() else { return };
+        let (w, _) = canvas_size(ui);
+        let (Some(vp), Some(o)) = (s.viewport, s.overview.as_mut()) else {
+            return;
+        };
+        o.set_width(ui.overview.get_client_size().width.max(1) as u32);
+        let start = o.press(p.0 as f64, vp.visible_range(w));
+        scroll_to(&mut s, ui, start);
+    });
+    let st = state.clone();
+    ui.overview.on_mouse_motion(move |e| {
+        let Some(p) = mouse_pos(&e) else { return };
+        let Ok(mut s) = st.try_borrow_mut() else { return };
+        if let Some(start) = s.overview.as_mut().and_then(|o| o.drag(p.0 as f64)) {
+            scroll_to(&mut s, ui, start);
+        }
+    });
+    let st = state.clone();
+    ui.overview.on_mouse_left_up(move |_| {
+        if ui.overview.has_capture() {
+            ui.overview.release_mouse();
+        }
+        if let Some(o) = st.try_borrow_mut().ok().as_mut().and_then(|s| s.overview.as_mut()) {
+            o.release();
+        }
+    });
+
+    // --- detection settings ---
+    for (i, &(slider, value)) in ui.detection.iter().enumerate() {
+        let st = state.clone();
+        let param = Param::ALL[i];
+        slider.on_slider(move |e| {
+            let v = param.value_at(e.get_value());
+            value.set_label(&param.format(v));
+            let Ok(mut s) = st.try_borrow_mut() else { return };
+            set_detection_param(&mut s, param, v);
+        });
+    }
 
     // --- filter list and details ---
     let st = state.clone();
@@ -583,7 +784,7 @@ fn bind_events(state: &Shared, ui: Ui) {
                 nr.estimate = NoiseEstimate::default();
             }
         });
-        ui.frame.set_status_text("Noise estimate: adaptive", 0);
+        report(ui, "Noise estimate: adaptive");
     });
 
     // --- background polling ---
@@ -593,9 +794,11 @@ fn bind_events(state: &Shared, ui: Ui) {
         if let Ok(mut s) = st.try_borrow_mut() {
             tick(&mut s, ui);
         }
+
         // Outside the borrow, so the paint handler can read the state.
         if REPAINT_PENDING.with(|p| p.replace(false)) {
             ui.canvas.refresh(false, None);
+            ui.overview.refresh(false, None);
         }
     });
     timer.start(40, false);
@@ -652,13 +855,16 @@ fn start_loading(s: &mut State, path: PathBuf) {
     let tx = s.tx.clone();
     s.busy = Some(format!("Loading {} ...", path.display()));
     std::thread::spawn(move || {
-        let result = AudioData::load(&path);
+        let result = AudioData::load(&path).map(|audio| {
+            let peaks = Peaks::new(&audio.mono());
+            (audio, peaks)
+        });
         let _ = tx.send(Background::Loaded(path, result));
     });
 }
 
 /// Installs a freshly loaded recording: new engine, new player, fitted view.
-fn install_audio(s: &mut State, ui: Ui, path: &Path, audio: AudioData) {
+fn install_audio(s: &mut State, ui: Ui, path: &Path, audio: AudioData, peaks: Peaks) {
     // Stop the old player before its engine goes away.
     s.doc = None;
     let audio = Arc::new(audio);
@@ -674,7 +880,7 @@ fn install_audio(s: &mut State, ui: Ui, path: &Path, audio: AudioData) {
     let player = match Player::new(engine.clone()) {
         Ok(p) => Some(p),
         Err(e) => {
-            ui.frame.set_status_text(&format!("Playback unavailable: {e:#}"), 0);
+            report(ui, &format!("Playback unavailable: {e:#}"));
             None
         }
     };
@@ -684,15 +890,32 @@ fn install_audio(s: &mut State, ui: Ui, path: &Path, audio: AudioData) {
     ui.frame.set_title(&format!("{name} - noiseextractor"));
     let (w, _) = canvas_size(ui);
     s.viewport = Some(Viewport::fit(audio.len(), audio.sample_rate, w));
+    s.overview = Some(Overview::new(
+        audio.len(),
+        ui.overview.get_client_size().width.max(1) as u32,
+    ));
     s.selection = None;
     s.playhead = 0;
+    s.scrub = None;
+    report(
+        ui,
+        &format!(
+            "Loaded {name}: {} channel(s), {} Hz, {}",
+            audio.channels.len(),
+            audio.sample_rate,
+            format_time(audio.len() as f64 / audio.sample_rate as f64)
+        ),
+    );
     s.doc = Some(Doc {
         audio,
         engine,
         player,
         name,
+        peaks,
     });
     s.last_revision = u64::MAX;
+    refresh_detection(s, ui);
+    ui.overview.refresh(false, None);
 }
 
 /// Loads a project file, keeping the current recording.
@@ -710,8 +933,9 @@ fn open_project(st: &Shared, ui: Ui, path: &Path) {
             // A different STFT needs a new engine; reinstalling is simplest.
             let audio = (*doc.audio).clone();
             let name = doc.name.clone();
+            let peaks = doc.peaks.clone();
             s.project = project;
-            install_audio(&mut s, ui, Path::new(&name), audio);
+            install_audio(&mut s, ui, Path::new(&name), audio, peaks);
         } else {
             s.project = project;
             push_project(&s);
@@ -757,12 +981,56 @@ fn finish_drag(s: &mut State, ui: Ui, start: (f32, f32), end: (f32, f32)) {
     }
     let sel = vp.drag_to_selection(start, end, h);
     s.selection = Some(sel);
-    s.selection_serial += 1;
-    // Show the rectangle immediately; the analysis fills in the masks.
-    s.project.preview = Some(Filter {
+    // Show the rectangle immediately; the analysis fills in the masks. The
+    // detection settings last chosen carry over to the new selection.
+    let mut preview = Filter {
         enabled: false,
         ..Filter::event("Selection", sel, FilterAction::Suppress)
-    });
+    };
+    if let FilterKind::Event(e) = &mut preview.kind {
+        (e.params, e.similar) = s.last_params.clone();
+    }
+    s.project.preview = Some(preview);
+    s.reanalyse_at = None;
+    start_analysis(s, Target::Preview);
+    refresh_detection(s, ui);
+}
+
+/// The object the detection sliders edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// The fresh selection, not yet a filter.
+    Preview,
+    /// Event filter number `.0` of the list.
+    Filter(usize),
+}
+
+/// What the detection sliders edit: a fresh selection if there is one,
+/// else the current filter if it is an event filter.
+fn detection_target(s: &State) -> Option<Target> {
+    if s.project.preview.is_some() {
+        return Some(Target::Preview);
+    }
+    let i = s.current_filter?;
+    matches!(s.project.filters.get(i)?.kind, FilterKind::Event(_)).then_some(Target::Filter(i))
+}
+
+/// The event filter behind `target`.
+fn target_filter(s: &mut State, target: Target) -> Option<&mut EventFilter> {
+    let f = match target {
+        Target::Preview => s.project.preview.as_mut()?,
+        Target::Filter(i) => s.project.filters.get_mut(i)?,
+    };
+    match &mut f.kind {
+        FilterKind::Event(e) => Some(e),
+        FilterKind::NoiseReduction(_) => None,
+    }
+}
+
+/// Analyses the selection of `target` with its current settings on a
+/// background thread; [`tick`] hands the result to every object that still
+/// matches. The old analysis stays in use until then.
+fn start_analysis(s: &mut State, target: Target) {
     let Some(doc) = &s.doc else { return };
     let mono = doc.engine.mono().clone();
     // The individual tracks tell where the marked sound comes from.
@@ -770,20 +1038,94 @@ fn finish_drag(s: &mut State, ui: Ui, start: (f32, f32), end: (f32, f32)) {
     let sr = doc.audio.sample_rate;
     let cfg = s.project.stft;
     let noise = s.project.analysis_noise();
-    let params = Default::default();
-    let serial = s.selection_serial;
     let tx = s.tx.clone();
+    let Some(e) = target_filter(s, target) else { return };
+    let (sel, params) = (e.selection, e.params.clone());
     std::thread::spawn(move || {
         let a = analyze_selection(&mono, &audio.channels, sr, &Stft::new(cfg), &sel, &noise, &params);
-        let _ = tx.send(Background::Analysed(serial, Arc::new(a)));
+        let _ = tx.send(Background::Analysed(sel, params, Arc::new(a)));
     });
+}
+
+/// One line about an analysis for the status bar and the log.
+fn describe_analysis(a: &RegionAnalysis) -> String {
+    let found: Vec<String> = a.partials.iter().map(|p| format!("{:.2}", p.ratio)).collect();
+    let mut text = if found.is_empty() {
+        "No related partials found".to_string()
+    } else {
+        format!("Related partials at {} x the tracked pitch", found.join(", "))
+    };
+    if let Some(sig) = a.template.as_ref().and_then(|t| t.spatial.as_ref()) {
+        for (i, p) in sig.pairs.iter().enumerate() {
+            text += &format!(
+                "; channel {} vs 0: {:+.1} dB, {:+.2} samples",
+                i + 1,
+                p.level_db,
+                p.delay_samples
+            );
+        }
+    }
+    text
+}
+
+/// A detection slider moved: stores the value in the edited object (and
+/// as the default for new selections). Repetition settings take effect
+/// with the next processing; part settings need a new analysis, which
+/// starts once the slider rests for [`REANALYSE_DELAY`].
+fn set_detection_param(s: &mut State, param: Param, v: f32) {
+    let Some(target) = detection_target(s) else { return };
+    let Some(e) = target_filter(s, target) else { return };
+    param.set(e, v);
+    let params = (e.params.clone(), e.similar.clone());
+    s.last_params = params;
+    if param.reanalyse() {
+        s.reanalyse_at = Some(Instant::now() + REANALYSE_DELAY);
+    } else {
+        push_project(s);
+    }
+}
+
+/// Shows the edited object's detection settings in the sliders, and which
+/// object that is. Settings that need several channels are disabled for
+/// mono recordings.
+fn refresh_detection(s: &State, ui: Ui) {
+    let target = detection_target(s);
+    let e = target.and_then(|t| match t {
+        Target::Preview => s.project.preview.as_ref(),
+        Target::Filter(i) => s.project.filters.get(i),
+    });
+    let e = e.and_then(|f| match &f.kind {
+        FilterKind::Event(e) => Some((f.name.as_str(), e)),
+        FilterKind::NoiseReduction(_) => None,
+    });
+    let title = match (target, e) {
+        (Some(Target::Preview), Some(_)) => "Settings of the selection (not yet a filter)".to_string(),
+        (_, Some((name, _))) => format!("Settings of \"{name}\""),
+        _ => "Mark a sound or pick a sound filter".to_string(),
+    };
+    ui.detection_title.set_label(&title);
+    let stereo = s.doc.as_ref().is_some_and(|d| d.audio.channels.len() >= 2);
+    for (p, &(slider, value)) in Param::ALL.iter().zip(&ui.detection) {
+        match e {
+            Some((_, e)) => {
+                let v = p.get(e);
+                slider.set_value(p.slider_pos(v));
+                value.set_label(&p.format(v));
+                slider.enable(stereo || !p.spatial());
+            }
+            None => {
+                value.set_label("");
+                slider.enable(false);
+            }
+        }
+    }
 }
 
 /// Turns the analysed selection into a new filter.
 fn add_filter_from_selection(st: &Shared, ui: Ui, action: FilterAction) {
     let mut s = st.borrow_mut();
     let Some(preview) = s.project.preview.take() else {
-        ui.frame.set_status_text("Drag a rectangle over the noise first", 0);
+        report(ui, "Drag a rectangle over the noise first");
         return;
     };
     let name = format!(
@@ -828,8 +1170,7 @@ fn move_filter(st: &Shared, ui: Ui, delta: i32) {
 fn learn_noise(st: &Shared, ui: Ui) {
     let mut s = st.borrow_mut();
     let (Some(sel), Some(doc)) = (s.selection, s.doc.as_ref()) else {
-        ui.frame
-            .set_status_text("Select a stretch that contains only background noise first", 0);
+        report(ui, "Select a stretch that contains only background noise first");
         return;
     };
     let cfg = s.project.stft;
@@ -863,7 +1204,7 @@ fn learn_noise(st: &Shared, ui: Ui) {
     s.current_filter = Some(i);
     push_project(&s);
     refresh_filter_list(&s, ui);
-    ui.frame.set_status_text("Noise profile learned from the selection", 0);
+    report(ui, "Noise profile learned from the selection");
 }
 
 /// Starts or stops playback: the selection if there is one, otherwise from
@@ -915,45 +1256,41 @@ fn start_export(s: &mut State, path: PathBuf) {
 fn tick(s: &mut State, ui: Ui) {
     while let Ok(msg) = s.rx.try_recv() {
         match msg {
-            Background::Loaded(path, Ok(audio)) => {
+            Background::Loaded(path, Ok((audio, peaks))) => {
                 s.busy = None;
-                install_audio(s, ui, &path, audio);
+                install_audio(s, ui, &path, audio, peaks);
             }
             Background::Loaded(path, Err(e)) => {
                 s.busy = None;
-                ui.frame
-                    .set_status_text(&format!("Cannot open {}: {e:#}", path.display()), 0);
+                report(ui, &format!("Cannot open {}: {e:#}", path.display()));
             }
-            Background::Analysed(serial, a) => {
-                if serial == s.selection_serial {
-                    if let Some(Filter {
-                        kind: FilterKind::Event(e),
-                        ..
-                    }) = s.project.preview.as_mut()
-                    {
-                        let found: Vec<String> = a.partials.iter().map(|p| format!("{:.2}", p.ratio)).collect();
-                        ui.frame.set_status_text(
-                            &if found.is_empty() {
-                                "No related partials found".to_string()
-                            } else {
-                                format!("Related partials at {} x the tracked pitch", found.join(", "))
-                            },
-                            0,
-                        );
-                        e.analysis = Some(a);
-                        push_project(s);
+            Background::Analysed(sel, params, a) => {
+                // Every object that still has this selection and these
+                // settings takes the result; one that changed since waits
+                // for its own, newer analysis.
+                let mut taken = false;
+                for f in s.project.filters.iter_mut().chain(s.project.preview.as_mut()) {
+                    if let FilterKind::Event(e) = &mut f.kind {
+                        if e.selection == sel && e.params == params {
+                            e.analysis = Some(a.clone());
+                            taken = true;
+                        }
                     }
+                }
+                if taken {
+                    report(ui, &describe_analysis(&a));
+                    push_project(s);
                 }
             }
             Background::ExportProgress(p) => s.busy = Some(format!("Exporting ... {p}%")),
             Background::Exported(r) => {
                 s.busy = None;
-                ui.frame.set_status_text(
+                report(
+                    ui,
                     &match r {
                         Ok(p) => format!("Exported {}", p.display()),
                         Err(e) => format!("Export failed: {e:#}"),
                     },
-                    0,
                 );
             }
         }
@@ -961,11 +1298,25 @@ fn tick(s: &mut State, ui: Ui) {
 
     let (w, _) = canvas_size(ui);
     let Some(doc) = &s.doc else {
+        // Progress goes to the status bar only; the log gets the result.
         if let Some(b) = &s.busy {
             ui.frame.set_status_text(b, 0);
         }
         return;
     };
+    if let Some(pos) = s.scrub.as_mut().and_then(|sc| sc.scrubber.tick(Instant::now())) {
+        if let Some(p) = &doc.player {
+            p.play(pos, None);
+        }
+    }
+    if s.reanalyse_at.is_some_and(|t| Instant::now() >= t) {
+        s.reanalyse_at = None;
+        if let Some(target) = detection_target(s) {
+            report(ui, "Analysing the selected sound again with the new settings ...");
+            start_analysis(s, target);
+        }
+    }
+    let Some(doc) = &s.doc else { return };
     let playing = doc.player.as_ref().is_some_and(|p| p.is_playing());
     if playing {
         s.playhead = doc.player.as_ref().map_or(s.playhead, |p| p.position());
@@ -1094,6 +1445,7 @@ fn refresh_details(s: &State, ui: Ui) {
     let Some(f) = f else {
         ui.name.change_value("");
         ui.reduction.enable(false);
+        refresh_detection(s, ui);
         return;
     };
     // change_value does not emit a text event, so no feedback loop.
@@ -1107,6 +1459,7 @@ fn refresh_details(s: &State, ui: Ui) {
         ui.parts.append(label);
         ui.parts.check(i as u32, on);
     }
+    refresh_detection(s, ui);
     let nr = matches!(f.kind, FilterKind::NoiseReduction(_));
     ui.reduction.enable(nr);
     ui.learn.enable(true);
@@ -1116,4 +1469,95 @@ fn refresh_details(s: &State, ui: Ui) {
         ui.reduction_label
             .set_label(&format!("Max. reduction: {:.0} dB", n.reduction_db));
     }
+}
+
+/// Shows `msg` in the status bar and keeps it in the log.
+fn report(ui: Ui, msg: &str) {
+    ui.frame.set_status_text(msg, 0);
+    log::append(msg);
+}
+
+/// Right button down at pixel column `x`: starts scrubbing there.
+fn begin_scrub(s: &mut State, x: f32) {
+    let (Some(vp), Some(doc)) = (s.viewport, &s.doc) else {
+        return;
+    };
+    let Some(player) = &doc.player else { return };
+    let mut scrubber = Scrubber::default();
+    let was_playing = player.is_playing();
+    if let Some(pos) = scrubber.move_to(vp.sample_at(x), Instant::now()) {
+        player.play(pos, None);
+    }
+    s.scrub = Some(Scrub { scrubber, was_playing });
+}
+
+/// The pointer moved to pixel column `x` while scrubbing.
+fn scrub_to(s: &mut State, x: f32) {
+    let (Some(vp), Some(doc), Some(scrub)) = (s.viewport, &s.doc, &mut s.scrub) else {
+        return;
+    };
+    if let (Some(pos), Some(p)) = (scrub.scrubber.move_to(vp.sample_at(x), Instant::now()), &doc.player) {
+        p.play(pos, None);
+    }
+}
+
+/// Right button up: playback goes on if it ran before the scrub, else it
+/// stops and the play head stays where the scrub ended.
+fn end_scrub(s: &mut State) {
+    let Some(scrub) = s.scrub.take() else { return };
+    let Some(p) = s.doc.as_ref().and_then(|d| d.player.as_ref()) else {
+        return;
+    };
+    if !scrub.was_playing {
+        p.pause();
+        s.playhead = scrub.scrubber.position().unwrap_or_else(|| p.position());
+    }
+    request_repaint();
+}
+
+/// Scrolls the spectrogram so that it starts at sample `start` (clamped).
+fn scroll_to(s: &mut State, ui: Ui, start: usize) {
+    let (w, _) = canvas_size(ui);
+    if let Some(vp) = s.viewport.as_mut() {
+        vp.view.start_sample = start as f64;
+        vp.clamp(w);
+    }
+    request_repaint();
+}
+
+/// Draws the overview: the waveform of the whole recording, the selection's
+/// time span, the frame around the part shown in the spectrogram, and the
+/// play head.
+fn paint_overview(s: &State, ui: Ui, dc: &AutoBufferedPaintDC) {
+    let (w, h) = dc.get_size();
+    dc.set_background(Colour::rgb(20, 20, 26));
+    dc.clear();
+    let (Some(doc), Some(vp), Some(o)) = (&s.doc, &s.viewport, &s.overview) else {
+        return;
+    };
+    let mut o = *o;
+    o.set_width(w.max(1) as u32);
+    let mid = h as f32 / 2.0;
+    let scale = mid * 0.95;
+    dc.set_pen(Colour::rgb(90, 140, 230), 1, PenStyle::Solid);
+    for (x, (lo, hi)) in doc.peaks.columns(w.max(1) as u32).into_iter().enumerate() {
+        let (y0, y1) = ((mid - hi * scale) as i32, (mid - lo * scale) as i32);
+        dc.draw_line(x as i32, y0, x as i32, y1.max(y0 + 1));
+    }
+    let sr = doc.audio.sample_rate as f64;
+    dc.set_brush(Colour::rgb(0, 0, 0), BrushStyle::Transparent);
+    if let Some(sel) = &s.selection {
+        let x0 = o.sample_to_x((sel.start_s * sr) as usize);
+        let x1 = o.sample_to_x((sel.end_s * sr) as usize);
+        dc.set_pen(Colour::rgb(120, 255, 120), 1, PenStyle::ShortDash);
+        dc.draw_rectangle(x0 as i32, 1, (x1 - x0).max(1.0) as i32, h - 2);
+    }
+    // Kept inside the strip, so its edges show even when all is visible.
+    let (l, r) = o.frame(vp.visible_range(canvas_size(ui).0));
+    let (l, r) = (l.max(0.0), r.min(w as f64 - 1.0));
+    dc.set_pen(Colour::rgb(240, 240, 240), 1, PenStyle::Solid);
+    dc.draw_rectangle(l as i32, 0, (r - l).max(1.0) as i32, h);
+    let px = o.sample_to_x(s.playhead) as i32;
+    dc.set_pen(Colour::rgb(255, 230, 80), 1, PenStyle::Solid);
+    dc.draw_line(px, 0, px, h);
 }
