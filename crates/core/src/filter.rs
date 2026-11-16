@@ -9,7 +9,10 @@
 //! * a noise-reduction filter targets the stationary background noise,
 //! * an event filter targets the marked sound plus everything the analysis
 //!   found to belong to it (each kind of evidence is a separately
-//!   switchable part).
+//!   switchable part),
+//! * a discovered filter targets a sound found automatically: its share of
+//!   the spectral patterns learned by [`crate::discover`] (each pattern is
+//!   a switchable part).
 //!
 //! The *action* decides what happens to the target:
 //!
@@ -25,11 +28,13 @@
 //! "suppress X" + "extract X" add up (in power) to the original.
 
 use crate::analysis::{analyze_selection, AnalysisParams, RegionAnalysis, Selection};
+use crate::discover::{Decomposition, Discovery, FrameFit};
 use crate::noise::{NoiseEstimate, NoiseReduction};
 use crate::similar::{add_occurrence_mask, Occurrence, SimilarParams};
+use crate::spatial::Signature;
 use crate::stft::{Stft, StftConfig};
 use crate::AudioData;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -94,6 +99,36 @@ pub enum FilterKind {
     NoiseReduction(NoiseReduction),
     /// A marked sound and the parts of the spectrum that belong to it.
     Event(EventFilter),
+    /// A sound found automatically: some of the spectral patterns of a
+    /// [`Decomposition`] (see [`crate::discover`]).
+    Discovered(DiscoveredFilter),
+}
+
+/// One spectral pattern of a [`DiscoveredFilter`]: a switchable part.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveredPart {
+    /// Index of the pattern in its decomposition.
+    pub component: usize,
+    /// What the pattern sounds like, e.g. "tonal, 1.9–3.1 kHz, peak 2.4 kHz".
+    pub label: String,
+    /// Part switch.
+    pub enabled: bool,
+}
+
+/// A filter made of automatically found spectral patterns.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveredFilter {
+    /// Index into [`Project::decompositions`].
+    pub decomposition: usize,
+    /// The patterns that make up the sound.
+    pub parts: Vec<DiscoveredPart>,
+}
+
+impl DiscoveredFilter {
+    /// Components of the enabled parts.
+    pub fn enabled_components(&self) -> Vec<usize> {
+        self.parts.iter().filter(|p| p.enabled).map(|p| p.component).collect()
+    }
 }
 
 /// One entry of the filter list.
@@ -111,6 +146,10 @@ pub struct Filter {
     pub action: FilterAction,
     /// What the filter targets.
     pub kind: FilterKind,
+    /// Suggested by the automatic search and not kept yet: the next search
+    /// replaces it (see [`Project::add_discovery`]).
+    #[serde(default)]
+    pub suggested: bool,
 }
 
 impl Filter {
@@ -122,6 +161,7 @@ impl Filter {
             visible: false,
             action: FilterAction::Suppress,
             kind: FilterKind::NoiseReduction(NoiseReduction::default()),
+            suggested: false,
         }
     }
 
@@ -133,19 +173,26 @@ impl Filter {
             visible: true,
             action,
             kind: FilterKind::Event(EventFilter::new(selection)),
+            suggested: false,
         }
     }
 
     /// Names and on/off state of the filter's parts, in display order.
-    pub fn parts(&self) -> Vec<(&'static str, bool)> {
+    pub fn parts(&self) -> Vec<(String, bool)> {
+        let fixed = |parts: &[(&str, bool)]| parts.iter().map(|&(l, on)| (l.to_string(), on)).collect();
         match &self.kind {
-            FilterKind::NoiseReduction(_) => vec![("Background noise", true)],
-            FilterKind::Event(e) => vec![
+            FilterKind::NoiseReduction(_) => fixed(&[("Background noise", true)]),
+            FilterKind::Event(e) => fixed(&[
                 ("Marked area", e.use_selection),
                 ("Harmonics (follow the pitch)", e.use_harmonics),
                 ("Co-modulated resonances", e.use_comodulation),
                 ("Same sound elsewhere", e.use_similar),
-            ],
+            ]),
+            FilterKind::Discovered(d) => d
+                .parts
+                .iter()
+                .map(|p| (format!("Pattern {}: {}", p.component + 1, p.label), p.enabled))
+                .collect(),
         }
     }
 
@@ -153,8 +200,17 @@ impl Filter {
     /// The single part of a noise-reduction filter cannot be switched; use
     /// [`Filter::enabled`] instead. Returns whether anything changed.
     pub fn set_part_enabled(&mut self, index: usize, on: bool) -> bool {
-        let FilterKind::Event(e) = &mut self.kind else {
-            return false;
+        let e = match &mut self.kind {
+            FilterKind::Event(e) => e,
+            FilterKind::Discovered(d) => {
+                let Some(part) = d.parts.get_mut(index) else {
+                    return false;
+                };
+                let changed = part.enabled != on;
+                part.enabled = on;
+                return changed;
+            }
+            FilterKind::NoiseReduction(_) => return false,
         };
         let slot = match index {
             0 => &mut e.use_selection,
@@ -260,6 +316,10 @@ pub struct Project {
     /// filter, so picking a filter shows what it does. Never saved.
     #[serde(skip)]
     pub highlight: Option<usize>,
+    /// Spectral patterns found by automatic searches, referred to by
+    /// [`DiscoveredFilter::decomposition`].
+    #[serde(default)]
+    pub decompositions: Vec<Decomposition>,
 }
 
 impl Default for Project {
@@ -271,6 +331,7 @@ impl Default for Project {
             filters: vec![Filter::noise_reduction("Background noise")],
             preview: None,
             highlight: None,
+            decompositions: Vec::new(),
         }
     }
 }
@@ -287,7 +348,10 @@ impl Project {
 
     /// Writes the project as pretty-printed JSON.
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, serde_json::to_string_pretty(self)?)
+        // Patterns no filter uses any more are not worth saving.
+        let mut tidy = self.clone();
+        tidy.prune_decompositions();
+        std::fs::write(path, serde_json::to_string_pretty(&tidy)?)
             .with_context(|| format!("cannot write {}", path.display()))
     }
 
@@ -331,6 +395,164 @@ impl Project {
                         &noise,
                         &e.params,
                     )));
+                }
+            }
+        }
+    }
+
+    /// Adds the result of an automatic search: its patterns, and one
+    /// suggested filter per group, switched off and hidden (picking one in
+    /// the list shows it). Suggestions of earlier searches that were not
+    /// kept are replaced. Returns the index of the first new filter.
+    pub fn add_discovery(&mut self, discovery: Discovery) -> usize {
+        self.discard_suggestions();
+        let index = self.decompositions.len();
+        let first = self.filters.len();
+        for (n, group) in discovery.groups.iter().enumerate() {
+            let label = |c: usize| discovery.decomposition.labels.get(c).cloned().unwrap_or_default();
+            self.filters.push(Filter {
+                name: format!("Found {}: {}", n + 1, label(group[0])),
+                enabled: false,
+                visible: false,
+                action: FilterAction::Suppress,
+                kind: FilterKind::Discovered(DiscoveredFilter {
+                    decomposition: index,
+                    parts: group
+                        .iter()
+                        .map(|&c| DiscoveredPart {
+                            component: c,
+                            label: label(c),
+                            enabled: true,
+                        })
+                        .collect(),
+                }),
+                suggested: true,
+            });
+        }
+        self.decompositions.push(discovery.decomposition);
+        first
+    }
+
+    /// Removes all suggestions that were not kept; returns how many.
+    pub fn discard_suggestions(&mut self) -> usize {
+        let before = self.filters.len();
+        self.filters.retain(|f| !f.suggested);
+        self.prune_decompositions();
+        before - self.filters.len()
+    }
+
+    /// Merges filter `from` into filter `into`: both must be found by the
+    /// same search. `into` gets the parts of both (and counts as kept);
+    /// `from` is removed. Returns the new index of the merged filter.
+    pub fn merge(&mut self, into: usize, from: usize) -> Result<usize> {
+        let decomposition_of = |f: Option<&Filter>| match f.map(|f| &f.kind) {
+            Some(FilterKind::Discovered(d)) => Some(d.decomposition),
+            _ => None,
+        };
+        let (Some(a), Some(b)) = (
+            decomposition_of(self.filters.get(into)),
+            decomposition_of(self.filters.get(from)),
+        ) else {
+            bail!("only automatically found sounds can be merged");
+        };
+        if into == from {
+            bail!("pick two different sounds to merge");
+        }
+        if a != b {
+            bail!("only sounds found by the same search can be merged");
+        }
+        let removed = self.filters.remove(from);
+        let into = if from < into { into - 1 } else { into };
+        if let (FilterKind::Discovered(dst), FilterKind::Discovered(src)) = (&mut self.filters[into].kind, removed.kind)
+        {
+            for part in src.parts {
+                if !dst.parts.iter().any(|p| p.component == part.component) {
+                    dst.parts.push(part);
+                }
+            }
+            dst.parts.sort_by_key(|p| p.component);
+        }
+        self.filters[into].suggested = false;
+        Ok(into)
+    }
+
+    /// The filters that can be merged into filter `index`: other sounds
+    /// found by the same search.
+    pub fn merge_candidates(&self, index: usize) -> Vec<usize> {
+        let Some(FilterKind::Discovered(d)) = self.filters.get(index).map(|f| &f.kind) else {
+            return Vec::new();
+        };
+        self.filters
+            .iter()
+            .enumerate()
+            .filter(|&(j, f)| {
+                j != index && matches!(&f.kind, FilterKind::Discovered(o) if o.decomposition == d.decomposition)
+            })
+            .map(|(j, _)| j)
+            .collect()
+    }
+
+    /// Splits an automatically found sound into one filter per pattern,
+    /// in its place. Returns how many filters it became.
+    pub fn split(&mut self, index: usize) -> Result<usize> {
+        let Some(Filter {
+            kind: FilterKind::Discovered(d),
+            ..
+        }) = self.filters.get(index)
+        else {
+            bail!("only automatically found sounds can be split");
+        };
+        if d.parts.len() < 2 {
+            bail!("this sound has only one pattern");
+        }
+        let original = self.filters.remove(index);
+        let FilterKind::Discovered(d) = &original.kind else {
+            unreachable!("checked above")
+        };
+        let pieces: Vec<Filter> = d
+            .parts
+            .iter()
+            .map(|part| Filter {
+                name: format!("{} / pattern {}", original.name, part.component + 1),
+                kind: FilterKind::Discovered(DiscoveredFilter {
+                    decomposition: d.decomposition,
+                    parts: vec![DiscoveredPart {
+                        enabled: true,
+                        ..part.clone()
+                    }],
+                }),
+                ..original.clone()
+            })
+            .collect();
+        let n = pieces.len();
+        self.filters.splice(index..index, pieces);
+        Ok(n)
+    }
+
+    /// Drops decompositions no filter refers to and renumbers the rest.
+    pub fn prune_decompositions(&mut self) {
+        let used: Vec<bool> = (0..self.decompositions.len())
+            .map(|i| {
+                self.filters
+                    .iter()
+                    .any(|f| matches!(&f.kind, FilterKind::Discovered(d) if d.decomposition == i))
+            })
+            .collect();
+        let mut new_index = vec![0; used.len()];
+        let mut next = 0;
+        for (i, &u) in used.iter().enumerate() {
+            new_index[i] = next;
+            next += usize::from(u);
+        }
+        let mut i = 0;
+        self.decompositions.retain(|_| {
+            i += 1;
+            used[i - 1]
+        });
+        for f in &mut self.filters {
+            if let FilterKind::Discovered(d) = &mut f.kind {
+                if let Some(&n) = new_index.get(d.decomposition) {
+                    d.decomposition = n;
                 }
             }
         }
@@ -381,6 +603,7 @@ pub fn compute_gains(
     let mut scratch_inf = vec![0.0f32; bins];
     let no_occurrences: Vec<Occurrence> = Vec::new();
     let occ_of = |i: usize| occurrences.get(i).unwrap_or(&no_occurrences);
+    let fits = fit_decompositions(project, &power_with_warmup[warmup..]);
 
     // Event filters' masks first (frame by frame), so that bins claimed by
     // both an extract and a suppress filter can be shared out before the
@@ -429,7 +652,36 @@ pub fn compute_gains(
                             .then(|| (0..bins).map(|k| scratch_sel[k].max(scratch_inf[k])).collect())
                     })
                     .collect();
-                events.push((fi, f, e, masks));
+                events.push((fi, f, Source::Event(e), masks));
+            }
+            FilterKind::Discovered(d) => {
+                let Some((dec, fits)) = discovered(project, &fits, d) else {
+                    continue;
+                };
+                if f.action == FilterAction::Extract {
+                    extract.get_or_insert_with(|| vec![vec![0.0; bins]; n]);
+                }
+                let parts = d.enabled_components();
+                if parts.is_empty() {
+                    continue;
+                }
+                let mut masks = Vec::with_capacity(n);
+                let mut shapes = Vec::with_capacity(n);
+                for fit in fits {
+                    let mut shape = vec![0.0f32; bins];
+                    dec.expected_power(fit, &parts, &mut shape);
+                    let mut mask = vec![0.0f32; bins];
+                    dec.mask(fit, &parts, &mut mask);
+                    masks.push(Some(mask));
+                    shapes.push(shape);
+                }
+                // The strongest enabled pattern's direction stands for the
+                // sound's.
+                let direction = parts
+                    .iter()
+                    .find_map(|&c| dec.directions.get(c)?.as_ref())
+                    .map(|sig| (sig, dec.level_tolerance_db, dec.delay_tolerance_samples));
+                events.push((fi, f, Source::Discovered { shapes, direction }, masks));
             }
         }
     }
@@ -442,7 +694,10 @@ pub fn compute_gains(
         let noise = share_noise.unwrap_or_else(|| {
             events
                 .iter()
-                .find_map(|(_, _, e, _)| e.analysis.as_ref()?.template.as_ref().map(|t| t.noise.clone()))
+                .find_map(|(_, _, src, _)| match src {
+                    Source::Event(e) => e.analysis.as_ref()?.template.as_ref().map(|t| t.noise.clone()),
+                    Source::Discovered { .. } => None,
+                })
                 .unwrap_or_else(|| vec![0.0; bins])
         });
         share_bins(
@@ -469,12 +724,26 @@ pub fn compute_gains(
     }
 
     // Overlays of visible (or highlighted) event filters, including the
-    // live preview.
+    // live preview. Automatically found sounds are what the program
+    // detected, so they are drawn in red.
     for (fi, f) in project.filters.iter().chain(project.preview.as_ref()).enumerate() {
-        let FilterKind::Event(e) = &f.kind else { continue };
         if !project.shows(fi) {
             continue;
         }
+        let e = match &f.kind {
+            FilterKind::Event(e) => e,
+            FilterKind::Discovered(d) => {
+                if let Some((dec, fits)) = discovered(project, &fits, d) {
+                    let parts = d.enabled_components();
+                    for (fit, inf) in fits.iter().zip(inferred.iter_mut()) {
+                        dec.mask(fit, &parts, &mut scratch_inf);
+                        inf.iter_mut().zip(&scratch_inf).for_each(|(i, m)| *i = i.max(*m));
+                    }
+                }
+                continue;
+            }
+            FilterKind::NoiseReduction(_) => continue,
+        };
         for t in 0..n {
             let power = &power_with_warmup[warmup + t];
             if !event_masks(
@@ -521,9 +790,52 @@ fn add_removed(g: &[Vec<f32>], inferred: &mut [Vec<f32>]) {
     }
 }
 
-/// Event filters with their masks per frame, as collected in
-/// [`compute_gains`]: `(index in the list, filter, event part, masks)`.
-type EventMasks<'a> = Vec<(usize, &'a Filter, &'a EventFilter, Vec<Option<Vec<f32>>>)>;
+/// Fits every decomposition that an enabled or drawn filter uses to each
+/// of the `power` frames (see [`Decomposition::fit_frame`]); `None` for
+/// the others and for decompositions learned with another FFT size.
+fn fit_decompositions(project: &Project, power: &[Vec<f32>]) -> Vec<Option<Vec<FrameFit>>> {
+    let bins = project.stft.bins();
+    (0..project.decompositions.len())
+        .map(|i| {
+            let dec = &project.decompositions[i];
+            let needed = project.filters.iter().enumerate().any(|(fi, f)| {
+                matches!(&f.kind, FilterKind::Discovered(d) if d.decomposition == i) && (f.enabled || project.shows(fi))
+            });
+            (needed && dec.bins() == bins && dec.fft_size == project.stft.fft_size)
+                .then(|| power.iter().map(|p| dec.fit_frame(p)).collect())
+        })
+        .collect()
+}
+
+/// The decomposition of `d` with its frame fits, if they were computed.
+fn discovered<'a>(
+    project: &'a Project,
+    fits: &'a [Option<Vec<FrameFit>>],
+    d: &DiscoveredFilter,
+) -> Option<(&'a Decomposition, &'a Vec<FrameFit>)> {
+    Some((
+        project.decompositions.get(d.decomposition)?,
+        fits.get(d.decomposition)?.as_ref()?,
+    ))
+}
+
+/// What the bin sharing knows about a filter's sound.
+enum Source<'a> {
+    /// A marked sound: its shape comes from the analysis' source model.
+    Event(&'a EventFilter),
+    /// An automatically found sound: the patterns give its expected power
+    /// per frame directly, and the direction of its strongest pattern.
+    Discovered {
+        /// Expected power per bin in every frame.
+        shapes: Vec<Vec<f32>>,
+        /// Direction with level and delay tolerances, if known.
+        direction: Option<(&'a Signature, f32, f32)>,
+    },
+}
+
+/// Event and discovered filters with their masks per frame, as collected
+/// in [`compute_gains`]: `(index in the list, filter, source, masks)`.
+type EventMasks<'a> = Vec<(usize, &'a Filter, Source<'a>, Vec<Option<Vec<f32>>>)>;
 
 /// Shares contested bins between extract and suppress filters (see
 /// [`crate::share`]): predicts each sound's shape in every frame from its
@@ -562,7 +874,16 @@ fn share_bins(
     let mut shapes: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(events.len());
     let mut loud: Vec<Vec<Option<f32>>> = Vec::with_capacity(events.len());
     let mut scratch = vec![0.0f32; bins];
-    for (fi, _, e, masks) in events.iter() {
+    for (fi, _, src, masks) in events.iter() {
+        let e = match src {
+            Source::Event(e) => e,
+            Source::Discovered { shapes: s, .. } => {
+                // The patterns predict the power itself: loudness 1.
+                shapes.push((0..n).map(|t| masks[t].as_ref().map(|_| s[t].clone())).collect());
+                loud.push((0..n).map(|t| masks[t].as_ref().map(|_| 1.0)).collect());
+                continue;
+            }
+        };
         let a = e.analysis.as_ref();
         let model = a.and_then(|a| a.model.as_ref());
         let (mut sh, mut lo) = (vec![None; n], vec![None; n]);
@@ -607,14 +928,17 @@ fn share_bins(
     for t in 0..n {
         let Some(c) = &contested_bins[t] else { continue };
         let mut claimants: Vec<Claimant> = Vec::new();
-        for (i, (_, f, e, masks)) in events.iter_mut().enumerate() {
+        for (i, (_, f, src, masks)) in events.iter_mut().enumerate() {
             let Some(mask) = masks[t].as_mut() else { continue };
-            let direction = e
-                .analysis
-                .as_ref()
-                .and_then(|a| a.template.as_ref())
-                .and_then(|tpl| tpl.spatial.as_ref())
-                .map(|sig| (sig, e.similar.level_tolerance_db, e.similar.delay_tolerance_samples));
+            let direction = match src {
+                Source::Event(e) => e
+                    .analysis
+                    .as_ref()
+                    .and_then(|a| a.template.as_ref())
+                    .and_then(|tpl| tpl.spatial.as_ref())
+                    .map(|sig| (sig, e.similar.level_tolerance_db, e.similar.delay_tolerance_samples)),
+                Source::Discovered { direction, .. } => *direction,
+            };
             claimants.push(Claimant {
                 extract: f.action == FilterAction::Extract,
                 mask: mask.as_mut_slice(),
@@ -670,6 +994,7 @@ mod tests {
             filters,
             preview: None,
             highlight: None,
+            decompositions: Vec::new(),
         }
     }
 
@@ -781,6 +1106,113 @@ mod tests {
         assert!(removed(&p).0 > 0.5);
     }
 
+    /// A search result over 3 bins: pattern 0 lives in bin 0, pattern 1
+    /// in bin 2, pattern 2 in bin 1; grouped as {0, 2} and {1}.
+    fn discovery() -> Discovery {
+        Discovery {
+            decomposition: Decomposition {
+                fft_size: 4,
+                patterns: vec![vec![1.0, 0.0, 0.0], vec![0.0, 0.0, 1.0], vec![0.0, 1.0, 0.0]],
+                background: Vec::new(),
+                directions: vec![None; 3],
+                labels: vec!["low".into(), "high".into(), "middle".into()],
+                level_tolerance_db: 3.0,
+                delay_tolerance_samples: 2.0,
+            },
+            groups: vec![vec![0, 2], vec![1]],
+            energy: vec![0.5, 0.3, 0.2],
+            frames_used: 10,
+        }
+    }
+
+    #[test]
+    fn discovered_sounds_are_suggested_switched_off_and_hidden() {
+        let mut p = project(vec![Filter::noise_reduction("noise")]);
+        assert_eq!(p.add_discovery(discovery()), 1);
+        assert_eq!(p.filters.len(), 3);
+        let f = &p.filters[1];
+        assert!(f.suggested && !f.enabled && !f.visible);
+        assert_eq!(f.name, "Found 1: low");
+        assert_eq!(f.parts().len(), 2);
+        assert_eq!(f.parts()[1].0, "Pattern 3: middle");
+        // Nothing changes the sound until a suggestion is switched on.
+        let power = vec![vec![4.0, 4.0, 4.0]; 2];
+        p.filters.remove(0);
+        let g = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        assert_eq!(g.gain[0], vec![1.0; 3]);
+        assert_eq!(g.inferred[0], vec![0.0; 3]);
+        // Picking it shows what it found, in red.
+        p.highlight = Some(0);
+        let g = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        assert!(g.inferred[0][0] > 0.99 && g.inferred[0][1] > 0.99 && g.inferred[0][2] < 1e-3);
+        assert_eq!(g.selected[0], vec![0.0; 3]);
+    }
+
+    #[test]
+    fn discovered_sounds_suppress_and_extract_by_their_share() {
+        let mut p = project(Vec::new());
+        p.add_discovery(discovery());
+        let power = vec![vec![9.0, 1.0, 4.0]; 2];
+        p.filters[0].enabled = true;
+        let s = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        p.filters[0].action = FilterAction::Extract;
+        let e = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        for k in 0..3 {
+            assert!((s.gain[0][k].powi(2) + e.gain[0][k].powi(2) - 1.0).abs() < 1e-5);
+        }
+        // Each bin belongs to exactly one pattern here.
+        assert!(
+            e.gain[0][0] > 0.99 && e.gain[0][1] > 0.99 && e.gain[0][2] < 1e-3,
+            "{:?}",
+            e.gain[0]
+        );
+        // Switching a part off gives its bins back.
+        assert!(p.filters[0].set_part_enabled(1, false));
+        let e = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        assert!(e.gain[0][1] < 1e-3, "{:?}", e.gain[0]);
+    }
+
+    #[test]
+    fn suggestions_are_merged_split_kept_and_replaced() {
+        let mut p = project(Vec::new());
+        p.add_discovery(discovery());
+        assert!(p.merge(0, 0).is_err());
+        assert_eq!(p.merge_candidates(0), vec![1]);
+        assert_eq!(p.merge(1, 0).unwrap(), 0);
+        assert_eq!(p.filters.len(), 1);
+        let FilterKind::Discovered(d) = &p.filters[0].kind else {
+            panic!()
+        };
+        assert_eq!(d.parts.iter().map(|p| p.component).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(!p.filters[0].suggested, "merging is a decision to keep");
+        assert_eq!(p.split(0).unwrap(), 3);
+        assert_eq!(p.filters.len(), 3);
+        assert!(p.split(0).is_err(), "one pattern cannot be split");
+        // Another search replaces suggestions but keeps what was kept.
+        p.add_discovery(discovery());
+        assert_eq!(p.filters.len(), 5);
+        assert_eq!(p.decompositions.len(), 2);
+        // Sounds of different searches cannot be merged.
+        assert!(p.merge(0, 3).is_err());
+        assert_eq!(p.discard_suggestions(), 2);
+        assert_eq!(p.decompositions.len(), 1);
+        // Removing the last user of a decomposition renumbers the rest.
+        p.filters.clear();
+        p.add_discovery(discovery());
+        p.filters.iter_mut().for_each(|f| f.suggested = false);
+        p.add_discovery(discovery());
+        p.filters.drain(0..2);
+        p.prune_decompositions();
+        assert_eq!(p.decompositions.len(), 1);
+        assert!(p
+            .filters
+            .iter()
+            .all(|f| matches!(&f.kind, FilterKind::Discovered(d) if d.decomposition == 0)));
+        // Event filters cannot be merged or split.
+        p.filters.push(analysed_event(FilterAction::Suppress, 1.0));
+        assert!(p.merge(0, 2).is_err() && p.split(2).is_err());
+    }
+
     #[test]
     fn project_json_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -803,5 +1235,15 @@ mod tests {
         assert_eq!(q.filters[1].name, "bird");
         assert_eq!(q.filters[1].action, FilterAction::Extract);
         assert!(!q.filters[1].parts()[2].1);
+
+        // Found sounds keep their patterns; unused patterns are not saved.
+        p.add_discovery(discovery());
+        p.decompositions.push(discovery().decomposition);
+        p.save(&path).unwrap();
+        let q = Project::load(&path).unwrap();
+        assert_eq!(q.decompositions.len(), 1);
+        assert_eq!(q.decompositions[0], discovery().decomposition);
+        assert_eq!(q.filters.len(), 4);
+        assert!(q.filters[2].suggested);
     }
 }

@@ -26,6 +26,12 @@
 //! Picking a filter in the list draws its overlays even when "Show in
 //! spectrogram" is off: what an event filter targets in green / red /
 //! orange, what a noise reduction takes away in red.
+//!
+//! "Find sounds" looks for the recurring sounds the recording (or the
+//! selected stretch) is made of (see `noiseextractor_core::discover`) and
+//! adds them to the list as suggestions: switched off and hidden until
+//! picked. They can be kept, renamed, merged, split or discarded; their
+//! parts are the spectral patterns found.
 
 // A release build is a GUI program on Windows: started from Explorer it
 // gets no console window. Debug builds keep the console for their output.
@@ -44,6 +50,7 @@ mod view;
 use detection::{Group, Param};
 use noiseextractor_core::analysis::{analyze_selection, AnalysisParams, RegionAnalysis, Selection};
 use noiseextractor_core::audio::WavStreamWriter;
+use noiseextractor_core::discover::{discover, DiscoverParams, Discovery};
 use noiseextractor_core::engine::process_all;
 use noiseextractor_core::filter::{EventFilter, Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::{mean_power, NoiseEstimate};
@@ -119,6 +126,8 @@ enum Background {
     ExportProgress(usize),
     /// Export finished.
     Exported(anyhow::Result<PathBuf>),
+    /// The search for the recording's sounds finished.
+    Discovered(anyhow::Result<Discovery>),
 }
 
 /// All mutable application state, owned by the GUI thread.
@@ -216,6 +225,22 @@ struct Ui {
     learn: Button,
     /// Switches back to the adaptive noise estimate.
     adaptive: Button,
+    /// Starts the search for the recording's sounds.
+    find_sounds: Button,
+    /// How many spectral patterns to look for.
+    sounds: Slider,
+    /// Shows the slider value.
+    sounds_label: StaticText,
+    /// Whether patterns that belong together are suggested as one sound.
+    group: CheckBox,
+    /// Keeps the current suggestion (the next search will not replace it).
+    keep: Button,
+    /// Merges another found sound into the current one.
+    merge: Button,
+    /// Splits the current found sound into its patterns.
+    split: Button,
+    /// Removes all suggestions that were not kept.
+    discard: Button,
 }
 
 /// The application state as shared by all event handlers (GUI thread only).
@@ -347,8 +372,27 @@ fn build_ui() -> Ui {
         .build();
     let learn = Button::builder(&side).with_label("Learn noise from selection").build();
     let adaptive = Button::builder(&side).with_label("Adaptive noise estimate").build();
+    let sounds_label = StaticText::builder(&side)
+        .with_label(&sounds_text(DiscoverParams::default().components))
+        .build();
+    let sounds = Slider::builder(&side)
+        .with_value(DiscoverParams::default().components as i32)
+        .with_min_value(1)
+        .with_max_value(MAX_SOUNDS)
+        .build();
+    let group = CheckBox::builder(&side)
+        .with_label("Group patterns by timing and direction")
+        .build();
+    group.set_value(DiscoverParams::default().group);
+    let find_sounds = Button::builder(&side)
+        .with_label("Find sounds (in the selection, if any)")
+        .build();
+    let keep = Button::builder(&side).with_label("Keep").build();
+    let merge = Button::builder(&side).with_label("Merge with...").build();
+    let split = Button::builder(&side).with_label("Split").build();
+    let discard = Button::builder(&side).with_label("Discard suggestions").build();
     let legend = StaticText::builder(&side)
-        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere\nOrange: both\n\nDrag to select, click to set play head,\nright-drag to scrub, wheel zooms\n(Shift scrolls, Ctrl: frequency), Space plays.")
+        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere,\n  or a found sound you picked\nOrange: both\n\nDrag to select, click to set play head,\nright-drag to scrub, wheel zooms\n(Shift scrolls, Ctrl: frequency), Space plays.")
         .build();
 
     let s = BoxSizer::builder(Orientation::Vertical).build();
@@ -379,6 +423,22 @@ fn build_ui() -> Ui {
     s.add(&reduction, 0, SizerFlag::Expand | SizerFlag::All, 4);
     s.add(&learn, 0, SizerFlag::Expand | SizerFlag::All, 2);
     s.add(&adaptive, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    s.add(
+        &label("Sounds in the recording"),
+        0,
+        SizerFlag::Left | SizerFlag::Top,
+        6,
+    );
+    s.add(&sounds_label, 0, SizerFlag::Left | SizerFlag::Top, 4);
+    s.add(&sounds, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    s.add(&group, 0, SizerFlag::All, 4);
+    s.add(&find_sounds, 0, SizerFlag::Expand | SizerFlag::All, 2);
+    let row3 = BoxSizer::builder(Orientation::Horizontal).build();
+    row3.add(&keep, 1, SizerFlag::All, 2);
+    row3.add(&merge, 1, SizerFlag::All, 2);
+    row3.add(&split, 1, SizerFlag::All, 2);
+    s.add_sizer(&row3, 0, SizerFlag::Expand, 2);
+    s.add(&discard, 0, SizerFlag::Expand | SizerFlag::All, 2);
     s.add(&legend, 0, SizerFlag::All, 6);
     side.set_sizer(s, true);
 
@@ -416,7 +476,23 @@ fn build_ui() -> Ui {
         down,
         learn,
         adaptive,
+        find_sounds,
+        sounds,
+        sounds_label,
+        group,
+        keep,
+        merge,
+        split,
+        discard,
     }
+}
+
+/// Most spectral patterns the slider offers.
+const MAX_SOUNDS: i32 = 16;
+
+/// Label of the pattern-count slider.
+fn sounds_text(n: usize) -> String {
+    format!("Patterns to look for: {n}")
 }
 
 /// Builds the detection settings pane: a title naming the object being
@@ -783,6 +859,7 @@ fn bind_events(state: &Shared, ui: Ui) {
             return;
         };
         s.project.filters.remove(i);
+        s.project.prune_decompositions();
         s.current_filter = if s.project.filters.is_empty() {
             None
         } else {
@@ -797,6 +874,43 @@ fn bind_events(state: &Shared, ui: Ui) {
     ui.down.on_click(move |_| move_filter(&st, ui, 1));
     let st = state.clone();
     ui.learn.on_click(move |_| learn_noise(&st, ui));
+    ui.sounds.on_slider(move |e| {
+        ui.sounds_label.set_label(&sounds_text(e.get_value().max(1) as usize));
+    });
+    let st = state.clone();
+    ui.find_sounds
+        .on_click(move |_| start_discovery(&mut st.borrow_mut(), ui));
+    let st = state.clone();
+    ui.keep.on_click(move |_| {
+        with_current_filter(&st, ui, |f| f.suggested = false);
+        refresh_filter_list(&st.borrow(), ui);
+    });
+    let st = state.clone();
+    ui.merge.on_click(move |_| merge_dialog(&st, ui));
+    let st = state.clone();
+    ui.split.on_click(move |_| {
+        let mut s = st.borrow_mut();
+        let Some(i) = s.current_filter else { return };
+        match s.project.split(i) {
+            Ok(n) => report(ui, &format!("Split into {n} sounds, one per pattern")),
+            Err(e) => report(ui, &format!("{e:#}")),
+        }
+        push_project(&s);
+        refresh_filter_list(&s, ui);
+    });
+    let st = state.clone();
+    ui.discard.on_click(move |_| {
+        let mut s = st.borrow_mut();
+        let n = s.project.discard_suggestions();
+        let len = s.project.filters.len();
+        s.current_filter = s
+            .current_filter
+            .filter(|_| len > 0)
+            .map(|i| i.min(len.saturating_sub(1)));
+        push_project(&s);
+        refresh_filter_list(&s, ui);
+        report(ui, &format!("Discarded {n} suggestion(s)"));
+    });
     let st = state.clone();
     ui.adaptive.on_click(move |_| {
         with_current_filter(&st, ui, |f| {
@@ -1057,7 +1171,7 @@ fn target_filter(s: &mut State, target: Target) -> Option<&mut EventFilter> {
     };
     match &mut f.kind {
         FilterKind::Event(e) => Some(e),
-        FilterKind::NoiseReduction(_) => None,
+        FilterKind::NoiseReduction(_) | FilterKind::Discovered(_) => None,
     }
 }
 
@@ -1130,7 +1244,7 @@ fn refresh_detection(s: &State, ui: Ui) {
     });
     let e = e.and_then(|f| match &f.kind {
         FilterKind::Event(e) => Some((f.name.as_str(), e)),
-        FilterKind::NoiseReduction(_) => None,
+        FilterKind::NoiseReduction(_) | FilterKind::Discovered(_) => None,
     });
     let title = match (target, e) {
         (Some(Target::Preview), Some(_)) => "Settings of the selection (not yet a filter)".to_string(),
@@ -1181,6 +1295,82 @@ fn add_filter_from_selection(st: &Shared, ui: Ui, action: FilterAction) {
     });
     s.current_filter = Some(s.project.filters.len() - 1);
     s.selection = None;
+    push_project(&s);
+    refresh_filter_list(&s, ui);
+}
+
+/// Looks for the recording's sounds on a background thread, in the selected
+/// time range if there is a selection; [`tick`] adds the result.
+fn start_discovery(s: &mut State, ui: Ui) {
+    let Some(doc) = &s.doc else {
+        report(ui, "Open an audio file first");
+        return;
+    };
+    if s.busy.is_some() {
+        report(ui, "Busy, try again in a moment");
+        return;
+    }
+    let params = DiscoverParams {
+        components: ui.sounds.get_value().clamp(1, MAX_SOUNDS) as usize,
+        group: ui.group.get_value(),
+        range_s: s.selection.map(|sel| (sel.start_s, sel.end_s)),
+        ..DiscoverParams::default()
+    };
+    let audio = doc.audio.clone();
+    let cfg = s.project.stft;
+    let noise = s.project.analysis_noise();
+    let tx = s.tx.clone();
+    s.busy = Some("Looking for sounds ...".into());
+    report(
+        ui,
+        &format!(
+            "Looking for {} patterns in {} ...",
+            params.components,
+            if params.range_s.is_some() {
+                "the selected stretch"
+            } else {
+                "the recording"
+            }
+        ),
+    );
+    std::thread::spawn(move || {
+        let _ = tx.send(Background::Discovered(discover(&audio, cfg, &noise, &params)));
+    });
+}
+
+/// Asks which found sound to merge into the current one, then merges.
+fn merge_dialog(st: &Shared, ui: Ui) {
+    // Collect the choices first: no borrow may be held across the dialog.
+    let (current, candidates, names) = {
+        let s = st.borrow();
+        let Some(i) = s.current_filter else { return };
+        let candidates = s.project.merge_candidates(i);
+        let names: Vec<String> = candidates.iter().map(|&j| s.project.filters[j].name.clone()).collect();
+        (i, candidates, names)
+    };
+    if candidates.is_empty() {
+        report(ui, "No other sound from the same search to merge with");
+        return;
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let dlg = SingleChoiceDialog::builder(&ui.frame, "Merge which sound into this one?", "Merge sounds", &refs).build();
+    if dlg.show_modal() != ID_OK {
+        return;
+    }
+    let Some(&from) = usize::try_from(dlg.get_selection())
+        .ok()
+        .and_then(|k| candidates.get(k))
+    else {
+        return;
+    };
+    let mut s = st.borrow_mut();
+    match s.project.merge(current, from) {
+        Ok(i) => {
+            s.current_filter = Some(i);
+            report(ui, "Merged");
+        }
+        Err(e) => report(ui, &format!("{e:#}")),
+    }
     push_project(&s);
     refresh_filter_list(&s, ui);
 }
@@ -1314,6 +1504,27 @@ fn tick(s: &mut State, ui: Ui) {
                 if taken {
                     report(ui, &describe_analysis(&a));
                     push_project(s);
+                }
+            }
+            Background::Discovered(result) => {
+                s.busy = None;
+                match result {
+                    Ok(found) => {
+                        let (patterns, frames) = (found.decomposition.patterns.len(), found.frames_used);
+                        let sounds = found.groups.len();
+                        let first = s.project.add_discovery(found);
+                        s.current_filter = Some(first);
+                        push_project(s);
+                        refresh_filter_list(s, ui);
+                        report(
+                            ui,
+                            &format!(
+                                "Found {sounds} sound(s) from {patterns} patterns ({frames} frames): pick one to see it in \
+                                 red, check it to apply it; Keep, Merge, Split or Discard"
+                            ),
+                        );
+                    }
+                    Err(e) => report(ui, &format!("Finding sounds failed: {e:#}")),
                 }
             }
             Background::ExportProgress(p) => s.busy = Some(format!("Exporting ... {p}%")),
@@ -1455,8 +1666,11 @@ fn refresh_filter_list(s: &State, ui: Ui) {
             (FilterKind::NoiseReduction(_), FilterAction::Extract) => "keep noise",
             (FilterKind::Event(_), FilterAction::Suppress) => "suppress",
             (FilterKind::Event(_), FilterAction::Extract) => "extract",
+            (FilterKind::Discovered(_), FilterAction::Suppress) => "found, suppress",
+            (FilterKind::Discovered(_), FilterAction::Extract) => "found, extract",
         };
-        ui.filters.append(&format!("{} [{kind}]", f.name));
+        let note = if f.suggested { " (suggested)" } else { "" };
+        ui.filters.append(&format!("{} [{kind}]{note}", f.name));
         ui.filters.check(i as u32, f.enabled);
     }
     if let Some(i) = s.current_filter.filter(|&i| i < s.project.filters.len()) {
@@ -1476,7 +1690,11 @@ fn refresh_details(s: &State, ui: Ui) {
     ui.parts.enable(has);
     ui.delete.enable(has);
     ui.parts.clear();
+    ui.discard.enable(s.project.filters.iter().any(|f| f.suggested));
     let Some(f) = f else {
+        ui.keep.enable(false);
+        ui.merge.enable(false);
+        ui.split.enable(false);
         ui.name.change_value("");
         ui.reduction.enable(false);
         refresh_detection(s, ui);
@@ -1490,10 +1708,14 @@ fn refresh_details(s: &State, ui: Ui) {
     ui.action
         .set_selection(if f.action == FilterAction::Extract { 1 } else { 0 });
     for (i, (label, on)) in f.parts().into_iter().enumerate() {
-        ui.parts.append(label);
+        ui.parts.append(&label);
         ui.parts.check(i as u32, on);
     }
     refresh_detection(s, ui);
+    let found = matches!(f.kind, FilterKind::Discovered(_));
+    ui.keep.enable(f.suggested);
+    ui.merge.enable(found);
+    ui.split.enable(found);
     let nr = matches!(f.kind, FilterKind::NoiseReduction(_));
     ui.reduction.enable(nr);
     ui.learn.enable(true);

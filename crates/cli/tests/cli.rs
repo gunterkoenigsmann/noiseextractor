@@ -298,3 +298,88 @@ fn stereo_repetition_from_another_place_is_kept() {
         }
     }
 }
+
+/// A 3 s mono recording of two sounds taking turns over faint noise: a
+/// 660 Hz tone with an octave overtone at 0.3-1.0 s and 1.8-2.4 s, and a
+/// warbling 3 kHz whistle at 1.1-1.7 s and 2.5-2.9 s.
+fn write_two_sounds(path: &Path) -> AudioData {
+    let sr = 16000;
+    let mut rng = 9u64;
+    let x: Vec<f32> = (0..3 * sr)
+        .map(|i| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let n = ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.01;
+            let t = i as f32 / sr as f32;
+            let w = 2.0 * std::f32::consts::PI * t;
+            let tone = if (0.3..1.0).contains(&t) || (1.8..2.4).contains(&t) {
+                0.3 * (660.0 * w).sin() + 0.15 * (1320.0 * w).sin()
+            } else {
+                0.0
+            };
+            let whistle = if (1.1..1.7).contains(&t) || (2.5..2.9).contains(&t) {
+                0.3 * (3000.0 * w + 3.0 * (6.0 * w).sin()).sin()
+            } else {
+                0.0
+            };
+            tone + whistle + n
+        })
+        .collect();
+    let audio = AudioData::new(sr as u32, vec![x]);
+    audio.save_wav(path).unwrap();
+    audio
+}
+
+#[test]
+fn discovered_sound_can_be_extracted() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    let project = dir.path().join("p.json");
+    let output = dir.path().join("out.wav");
+    let audio = write_two_sounds(&input);
+    let out = bin()
+        .args(["discover", "--sounds", "3"])
+        .arg(&input)
+        .arg("--save-project")
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("suggestion 1"), "{report}");
+
+    // Switch on, as an extract filter, the suggestion with the tone.
+    let mut p = Project::load(&project).unwrap();
+    let tone = p
+        .filters
+        .iter()
+        .position(|f| {
+            f.suggested
+                && f.parts()
+                    .iter()
+                    .any(|(l, _)| l.contains("peak 656 Hz") || l.contains("peak 664 Hz"))
+        })
+        .unwrap_or_else(|| panic!("no suggestion with the tone:\n{report}"));
+    p.filters[tone].enabled = true;
+    p.filters[tone].action = noiseextractor_core::FilterAction::Extract;
+    // Keep the background noise reduction out of the way.
+    p.filters
+        .retain(|f| !matches!(f.kind, noiseextractor_core::FilterKind::NoiseReduction(_)));
+    p.save(&project).unwrap();
+    let st = bin()
+        .arg("process")
+        .arg(&input)
+        .arg("--project")
+        .arg(&project)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let result = AudioData::load(&output).unwrap();
+    let (a, b) = (&audio.channels[0], &result.channels[0]);
+    let range = |t0: f32, t1: f32| ((t0 * 16000.0) as usize, (t1 * 16000.0) as usize);
+    let (t0, t1) = range(0.4, 0.9);
+    assert!(rms(&b[t0..t1]) > 0.8 * rms(&a[t0..t1]), "tone damaged");
+    let (w0, w1) = range(1.2, 1.6);
+    assert!(rms(&b[w0..w1]) < 0.2 * rms(&a[w0..w1]), "whistle kept");
+}

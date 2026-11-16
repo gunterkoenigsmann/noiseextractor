@@ -23,9 +23,10 @@
 
 use crate::stft::Stft;
 use realfft::num_complex::Complex32;
+use serde::{Deserialize, Serialize};
 
 /// Level and delay of one channel relative to channel 0.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PairCue {
     /// Level of the channel minus level of channel 0, in dB.
     pub level_db: f32,
@@ -35,6 +36,7 @@ pub struct PairCue {
     /// `delay_samples` as far as the measured cells can tell: a narrow band
     /// pins the delay down only loosely, and in a room the reflections
     /// shift each bin's phase a little (see [`DELAY_PIN_FRACTION`]).
+    #[serde(default)]
     pub delay_uncertainty: f32,
 }
 
@@ -46,8 +48,9 @@ pub struct PairCue {
 pub const DELAY_PIN_FRACTION: f32 = 0.9;
 
 /// Spatial signature of a sound: one [`PairCue`] per channel after the
-/// first. Empty for mono recordings.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// first. Empty for mono recordings. Saved with automatically discovered
+/// sounds (see [`crate::discover`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Signature {
     /// Cues of channels 1, 2, ... relative to channel 0.
     pub pairs: Vec<PairCue>,
@@ -70,14 +73,42 @@ pub struct Cells<'a> {
 /// Step of the delay search in samples.
 const DELAY_STEP: f32 = 0.25;
 
-/// Per-bin sums over the frames of some [`Cells`] for one channel pair.
-struct PairSums {
+/// Per-bin sums over the frames of some cells for one channel pair: what
+/// a [`Signature`] is estimated from (see [`from_sums`]).
+#[derive(Clone, Debug)]
+pub struct PairSums {
     /// Σ w·cross/|cross| per bin (phase votes, cross = ref·conj(other)).
     votes: Vec<Complex32>,
     /// Σ w·|ref|² per bin.
     e_ref: Vec<f64>,
     /// Σ w·|other|² per bin.
     e_other: Vec<f64>,
+}
+
+impl PairSums {
+    /// Empty sums for `width` bins.
+    pub fn new(width: usize) -> Self {
+        Self {
+            votes: vec![Complex32::new(0.0, 0.0); width],
+            e_ref: vec![0.0; width],
+            e_other: vec![0.0; width],
+        }
+    }
+
+    /// Adds one cell of bin index `i` with membership weight `w`, whose
+    /// spectrum is `a` in the reference channel and `b` in the other one.
+    pub fn add(&mut self, i: usize, w: f32, a: Complex32, b: Complex32) {
+        if w <= 0.0 {
+            return;
+        }
+        self.e_ref[i] += (w * a.norm_sqr()) as f64;
+        self.e_other[i] += (w * b.norm_sqr()) as f64;
+        let cross = a * b.conj();
+        let mag = cross.norm();
+        if mag > 1e-20 {
+            self.votes[i] += cross * (w / mag);
+        }
+    }
 }
 
 /// Analyses all channels over the frames of `cells` and sums, for every
@@ -92,26 +123,11 @@ fn pair_sums(channels: &[Vec<f32>], stft: &Stft, cells: &Cells) -> Vec<PairSums>
     spectra[1..]
         .iter()
         .map(|other| {
-            let mut sums = PairSums {
-                votes: vec![Complex32::new(0.0, 0.0); width],
-                e_ref: vec![0.0; width],
-                e_other: vec![0.0; width],
-            };
+            let mut sums = PairSums::new(width);
             for t in 0..cells.frames {
                 for i in 0..width {
-                    let w = cells.weights[t * width + i];
-                    if w <= 0.0 {
-                        continue;
-                    }
                     let k = cells.k0 + i;
-                    let (a, b) = (reference[t][k], other[t][k]);
-                    sums.e_ref[i] += (w * a.norm_sqr()) as f64;
-                    sums.e_other[i] += (w * b.norm_sqr()) as f64;
-                    let cross = a * b.conj();
-                    let mag = cross.norm();
-                    if mag > 1e-20 {
-                        sums.votes[i] += cross * (w / mag);
-                    }
+                    sums.add(i, cells.weights[t * width + i], reference[t][k], other[t][k]);
                 }
             }
             sums
@@ -138,9 +154,25 @@ pub fn measure(channels: &[Vec<f32>], stft: &Stft, cells: &Cells, max_delay_samp
     if width == 0 || cells.weights.iter().all(|&w| w <= 0.0) {
         return None;
     }
-    let n = stft.config().fft_size as f32;
-    let mut pairs = Vec::with_capacity(channels.len() - 1);
-    for sums in pair_sums(channels, stft, cells) {
+    from_sums(
+        &pair_sums(channels, stft, cells),
+        cells.k0,
+        stft.config().fft_size,
+        max_delay_samples,
+    )
+}
+
+/// Estimates a signature from per-bin sums, one [`PairSums`] per channel
+/// after the first, whose bin index 0 is bin `k0` of an `fft_size`-point
+/// STFT. Delays are searched up to ±`max_delay_samples`. `None` when a
+/// channel pair carries no energy.
+pub fn from_sums(sums: &[PairSums], k0: usize, fft_size: usize, max_delay_samples: f32) -> Option<Signature> {
+    if sums.is_empty() {
+        return None;
+    }
+    let n = fft_size as f32;
+    let mut pairs = Vec::with_capacity(sums.len());
+    for sums in sums {
         let e_ref: f64 = sums.e_ref.iter().sum();
         let e_other: f64 = sums.e_other.iter().sum();
         if e_ref <= 0.0 || e_other <= 0.0 {
@@ -154,7 +186,7 @@ pub fn measure(channels: &[Vec<f32>], stft: &Stft, cells: &Cells, max_delay_samp
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    let phase = -delay_phase(cells.k0 + i, tau, n);
+                    let phase = -delay_phase(k0 + i, tau, n);
                     v.re * phase.cos() - v.im * phase.sin()
                 })
                 .sum()
