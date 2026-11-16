@@ -1,0 +1,100 @@
+# Releases
+
+A release is a git tag `vX.Y.Z`. Pushing it starts
+[`release.yml`](../.github/workflows/release.yml), which builds, tests and
+publishes the packages below to the GitHub release of that tag. The
+workflow follows losslessaudiocut's on purpose; keep the two alike.
+
+## Packages
+
+| Platform | Architectures | Files | Built on |
+|---|---|---|---|
+| Debian 13, Ubuntu 24.04 and newer | amd64, arm64 | `noiseextractor_VERSION-1_ARCH.deb` | `ubuntu-24.04`, `ubuntu-24.04-arm` |
+| Linux (glibc 2.39 or newer) | x86_64, aarch64 | `noiseextractor-VERSION-linux-ARCH.AppImage` | `ubuntu-24.04`, `ubuntu-24.04-arm` |
+| Windows 10/11 | x64, arm64 | `noiseextractor-VERSION-windows-ARCH.zip` (unpack and run), `noiseextractor-VERSION-windows-ARCH-setup.exe` (installer) | `windows-latest`, `windows-11-arm` |
+| macOS | arm64 (Apple silicon), x86_64 (Intel) | `noiseextractor-VERSION-macos-ARCH.dmg` | `macos-latest`, `macos-15-intel` |
+
+Plus `SHA256SUMS.txt` with the checksums of all of them. In the `.deb`
+name a pre-release suffix is written with `~` (`0.2.0~rc1-1`), so that
+apt sorts it before the release.
+
+Every package holds the GUI and the command line tool `noiseextractor-cli`:
+
+- Debian package: `/usr/bin/noiseextractor` and
+  `/usr/bin/noiseextractor-cli`; install with
+  `sudo apt install ./noiseextractor_*.deb` so apt fetches the
+  dependencies (GTK 3, ALSA).
+- AppImage: `./noiseextractor-*.AppImage --cli ARGS...` runs the command
+  line tool, and so does a symlink named `noiseextractor-cli` to the
+  AppImage, like busybox. Everything but glibc, ALSA and OpenGL is bundled.
+- Windows: `noiseextractor-cli.exe` next to `noiseextractor.exe` (in the
+  zip folder, or the installation folder).
+- macOS: `noiseextractor.app/Contents/MacOS/noiseextractor-cli`.
+
+The packages offer the program under "Open with" for the audio types it
+reads (`FILE_TYPES` in `crates/core/src/audio.rs`); it never becomes the
+default program. `crates/core/tests/packaging.rs` checks that the desktop
+file, `Info.plist` and the installer list exactly these types.
+
+## What each run checks
+
+Each package is smoke-tested where a user would run it: the CLI denoises
+`packaging/smoke-test.wav` and the GUI must still be running 15 to 20 s
+after starting with that file. The `.deb` is installed with apt in clean
+`ubuntu:24.04` and `debian:trixie` containers, which proves its `Depends`
+line (computed by `dpkg-shlibdeps`) is complete. The DMG script fails if a
+binary links anything outside macOS itself.
+
+Pull requests that touch `packaging/`, the GUI's Windows resources or the
+workflow run the same builds and tests without releasing; the packages are
+then downloadable from the run's artifacts. "Run workflow" on the Actions
+page does the same for any branch.
+
+## Making a release
+
+1. In a pull request, set `version` in `[workspace.package]` of the root
+   `Cargo.toml` to the new version (and run `cargo check` so `Cargo.lock`
+   follows). Optionally add hand-written notes as
+   `docs/release-notes/vX.Y.Z.md`.
+2. After merging, tag the merge commit and push the tag:
+   ```sh
+   git checkout main && git pull
+   git tag -a vX.Y.Z -m "noiseextractor X.Y.Z"
+   git push origin vX.Y.Z
+   ```
+   A tag that does not match `Cargo.toml` fails the workflow before
+   anything is built. The `v` must be lowercase. Push the tag from the
+   command line: GitHub's web interface only creates tags together with a
+   release, and a release that exists before the workflow runs keeps its
+   own text instead of the generated notes.
+3. The workflow creates the GitHub release with notes generated from the
+   merged pull requests, after the text of
+   `docs/release-notes/vX.Y.Z.md` if that exists.
+4. A tag with a suffix, such as `v1.2.0-rc1`, becomes a pre-release.
+
+## Unsigned packages
+
+The packages are not code-signed, so the systems warn on first start:
+
+- **Windows**: SmartScreen says "Windows protected your PC"; click *More
+  info*, then *Run anyway*.
+- **macOS**: Gatekeeper refuses to open an app from an unidentified
+  developer. Right-click (Control-click) the app, choose *Open*, then *Open*
+  again; on macOS 15 and newer, allow it under *System Settings*, *Privacy &
+  Security* instead. Or remove the quarantine flag:
+  `xattr -dr com.apple.quarantine /Applications/noiseextractor.app`.
+- **Linux**: no warning; make the AppImage executable (`chmod +x`).
+
+## Files
+
+- `packaging/version.sh`: the version packages are named after; checks the
+  tag against `Cargo.toml`.
+- `packaging/linux/`: `deb.sh`, `appimage.sh` (with `AppRun`, the
+  AppImage's entry point) and the desktop file.
+- `packaging/macos/`: `dmg.sh` and the `Info.plist` template.
+- `packaging/windows/`: `package.ps1` (zip and installer), the Inno Setup
+  script and the application manifest. The manifest, the icon and the
+  version information are linked into `noiseextractor.exe` by
+  `crates/gui/build.rs`.
+- `packaging/icons/`: the icon as SVG, and as `.ico` (generated by
+  `generate.sh`, committed because Windows runners cannot render SVG).

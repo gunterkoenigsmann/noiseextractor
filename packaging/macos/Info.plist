@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Bundle description of noiseextractor.app. packaging/macos/dmg.sh
+     replaces @VERSION@ (the full version, e.g. 1.2.0 or
+     0.1.0-dev.20261116.b608345) and @SHORT_VERSION@ (only X.Y.Z, the form
+     macOS expects in CFBundleShortVersionString and CFBundleVersion). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>noiseextractor</string>
+    <!-- Documents the app opens: macOS offers it under "Open With" for
+         these types, but never makes it the default handler (LSHandlerRank
+         Alternate). The list must equal the UTIs of
+         noiseextractor_core::audio::FILE_TYPES, in that order;
+         crates/core/tests/packaging.rs checks it. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Audio recording</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.microsoft.waveform-audio</string>
+                <string>org.xiph.flac</string>
+                <string>org.xiph.ogg-audio</string>
+                <string>public.mp3</string>
+                <string>public.mpeg-4-audio</string>
+                <string>public.aac-audio</string>
+            </array>
+        </dict>
+    </array>
+    <!-- Types macOS itself may not define (it does define WAV, MP3, MPEG-4
+         audio and AAC). An imported declaration only applies where no
+         other app or the system declares the type. -->
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.xiph.flac</string>
+            <key>UTTypeDescription</key>
+            <string>FLAC audio</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.audio</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>flac</string>
+                </array>
+                <key>public.mime-type</key>
+                <array>
+                    <string>audio/flac</string>
+                    <string>audio/x-flac</string>
+                </array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.xiph.ogg-audio</string>
+            <key>UTTypeDescription</key>
+            <string>Ogg Vorbis audio</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.audio</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>ogg</string>
+                    <string>oga</string>
+                </array>
+                <key>public.mime-type</key>
+                <array>
+                    <string>audio/ogg</string>
+                    <string>audio/x-vorbis+ogg</string>
+                </array>
+            </dict>
+        </dict>
+    </array>
+    <key>CFBundleExecutable</key>
+    <string>noiseextractor</string>
+    <key>CFBundleIconFile</key>
+    <string>noiseextractor</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.gunterkoenigsmann.noiseextractor</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>noiseextractor</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@SHORT_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@SHORT_VERSION@</string>
+    <key>CFBundleGetInfoString</key>
+    <string>noiseextractor @VERSION@</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.music</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>GPL-3.0-or-later</string>
+</dict>
+</plist>
