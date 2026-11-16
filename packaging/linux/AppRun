@@ -1,0 +1,21 @@
+#!/bin/sh
+# Entry point of the AppImage (linuxdeploy's --custom-apprun; its GTK hook
+# runs before this). One AppImage holds both programs:
+#
+#   ./noiseextractor-*.AppImage [FILE]          the GUI
+#   ./noiseextractor-*.AppImage --cli ARGS...   the command line tool
+#   noiseextractor-cli ARGS...                  the same, through a symlink
+#                                               named noiseextractor-cli to
+#                                               the AppImage
+#
+# The AppImage runtime puts the path it was started as into $ARGV0, so a
+# symlink's name tells which program is wanted, as with busybox.
+here="$(dirname "$(readlink -f "$0")")"
+if [ "${1:-}" = "--cli" ]; then
+    shift
+    exec "$here/usr/bin/noiseextractor-cli" "$@"
+fi
+case "$(basename "${ARGV0:-}")" in
+    noiseextractor-cli) exec "$here/usr/bin/noiseextractor-cli" "$@" ;;
+esac
+exec "$here/usr/bin/noiseextractor" "$@"

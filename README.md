@@ -51,6 +51,15 @@ extract them, together with everything the program finds to belong to them.
   visible area first. A one-hour recording is usable immediately; the rest is
   processed while you work.
 
+## Download
+
+Each [release](https://github.com/gunterkoenigsmann/noiseextractor/releases)
+has a Debian package and an AppImage for Linux, a zip and an installer for
+Windows and a disk image for macOS, each for Intel/AMD and Arm processors.
+They hold the GUI and the command-line tool. The packages are not signed
+yet; [docs/release.md](docs/release.md) says how to get past the warnings,
+and how a release is made.
+
 ## Building
 
 You need a stable Rust toolchain, CMake and a C++ compiler. The GUI uses
