@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=noiseextractor
+GenericName=Spectral noise editor
+Comment=Mark noises in the spectrogram and suppress or extract them
+Exec=noiseextractor %f
+Icon=noiseextractor
+Terminal=false
+Categories=AudioVideo;Audio;AudioVideoEditing;
+Keywords=audio;noise;denoise;spectrogram;filter;extract;bird;wav;flac;ogg;mp3;m4a;aac;
+# The MIME types must equal those of noiseextractor_core::audio::FILE_TYPES;
+# crates/core/tests/packaging.rs checks it.
+MimeType=audio/x-wav;audio/wav;audio/vnd.wave;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/x-aac;

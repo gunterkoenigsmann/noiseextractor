@@ -7,6 +7,70 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
+/// An audio file type the program opens, with the names the desktop
+/// environments know it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileType {
+    /// Lower-case file name extensions, without the dot.
+    pub extensions: &'static [&'static str],
+    /// MIME types (freedesktop.org shared-mime-info names) for the Linux
+    /// desktop file.
+    pub mime_types: &'static [&'static str],
+    /// The macOS Uniform Type Identifier for `Info.plist`.
+    pub uti: &'static str,
+}
+
+/// Every file type [`AudioData::load`] decodes (the Symphonia features
+/// enabled in `Cargo.toml`). The packages offer the program under "Open
+/// with" for exactly these; `tests/packaging.rs` compares this list with
+/// the desktop file, the macOS `Info.plist` and the Windows installer.
+pub const FILE_TYPES: &[FileType] = &[
+    FileType {
+        extensions: &["wav"],
+        mime_types: &["audio/x-wav", "audio/wav", "audio/vnd.wave"],
+        uti: "com.microsoft.waveform-audio",
+    },
+    FileType {
+        extensions: &["flac"],
+        mime_types: &["audio/flac", "audio/x-flac"],
+        uti: "org.xiph.flac",
+    },
+    FileType {
+        extensions: &["ogg", "oga"],
+        mime_types: &["audio/ogg", "audio/x-vorbis+ogg"],
+        uti: "org.xiph.ogg-audio",
+    },
+    FileType {
+        extensions: &["mp3"],
+        mime_types: &["audio/mpeg"],
+        uti: "public.mp3",
+    },
+    // MP4 audio: AAC or ALAC inside.
+    FileType {
+        extensions: &["m4a"],
+        mime_types: &["audio/mp4", "audio/x-m4a"],
+        uti: "public.mpeg-4-audio",
+    },
+    // Raw AAC in ADTS frames.
+    FileType {
+        extensions: &["aac"],
+        mime_types: &["audio/aac", "audio/x-aac"],
+        uti: "public.aac-audio",
+    },
+];
+
+/// The patterns of the open dialog's "Audio files" entry: every extension
+/// of [`FILE_TYPES`] in lower and upper case (`*.wav;*.WAV;...`), since
+/// GTK matches patterns case-sensitively.
+pub fn file_dialog_patterns() -> String {
+    FILE_TYPES
+        .iter()
+        .flat_map(|t| t.extensions)
+        .flat_map(|e| [format!("*.{e}"), format!("*.{}", e.to_uppercase())])
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// A decoded recording: one sample vector per channel, all equally long.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioData {
@@ -178,6 +242,20 @@ impl WavStreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_dialog_offers_every_extension_in_both_cases() {
+        let patterns = file_dialog_patterns();
+        let list: Vec<&str> = patterns.split(';').collect();
+        for t in FILE_TYPES {
+            for e in t.extensions {
+                assert_eq!(*e, e.to_lowercase(), "extensions are listed lower-case");
+                assert!(list.contains(&format!("*.{e}").as_str()), "{patterns}");
+                assert!(list.contains(&format!("*.{}", e.to_uppercase()).as_str()), "{patterns}");
+            }
+        }
+        assert!(!patterns.contains('|'), "would break the wxWidgets wildcard");
+    }
 
     #[test]
     fn wav_roundtrip_preserves_samples() {
