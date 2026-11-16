@@ -22,6 +22,13 @@ extract them, together with everything the program finds to belong to them.
   tolerating a small frequency shift), so marking one bird call also catches
   its repetitions. Each repetition gets the same soft mask, weighted by how
   well it matches and by how far it stands above the noise there.
+* **Stereo and multi-channel recordings tell where a sound comes from.** For
+  every channel, the level difference to the first channel (dB) and the
+  arrival delay (in samples, by GCC-PHAT) of the marked part are measured.
+  Overtones and resonances whose channel ratio or delay does not fit come
+  from another source and are left out, and a repetition of the call from a
+  different place (the neighbour singing the same song) is not taken for
+  another occurrence. Mono recordings work exactly as before.
 * **Background noise removal that keeps the sound intact.** Instead of a gate
   that deletes everything below the noise floor (which eats attack and decay
   and changes the balance of partials), the noise filter uses a soft spectral
@@ -87,8 +94,9 @@ noiseextractor-cli process in.flac --project p.json -o out.wav
 noiseextractor-cli spectrogram in.flac --project p.json -o view.png --max-hz 10000
 ```
 
-`mark` prints which harmonic ratios it found and where else in the recording
-the same sound occurs, so you can check what a filter will grab before
+`mark` prints which harmonic ratios it found, where the marked sound comes
+from (level and delay per channel, for multi-channel files) and where else in
+the recording the same sound occurs, so you can check what a filter will grab before
 applying it.
 
 ## How filters combine

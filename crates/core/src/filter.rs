@@ -307,6 +307,7 @@ impl Project {
                 if e.analysis.is_none() {
                     e.analysis = Some(Arc::new(analyze_selection(
                         &mono,
+                        &audio.channels,
                         audio.sample_rate,
                         &stft,
                         &e.selection,

@@ -77,6 +77,7 @@ impl Selection {
 
 /// Tuning knobs of the correlation search.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AnalysisParams {
     /// Largest numerator m of a harmonic ratio m/n.
     pub max_harmonic: u32,
@@ -89,6 +90,16 @@ pub struct AnalysisParams {
     pub harmonic_threshold: f32,
     /// Envelope correlation above which a bin counts as co-modulated.
     pub comodulation_threshold: f32,
+    /// Multi-channel recordings: level difference between channels (dB) at
+    /// which a found partial or resonance whose channel ratio differs from
+    /// the marked part's has its weight reduced to e^-½.
+    pub spatial_level_tolerance_db: f32,
+    /// Multi-channel recordings: the same for the inter-channel delay, in
+    /// samples.
+    pub spatial_delay_tolerance_samples: f32,
+    /// Largest inter-channel delay searched, in samples (64 ≈ 1.3 ms at
+    /// 48 kHz, i.e. microphones up to ~45 cm apart).
+    pub max_delay_samples: f32,
 }
 
 impl Default for AnalysisParams {
@@ -99,6 +110,9 @@ impl Default for AnalysisParams {
             harmonic_tolerance: 0.03,
             harmonic_threshold: 0.5,
             comodulation_threshold: 0.8,
+            spatial_level_tolerance_db: 3.0,
+            spatial_delay_tolerance_samples: 2.0,
+            max_delay_samples: 64.0,
         }
     }
 }
@@ -138,6 +152,22 @@ pub struct RegionAnalysis {
 }
 
 impl RegionAnalysis {
+    /// Union of all parts (selected, harmonics, co-modulated) per cell:
+    /// everything the analysis attributes to the sound.
+    pub fn members(&self) -> Vec<Vec<f32>> {
+        (0..self.frames)
+            .map(|t| {
+                (0..self.bins)
+                    .map(|k| {
+                        self.selected[t][k]
+                            .max(self.harmonics[t][k])
+                            .max(self.comodulated[t][k])
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Mask values of one global frame, or `None` outside the analysed span.
     pub fn frame(&self, frame: i64) -> Option<(&[f32], &[f32], &[f32])> {
         let i = frame - self.first_frame;
@@ -157,8 +187,16 @@ const NOISE_CONTEXT_S: f64 = 2.0;
 /// Runs its own STFT over the selection plus some context for the noise
 /// estimate, so it can run on a background thread independently of the
 /// chunk engine. Cost is proportional to the selection length only.
+///
+/// With two or more `channels` (the individual tracks of the recording;
+/// pass `&[]` for mono), the marked part's direction is measured (level
+/// ratio and delay between the channels), harmonics and co-modulated bins
+/// coming from another direction lose weight (see [`apply_direction`]),
+/// and the template remembers the direction so that repetitions can be
+/// checked for it, too.
 pub fn analyze_selection(
     mono: &[f32],
+    channels: &[Vec<f32>],
     sample_rate: u32,
     stft: &Stft,
     selection: &Selection,
@@ -181,7 +219,77 @@ pub fn analyze_selection(
     let off = (f0 - ctx_start) as usize;
     let span = &power[off..off + (f1 - f0) as usize];
     let (k0, k1) = selection.bins(cfg, sample_rate);
-    analyze_power(span, f0, &noise_power, (k0, k1), params)
+    let mut analysis = analyze_power(span, f0, &noise_power, (k0, k1), params);
+    if channels.len() >= 2 && apply_direction(&mut analysis, channels, stft, (k0, k1), params) {
+        // The membership changed, so the template has to follow.
+        analysis.template = crate::similar::Template::build(span, f0, &noise_power, &analysis.members());
+    }
+    if let Some(template) = analysis.template.as_mut() {
+        template.attach_spatial(channels, stft, params.max_delay_samples);
+    }
+    analysis
+}
+
+/// Uses the direction of the marked part (inside the rectangle) to judge
+/// what the analysis found outside of it: a bird's overtones reach the
+/// microphones with the same level ratio and delay as its fundamental,
+/// while a neighbour's tone that happens to sit on a harmonic or to swell
+/// at the same time comes from elsewhere. Each bin of the harmonic and the
+/// co-modulation masks is multiplied by its agreement with the marked
+/// part's direction (see [`crate::spatial::per_bin_agreement`]).
+///
+/// Returns `false` (and changes nothing) when no direction could be
+/// measured.
+pub fn apply_direction(
+    analysis: &mut RegionAnalysis,
+    channels: &[Vec<f32>],
+    stft: &Stft,
+    (k0, k1): (usize, usize),
+    params: &AnalysisParams,
+) -> bool {
+    use crate::spatial::{measure, per_bin_agreement, Cells};
+    let (frames, bins) = (analysis.frames, analysis.bins);
+    if frames == 0 || bins == 0 {
+        return false;
+    }
+    let k1 = k1.min(bins - 1);
+    let marked: Vec<f32> = analysis
+        .selected
+        .iter()
+        .flat_map(|row| row[k0..=k1].iter().copied())
+        .collect();
+    let cells = Cells {
+        first_frame: analysis.first_frame,
+        frames,
+        k0,
+        weights: &marked,
+    };
+    let Some(reference) = measure(channels, stft, &cells, params.max_delay_samples) else {
+        return false;
+    };
+    let gate = |mask: &mut [Vec<f32>]| {
+        let weights: Vec<f32> = mask.iter().flatten().copied().collect();
+        let cells = Cells {
+            first_frame: analysis.first_frame,
+            frames,
+            k0: 0,
+            weights: &weights,
+        };
+        let agree = per_bin_agreement(
+            channels,
+            stft,
+            &cells,
+            &reference,
+            params.spatial_level_tolerance_db,
+            params.spatial_delay_tolerance_samples,
+        );
+        for row in mask.iter_mut() {
+            row.iter_mut().zip(&agree).for_each(|(m, a)| *m *= a);
+        }
+    };
+    gate(&mut analysis.harmonics);
+    gate(&mut analysis.comodulated);
+    true
 }
 
 /// Core of the analysis on precomputed power frames `power` (global frame
@@ -355,17 +463,7 @@ pub fn analyze_power(
         }
     }
 
-    // Template from everything the analysis attributes to the sound.
-    let members: Vec<Vec<f32>> = (0..frames)
-        .map(|t| {
-            (0..bins)
-                .map(|k| selected[t][k].max(harmonics[t][k]).max(comodulated[t][k]))
-                .collect()
-        })
-        .collect();
-    let template = crate::similar::Template::build(power, first_frame, noise, &members);
-
-    RegionAnalysis {
+    let mut analysis = RegionAnalysis {
         first_frame,
         frames,
         bins,
@@ -374,8 +472,11 @@ pub fn analyze_power(
         comodulated,
         pitch_track,
         partials,
-        template,
-    }
+        template: None,
+    };
+    // Template from everything the analysis attributes to the sound.
+    analysis.template = crate::similar::Template::build(power, first_frame, noise, &analysis.members());
+    analysis
 }
 
 /// All reduced fractions m/n ≠ 1 with m ≤ `max_m` and n ≤ `max_n`, sorted.
@@ -462,6 +563,7 @@ mod tests {
         };
         let a = analyze_selection(
             &x,
+            &[],
             sr,
             &stft,
             &sel,
@@ -484,6 +586,92 @@ mod tests {
         assert!(harm[k_tone] < 0.1 && comod[k_tone] < 0.1, "steady tone was marked");
     }
 
+    /// Stereo "duet": a bird gliding from 300 to 450 Hz with its octave,
+    /// placed left (right channel -8 dB, 3 samples later), and a second
+    /// source that glides exactly along the bird's 3rd harmonic but is
+    /// placed right (+8 dB, no delay). Returns the channels and the mono mix.
+    fn stereo_duet(sr: u32, secs: f32) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let n = (sr as f32 * secs) as usize;
+        let (mut bird, mut other) = (vec![0.0f32; n], vec![0.0f32; n]);
+        let mut phase = 0.0f32;
+        for i in 0..n {
+            let t = i as f32 / sr as f32;
+            phase += 2.0 * std::f32::consts::PI * (300.0 + 150.0 * t / secs) / sr as f32;
+            let env = (std::f32::consts::PI * t / secs).sin();
+            bird[i] = env * (0.5 * phase.sin() + 0.25 * (2.0 * phase).sin());
+            other[i] = env * 0.15 * (3.0 * phase + 0.7).sin();
+        }
+        let place = |src: &[f32], gain_db: f32, delay: usize, ch: &mut [Vec<f32>]| {
+            let g = 10f32.powf(gain_db / 20.0);
+            for i in 0..n {
+                ch[0][i] += src[i];
+                if i + delay < n {
+                    ch[1][i + delay] += g * src[i];
+                }
+            }
+        };
+        let mut ch = vec![vec![0.0f32; n]; 2];
+        place(&bird, -8.0, 3, &mut ch);
+        place(&other, 8.0, 0, &mut ch);
+        let mut rng = 99u64;
+        for c in ch.iter_mut() {
+            for v in c.iter_mut() {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *v += ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.002;
+            }
+        }
+        let mono = ch[0].iter().zip(&ch[1]).map(|(a, b)| 0.5 * (a + b)).collect();
+        (ch, mono)
+    }
+
+    #[test]
+    fn stereo_partial_from_another_direction_is_not_attributed() {
+        let sr = 16000;
+        let (ch, mono) = stereo_duet(sr, 2.0);
+        let cfg = StftConfig {
+            fft_size: 1024,
+            hop: 256,
+        };
+        let stft = Stft::new(cfg);
+        let sel = Selection {
+            start_s: 0.3,
+            end_s: 1.7,
+            low_hz: 280.0,
+            high_hz: 470.0,
+        };
+        let run = |channels: &[Vec<f32>]| {
+            analyze_selection(
+                &mono,
+                channels,
+                sr,
+                &stft,
+                &sel,
+                &NoiseEstimate::default(),
+                &AnalysisParams::default(),
+            )
+        };
+        // Weight of the harmonic mask at m·f0 in the middle of the selection.
+        let at = |a: &RegionAnalysis, m: f32| {
+            let mid = (a.frames / 2) as i64 + a.first_frame;
+            let f0 = 300.0 + 150.0 * (mid as f32 * cfg.hop as f32 / sr as f32) / 2.0;
+            a.frame(mid).unwrap().1[cfg.hz_to_bin(m * f0, sr).round() as usize]
+        };
+        // From the mix alone the other source looks like the 3rd harmonic.
+        let blind = run(&[]);
+        assert!(at(&blind, 2.0) > 0.5 && at(&blind, 3.0) > 0.5, "mono analysis changed");
+        // Its level ratio and delay give it away.
+        let seeing = run(&ch);
+        assert!(at(&seeing, 2.0) > 0.5, "octave lost: {}", at(&seeing, 2.0));
+        assert!(at(&seeing, 3.0) < 0.1, "other source kept: {}", at(&seeing, 3.0));
+        let sig = seeing
+            .template
+            .as_ref()
+            .and_then(|t| t.spatial.clone())
+            .expect("direction");
+        assert!((sig.pairs[0].level_db + 8.0).abs() < 1.0, "{sig:?}");
+        assert!((sig.pairs[0].delay_samples - 3.0).abs() <= 0.5, "{sig:?}");
+    }
+
     #[test]
     fn noise_only_selection_finds_no_partials() {
         let sr = 16000;
@@ -501,6 +689,7 @@ mod tests {
         };
         let a = analyze_selection(
             &x,
+            &[],
             sr,
             &stft,
             &sel,
@@ -526,6 +715,7 @@ mod tests {
         };
         let a = analyze_selection(
             &x,
+            &[],
             sr,
             &stft,
             &sel,
