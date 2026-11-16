@@ -28,7 +28,12 @@ extract them, together with everything the program finds to belong to them.
   Overtones and resonances whose channel ratio or delay does not fit come
   from another source and are left out, and a repetition of the call from a
   different place (the neighbour singing the same song) is not taken for
-  another occurrence. Mono recordings work exactly as before.
+  another occurrence. How strict that check is follows from the marked part
+  itself: in a room, reflections make every bin see a slightly different
+  level ratio and phase, so the tolerances grow with how much the marked
+  part's own bins scatter, and a narrow band that pins the delay down only
+  loosely counts every delay it cannot tell apart as a match. Mono
+  recordings work exactly as before.
 * **Background noise removal that keeps the sound intact.** Instead of a gate
   that deletes everything below the noise floor (which eats attack and decay
   and changes the balance of partials), the noise filter uses a soft spectral
@@ -83,6 +88,7 @@ libraries.
 | Open a recording | File > Open audio (Ctrl+O), or pass it on the command line |
 | Mark a sound | Drag a rectangle in the spectrogram |
 | Turn it into a filter | *Suppress selection* or *Extract selection* |
+| See what a filter does | Pick it in the filter list: its target is drawn (green / red / orange), for a noise reduction what it takes away (red); *Show in spectrogram* keeps it drawn when another filter is picked |
 | Tune what belongs to it and what counts as a repetition | Sliders in the *Detection settings* pane (they edit the fresh selection, or the selected sound filter; hover a slider for an explanation) |
 | Set the play head | Click |
 | Play / pause | Space (plays the selection if there is one), or Ctrl+P |

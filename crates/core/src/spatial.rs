@@ -31,7 +31,19 @@ pub struct PairCue {
     pub level_db: f32,
     /// Arrival delay at the channel relative to channel 0, in samples.
     pub delay_samples: f32,
+    /// How far (in samples, either way) the true delay may be from
+    /// `delay_samples` as far as the measured cells can tell: a narrow band
+    /// pins the delay down only loosely, and in a room the reflections
+    /// shift each bin's phase a little (see [`DELAY_PIN_FRACTION`]).
+    pub delay_uncertainty: f32,
 }
+
+/// The delays whose GCC-PHAT score is at least this fraction of the best
+/// one are taken as equally plausible (see [`PairCue::delay_uncertainty`]).
+/// 0.9 corresponds to a mean phase misfit of about 25°, which reflections
+/// in an ordinary room easily cause; a single narrow band at bin k then
+/// leaves about ±N/(14·k) samples open, a broadband sound far less.
+pub const DELAY_PIN_FRACTION: f32 = 0.9;
 
 /// Spatial signature of a sound: one [`PairCue`] per channel after the
 /// first. Empty for mono recordings.
@@ -148,33 +160,144 @@ pub fn measure(channels: &[Vec<f32>], stft: &Stft, cells: &Cells, max_delay_samp
                 .sum()
         };
         let steps = (max_delay_samples.max(0.0) / DELAY_STEP).round() as i32;
-        let (mut best_tau, mut best) = (0.0f32, f32::MIN);
-        for s in -steps..=steps {
-            let tau = s as f32 * DELAY_STEP;
-            let v = score(tau);
+        let scores: Vec<f32> = (-steps..=steps).map(|s| score(s as f32 * DELAY_STEP)).collect();
+        let (mut best_i, mut best) = (0usize, f32::MIN);
+        for (i, &v) in scores.iter().enumerate() {
+            let tau = (i as i32 - steps) as f32 * DELAY_STEP;
+            let best_tau = (best_i as i32 - steps) as f32 * DELAY_STEP;
             // Prefer the smaller delay on ties (symmetric phase wrapping).
             if v > best + 1e-6 || ((v - best).abs() <= 1e-6 && tau.abs() < best_tau.abs()) {
                 best = v;
-                best_tau = tau;
+                best_i = i;
             }
         }
+        // The plateau around the best delay: as far as the score stays
+        // within DELAY_PIN_FRACTION of the best, on each side.
+        let pinned = |v: f32| best > 0.0 && v >= DELAY_PIN_FRACTION * best;
+        let left = scores[..best_i].iter().rev().take_while(|&&v| pinned(v)).count();
+        let right = scores[best_i + 1..].iter().take_while(|&&v| pinned(v)).count();
         pairs.push(PairCue {
             level_db,
-            delay_samples: best_tau,
+            delay_samples: (best_i as i32 - steps) as f32 * DELAY_STEP,
+            delay_uncertainty: left.max(right) as f32 * DELAY_STEP,
         });
     }
     Some(Signature { pairs })
 }
 
-/// How well each bin of `cells` agrees with the direction `reference`
-/// (0..1, 1 for bins without weight or energy).
+/// How far one bin's cues are from a reference direction, for one channel
+/// pair (see [`per_bin_deviation`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Deviation {
+    /// Level difference minus the reference's, in dB.
+    pub level_db: f32,
+    /// Delay error in samples beyond the reference's own uncertainty, as
+    /// far as the bin's phase can tell (see [`per_bin_deviation`]).
+    pub delay_samples: f32,
+    /// Membership-weighted energy of the bin in channel 0; 0 for bins
+    /// without weight or energy, whose deviations mean nothing.
+    pub weight: f32,
+}
+
+/// Deviation of each bin of `cells` from the direction `reference`, one
+/// vector (indexed like the bins of `cells`) per channel pair.
 ///
 /// Per bin and channel pair, the level difference is compared directly.
 /// A single bin only knows its delay modulo N/k samples, so the delay
 /// error is the phase error to the reference delay's phase, converted to
 /// samples: `Δ = wrap(φ)·N/(2πk)`. At high frequencies that error can
 /// never exceed the tolerance, which is right: there the phase cannot tell
-/// the directions apart and the level difference has to.
+/// the directions apart and the level difference has to. Errors within the
+/// reference's [`PairCue::delay_uncertainty`] count as none, since the
+/// reference itself may be off by that much.
+pub fn per_bin_deviation(
+    channels: &[Vec<f32>],
+    stft: &Stft,
+    cells: &Cells,
+    reference: &Signature,
+) -> Vec<Vec<Deviation>> {
+    let width = cells.weights.len() / cells.frames.max(1);
+    if channels.len() < 2 || cells.frames == 0 {
+        return Vec::new();
+    }
+    let n = stft.config().fft_size as f32;
+    pair_sums(channels, stft, cells)
+        .iter()
+        .zip(&reference.pairs)
+        .map(|(sums, cue)| {
+            (0..width)
+                .map(|i| {
+                    let (er, eo) = (sums.e_ref[i], sums.e_other[i]);
+                    if er <= 0.0 || eo <= 0.0 {
+                        return Deviation::default();
+                    }
+                    let k = cells.k0 + i;
+                    let v = sums.votes[i];
+                    let delay_samples = if k == 0 || v.norm() <= 1e-20 {
+                        0.0
+                    } else {
+                        let aligned = v * Complex32::from_polar(1.0, -delay_phase(k, cue.delay_samples, n));
+                        let err = aligned.arg() * n / (2.0 * std::f32::consts::PI * k as f32);
+                        err.signum() * (err.abs() - cue.delay_uncertainty).max(0.0)
+                    };
+                    Deviation {
+                        level_db: (10.0 * (eo / er).log10()) as f32 - cue.level_db,
+                        delay_samples,
+                        weight: er as f32,
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Energy-weighted RMS of the level and delay deviations over all bins and
+/// channel pairs: how much the cues of one sound scatter around its own
+/// direction. Reflections in a room make every bin see a slightly
+/// different level difference and phase, so this is the yardstick for how
+/// far a bin may be off and still come from the same place. `(0, 0)` when
+/// nothing carries weight.
+pub fn spread(deviations: &[Vec<Deviation>]) -> (f32, f32) {
+    let (mut w, mut l, mut d) = (0.0f64, 0.0f64, 0.0f64);
+    for dev in deviations.iter().flatten() {
+        let dw = dev.weight as f64;
+        w += dw;
+        l += dw * (dev.level_db as f64).powi(2);
+        d += dw * (dev.delay_samples as f64).powi(2);
+    }
+    if w <= 0.0 {
+        return (0.0, 0.0);
+    }
+    ((l / w).sqrt() as f32, (d / w).sqrt() as f32)
+}
+
+/// Turns deviations into an agreement per bin (0..1, 1 for bins without
+/// weight or energy): a Gaussian in level and delay error with the given
+/// tolerances, multiplied over the channel pairs.
+pub fn agreement_of(
+    deviations: &[Vec<Deviation>],
+    width: usize,
+    level_tolerance_db: f32,
+    delay_tolerance_samples: f32,
+) -> Vec<f32> {
+    let mut out = vec![1.0f32; width];
+    let level_tol = level_tolerance_db.max(1e-3);
+    let delay_tol = delay_tolerance_samples.max(1e-3);
+    for pair in deviations {
+        for (o, dev) in out.iter_mut().zip(pair) {
+            if dev.weight <= 0.0 {
+                continue;
+            }
+            let (dl, dd) = (dev.level_db / level_tol, dev.delay_samples / delay_tol);
+            *o *= (-0.5 * (dl * dl + dd * dd)).exp();
+        }
+    }
+    out
+}
+
+/// How well each bin of `cells` agrees with the direction `reference`
+/// (0..1, 1 for bins without weight or energy): [`per_bin_deviation`]
+/// judged by [`agreement_of`] with fixed tolerances.
 pub fn per_bin_agreement(
     channels: &[Vec<f32>],
     stft: &Stft,
@@ -184,32 +307,12 @@ pub fn per_bin_agreement(
     delay_tolerance_samples: f32,
 ) -> Vec<f32> {
     let width = cells.weights.len() / cells.frames.max(1);
-    let mut out = vec![1.0f32; width];
-    if channels.len() < 2 || cells.frames == 0 {
-        return out;
-    }
-    let n = stft.config().fft_size as f32;
-    let level_tol = level_tolerance_db.max(1e-3);
-    let delay_tol = delay_tolerance_samples.max(1e-3);
-    for (sums, cue) in pair_sums(channels, stft, cells).iter().zip(&reference.pairs) {
-        for i in 0..width {
-            let (er, eo) = (sums.e_ref[i], sums.e_other[i]);
-            if er <= 0.0 || eo <= 0.0 {
-                continue;
-            }
-            let k = cells.k0 + i;
-            let dl = ((10.0 * (eo / er).log10()) as f32 - cue.level_db) / level_tol;
-            let v = sums.votes[i];
-            let dd = if k == 0 || v.norm() <= 1e-20 {
-                0.0
-            } else {
-                let aligned = v * Complex32::from_polar(1.0, -delay_phase(k, cue.delay_samples, n));
-                aligned.arg() * n / (2.0 * std::f32::consts::PI * k as f32) / delay_tol
-            };
-            out[i] *= (-0.5 * (dl * dl + dd * dd)).exp();
-        }
-    }
-    out
+    agreement_of(
+        &per_bin_deviation(channels, stft, cells, reference),
+        width,
+        level_tolerance_db,
+        delay_tolerance_samples,
+    )
 }
 
 /// How well two signatures agree, 1 for identical, falling off like a
@@ -304,18 +407,21 @@ mod tests {
             pairs: vec![PairCue {
                 level_db: 0.0,
                 delay_samples: 0.0,
+                delay_uncertainty: 0.0,
             }],
         };
         let near = Signature {
             pairs: vec![PairCue {
                 level_db: 1.0,
                 delay_samples: 0.5,
+                delay_uncertainty: 0.0,
             }],
         };
         let far = Signature {
             pairs: vec![PairCue {
                 level_db: -9.0,
                 delay_samples: 12.0,
+                delay_uncertainty: 0.0,
             }],
         };
         assert_eq!(agreement(&a, &a, 3.0, 2.0), 1.0);

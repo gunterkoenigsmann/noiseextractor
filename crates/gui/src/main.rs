@@ -22,6 +22,10 @@
 //!
 //! In the overview, dragging the frame (or clicking beside it) scrolls the
 //! spectrogram.
+//!
+//! Picking a filter in the list draws its overlays even when "Show in
+//! spectrogram" is off: what an event filter targets in green / red /
+//! orange, what a noise reduction takes away in red.
 
 // A release build is a GUI program on Windows: started from Explorer it
 // gets no console window. Debug builds keep the console for their output.
@@ -701,7 +705,13 @@ fn bind_events(state: &Shared, ui: Ui) {
         if let Some(i) = e.get_selection() {
             let mut s = st.borrow_mut();
             s.current_filter = Some(i as usize);
+            // Picking a filter means looking at it: a selection that was not
+            // turned into a filter is dropped, and the picked filter is drawn
+            // (see `push_project`).
+            s.project.preview = None;
+            push_project(&s);
             refresh_details(&s, ui);
+            refresh_detection(&s, ui);
         }
     });
     let st = state.clone();
@@ -957,11 +967,22 @@ fn open_project(st: &Shared, ui: Ui, path: &Path) {
 }
 
 /// Hands the current project to the engine, which recomputes in the
-/// background (nearest to the focus first).
+/// background (nearest to the focus first). The filter picked in the list
+/// is drawn as if it were visible, so picking it shows what it does; while
+/// a fresh selection is being edited, only that is highlighted.
 fn push_project(s: &State) {
     if let Some(doc) = &s.doc {
-        doc.engine.set_project(s.project.clone());
+        let mut project = s.project.clone();
+        project.highlight = highlighted_filter(s.current_filter, project.preview.is_some());
+        doc.engine.set_project(project);
     }
+}
+
+/// The filter whose overlay is drawn although it may not be marked visible
+/// (see [`push_project`]): the current one, unless a fresh selection is
+/// being edited, whose colours would be mixed up with it.
+fn highlighted_filter(current: Option<usize>, editing_selection: bool) -> Option<usize> {
+    current.filter(|_| !editing_selection)
 }
 
 /// Applies `change` to the filter shown in the details and pushes the
@@ -1002,6 +1023,9 @@ fn finish_drag(s: &mut State, ui: Ui, start: (f32, f32), end: (f32, f32)) {
     }
     s.project.preview = Some(preview);
     s.reanalyse_at = None;
+    // Stop highlighting the picked filter right away; the selection's own
+    // colours follow when its analysis is done.
+    push_project(s);
     start_analysis(s, Target::Preview);
     refresh_detection(s, ui);
 }
@@ -1577,3 +1601,15 @@ fn paint_overview(s: &State, ui: Ui, dc: &AutoBufferedPaintDC) {
 #[cfg(test)]
 #[path = "../build/resources.rs"]
 mod resources;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_picked_filter_is_highlighted_unless_a_selection_is_edited() {
+        assert_eq!(highlighted_filter(Some(2), false), Some(2));
+        assert_eq!(highlighted_filter(Some(2), true), None);
+        assert_eq!(highlighted_filter(None, false), None);
+    }
+}

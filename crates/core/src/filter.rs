@@ -103,7 +103,9 @@ pub struct Filter {
     pub name: String,
     /// Whether the filter affects the output.
     pub enabled: bool,
-    /// Whether the filter's masks are drawn on top of the spectrogram.
+    /// Whether the filter's masks are drawn on top of the spectrogram: an
+    /// event filter's marked area (green) and what was found to belong to
+    /// it (red); for a noise-reduction filter, what it takes away (red).
     pub visible: bool,
     /// Suppress or extract.
     pub action: FilterAction,
@@ -254,6 +256,10 @@ pub struct Project {
     /// applied, never saved.
     #[serde(skip)]
     pub preview: Option<Filter>,
+    /// Index of the filter picked in the GUI's list: drawn like a visible
+    /// filter, so picking a filter shows what it does. Never saved.
+    #[serde(skip)]
+    pub highlight: Option<usize>,
 }
 
 impl Default for Project {
@@ -264,6 +270,7 @@ impl Default for Project {
             stft: StftConfig::default(),
             filters: vec![Filter::noise_reduction("Background noise")],
             preview: None,
+            highlight: None,
         }
     }
 }
@@ -282,6 +289,16 @@ impl Project {
     pub fn save(&self, path: &Path) -> Result<()> {
         std::fs::write(path, serde_json::to_string_pretty(self)?)
             .with_context(|| format!("cannot write {}", path.display()))
+    }
+
+    /// Whether the overlays of filter `index` are drawn: when it is
+    /// visible or highlighted. Index `filters.len()` is the preview, which
+    /// is always drawn.
+    pub fn shows(&self, index: usize) -> bool {
+        match self.filters.get(index) {
+            Some(f) => f.visible || self.highlight == Some(index),
+            None => index == self.filters.len() && self.preview.is_some(),
+        }
     }
 
     /// Noise estimate the analysis should use: that of the first enabled
@@ -372,12 +389,22 @@ pub fn compute_gains(
     let mut share_noise: Option<Vec<f32>> = None;
     for (fi, f) in project.filters.iter().enumerate() {
         if !f.enabled {
+            // A disabled noise reduction still shows what it would take away.
+            if let FilterKind::NoiseReduction(nr) = &f.kind {
+                if project.shows(fi) {
+                    let g = nr.gains(power_with_warmup, &nr.noise_power(context, bins));
+                    add_removed(&g[warmup..], &mut inferred);
+                }
+            }
             continue;
         }
         match &f.kind {
             FilterKind::NoiseReduction(nr) => {
                 let noise = nr.noise_power(context, bins);
                 let g = nr.gains(power_with_warmup, &noise);
+                if project.shows(fi) {
+                    add_removed(&g[warmup..], &mut inferred);
+                }
                 for (t, row) in g[warmup..].iter().enumerate() {
                     match f.action {
                         // complement(complement(g)) == g, so apply directly.
@@ -441,10 +468,11 @@ pub fn compute_gains(
         }
     }
 
-    // Overlays of visible event filters, including the live preview.
+    // Overlays of visible (or highlighted) event filters, including the
+    // live preview.
     for (fi, f) in project.filters.iter().chain(project.preview.as_ref()).enumerate() {
         let FilterKind::Event(e) = &f.kind else { continue };
-        if !f.visible {
+        if !project.shows(fi) {
             continue;
         }
         for t in 0..n {
@@ -478,6 +506,18 @@ pub fn compute_gains(
         gain,
         selected,
         inferred,
+    }
+}
+
+/// Adds what a noise-reduction filter with gains `g` (one row per frame)
+/// takes away to the red overlay: its target, the noise, is the power
+/// complement of the gain (see the module documentation), whether the
+/// filter suppresses it or keeps only it.
+fn add_removed(g: &[Vec<f32>], inferred: &mut [Vec<f32>]) {
+    for (row, inf) in g.iter().zip(inferred.iter_mut()) {
+        for (g, i) in row.iter().zip(inf.iter_mut()) {
+            *i = i.max(complement(*g));
+        }
     }
 }
 
@@ -629,6 +669,7 @@ mod tests {
             stft: StftConfig { fft_size: 4, hop: 2 },
             filters,
             preview: None,
+            highlight: None,
         }
     }
 
@@ -698,6 +739,46 @@ mod tests {
         f.visible = false;
         let g = compute_gains(&project(vec![f]), &power, 0, &power, 0, &[], &[]);
         assert_eq!(g.selected[0][0], 0.0);
+    }
+
+    #[test]
+    fn a_highlighted_filter_is_drawn_although_hidden() {
+        // Picking a filter in the GUI's list highlights it; that must show
+        // its overlays even when "Show in spectrogram" is off.
+        let power = vec![vec![1.0; 3]; 2];
+        let mut hidden = analysed_event(FilterAction::Suppress, 0.8);
+        hidden.visible = false;
+        let mut p = project(vec![Filter::noise_reduction("noise"), hidden]);
+        let g = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        assert_eq!((g.selected[0][0], g.inferred[0][1]), (0.0, 0.0));
+        p.highlight = Some(1);
+        let g = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        assert_eq!((g.selected[0][0], g.inferred[0][1]), (0.8, 0.8));
+        assert!(p.shows(1) && !p.shows(0) && !p.shows(2), "no preview, nothing at 2");
+    }
+
+    #[test]
+    fn noise_reduction_overlay_shows_what_it_removes() {
+        // Stationary noise in every bin: the filter takes most of it away,
+        // and the red overlay must say so (it used to stay empty for
+        // noise-reduction filters, visible or not).
+        let power = vec![vec![1.0; 3]; 40];
+        let mut p = project(vec![Filter::noise_reduction("noise")]);
+        let removed = |p: &Project| {
+            let g = compute_gains(p, &power, 0, &power, 0, &[], &[]);
+            let expected = complement(g.gain[39][0]);
+            (g.inferred[39][0], expected)
+        };
+        assert_eq!(removed(&p).0, 0.0, "hidden and not highlighted");
+        p.highlight = Some(0);
+        let (shown, expected) = removed(&p);
+        assert!(expected > 0.5, "test premise: noise is mostly removed ({expected})");
+        assert_eq!(shown, expected);
+        // Switched off, it still shows what it would remove.
+        p.filters[0].enabled = false;
+        p.highlight = None;
+        p.filters[0].visible = true;
+        assert!(removed(&p).0 > 0.5);
     }
 
     #[test]
