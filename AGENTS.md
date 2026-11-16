@@ -15,7 +15,12 @@
 
 * `crates/core`: all signal processing and state that does not need a window.
   Start reading at `src/lib.rs` (signal flow), `filter.rs` (how filters
-  combine), `engine.rs` (chunked background processing).
+  combine), `engine.rs` (chunked background processing), `discover.rs`
+  (finding a recording's sounds by NMF; found sounds are fitted frame by
+  frame, so chunks stay seamless).
+* Real recordings for tests live in `crates/core/tests/fixtures` (excerpts
+  of the maintainer's own recordings, GPL; keep them to a few hundred kB
+  and list them in the README there).
 * `crates/cli`: thin front end; `tests/cli.rs` holds end-to-end tests.
 * `crates/gui`: wxDragon front end with AUI panes (`panes.rs`). The view
   models are pure and unit-tested (`view.rs`, `overview.rs`, `scrub.rs`,

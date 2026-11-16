@@ -9,6 +9,8 @@
 //! noiseextractor-cli denoise in.flac -o clean.wav --save-project p.json
 //! noiseextractor-cli mark in.flac --time 12.3:13.1 --freq 2000:4500 \
 //!     --name "blackbird" --extract --project p.json --save-project p.json
+//! noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract \
+//!     --save-project p.json
 //! noiseextractor-cli process in.flac --project p.json -o out.wav
 //! noiseextractor-cli spectrogram in.flac --project p.json -o view.png
 //! ```
@@ -20,6 +22,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use noiseextractor_core::analysis::Selection;
 use noiseextractor_core::audio::WavStreamWriter;
+use noiseextractor_core::discover::{discover, DiscoverParams, Discovery};
 use noiseextractor_core::engine::{process_all, ChunkLayout, ChunkResult};
 use noiseextractor_core::filter::{Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::{mean_power, GainRule, NoiseEstimate};
@@ -102,6 +105,35 @@ enum Command {
         #[arg(long)]
         extract: bool,
         /// Project to add the filter to (default: a new project).
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Where to save the extended project.
+        #[arg(long)]
+        save_project: Option<PathBuf>,
+    },
+    /// Find the sounds the recording is made of and add them to a project
+    /// as suggested filters (switched off unless named with --enable).
+    Discover {
+        /// Input audio file.
+        input: PathBuf,
+        /// Number of spectral patterns to look for.
+        #[arg(long, default_value_t = 6)]
+        sounds: usize,
+        /// Learn only from this time range "START:END" in seconds.
+        #[arg(long)]
+        time: Option<String>,
+        /// Suggest every pattern on its own instead of grouping patterns
+        /// that rise and fall together (and come from the same direction).
+        #[arg(long)]
+        no_grouping: bool,
+        /// Suggestions to switch on and keep, by the number printed, e.g.
+        /// "1,3".
+        #[arg(long, value_delimiter = ',')]
+        enable: Vec<usize>,
+        /// Switched-on suggestions extract instead of suppress.
+        #[arg(long)]
+        extract: bool,
+        /// Project to add the suggestions to (default: a new project).
         #[arg(long)]
         project: Option<PathBuf>,
         /// Where to save the extended project.
@@ -232,6 +264,45 @@ fn run(cli: Cli) -> Result<()> {
             project.filters.push(Filter::event(name, selection, action));
             project.prepare(&audio);
             print_report(&project, &audio);
+            if let Some(p) = save_project {
+                project.save(&p)?;
+            }
+            Ok(())
+        }
+        Command::Discover {
+            input,
+            sounds,
+            time,
+            no_grouping,
+            enable,
+            extract,
+            project,
+            save_project,
+        } => {
+            let audio = load(&input)?;
+            let mut project = match project {
+                Some(p) => Project::load(&p)?,
+                None => Project::default(),
+            };
+            let params = DiscoverParams {
+                components: sounds,
+                range_s: time.as_deref().map(parse_range).transpose()?,
+                group: !no_grouping,
+                ..DiscoverParams::default()
+            };
+            let found = discover(&audio, project.stft, &project.analysis_noise(), &params)?;
+            print_discovery(&found);
+            let first = project.add_discovery(found);
+            let count = project.filters.len() - first;
+            for n in enable {
+                anyhow::ensure!((1..=count).contains(&n), "--enable {n}: there are {count} suggestions");
+                let f = &mut project.filters[first + n - 1];
+                f.enabled = true;
+                f.suggested = false;
+                if extract {
+                    f.action = FilterAction::Extract;
+                }
+            }
             if let Some(p) = save_project {
                 project.save(&p)?;
             }
@@ -394,6 +465,29 @@ fn print_report(project: &Project, audio: &AudioData) {
             }
             (None, _) => println!("  nothing distinctive to search for elsewhere"),
             (_, false) => {}
+        }
+    }
+}
+
+/// Prints the suggestions of an automatic search, numbered as `--enable`
+/// expects them.
+fn print_discovery(found: &Discovery) {
+    let d = &found.decomposition;
+    println!(
+        "learned {} patterns from {} frames",
+        d.patterns.len(),
+        found.frames_used
+    );
+    for (n, group) in found.groups.iter().enumerate() {
+        let share: f32 = group.iter().map(|&c| found.energy[c]).sum();
+        println!("suggestion {} ({:.0} % of the sound):", n + 1, share * 100.0);
+        for &c in group {
+            let direction = d.directions[c]
+                .as_ref()
+                .and_then(|s| s.pairs.first())
+                .map(|p| format!(", level {:+.1} dB, delay {:+.2} samples", p.level_db, p.delay_samples))
+                .unwrap_or_default();
+            println!("  pattern {}: {}{direction}", c + 1, d.labels[c]);
         }
     }
 }

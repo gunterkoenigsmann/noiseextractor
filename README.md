@@ -34,6 +34,17 @@ extract them, together with everything the program finds to belong to them.
   part's own bins scatter, and a narrow band that pins the delay down only
   loosely counts every delay it cannot tell apart as a match. Mono
   recordings work exactly as before.
+* **Find out what a recording is made of.** *Find sounds* learns the
+  recurring spectral patterns of the recording (or of the selected stretch)
+  by non-negative matrix factorisation: each pattern has a fixed spectrum
+  and only its loudness changes over time, and the background noise gets a
+  pattern of its own so the others describe sounds. Patterns whose loudness
+  rises and falls together and that, in stereo, come from the same place
+  are suggested as one sound. The suggestions appear in the filter list
+  switched off; pick one to see it in red, switch it on to suppress or
+  extract it, and keep, rename, merge, split or discard it. Each pattern is
+  a part that can be switched off. You choose how many patterns to look
+  for; a handful of distinct sounds works best.
 * **Background noise removal that keeps the sound intact.** Instead of a gate
   that deletes everything below the noise floor (which eats attack and decay
   and changes the balance of partials), the noise filter uses a soft spectral
@@ -87,6 +98,7 @@ libraries.
 | Zoom time / scroll / zoom frequency | Wheel / Shift+wheel / Ctrl+wheel |
 | Jump elsewhere in a long recording | Drag the frame in the waveform overview, or click beside it |
 | Show / hide panes (filters, detection settings, overview, log) | View menu, or the pane's close button; panes can be dragged to other edges or floated, and the layout is remembered |
+| Find the sounds a recording is made of | Set *Patterns to look for*, then *Find sounds* (only the selected stretch is used to learn, if there is a selection); *Keep*, *Merge with...*, *Split* and *Discard suggestions* edit the result |
 | Learn the background noise | Mark a noise-only stretch, *Learn noise from selection* |
 | Save the filter list | File > Save project (Ctrl+S) |
 | Write the result | File > Export processed audio (Ctrl+E) |
@@ -100,6 +112,7 @@ batch jobs or tests:
 noiseextractor-cli denoise in.flac -o clean.wav --noise-from 0.0:1.5 --save-project p.json
 noiseextractor-cli mark in.flac --time 12.3:13.1 --freq 2000:4500 --name blackbird \
     --extract --project p.json --save-project p.json
+noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract --save-project p.json
 noiseextractor-cli process in.flac --project p.json -o out.wav
 noiseextractor-cli spectrogram in.flac --project p.json -o view.png --max-hz 10000
 ```
@@ -107,7 +120,9 @@ noiseextractor-cli spectrogram in.flac --project p.json -o view.png --max-hz 100
 `mark` prints which harmonic ratios it found, where the marked sound comes
 from (level and delay per channel, for multi-channel files) and where else in
 the recording the same sound occurs, so you can check what a filter will grab before
-applying it.
+applying it. `discover` prints the sounds it found, numbered, with the
+patterns they consist of (tonal or noise-like, frequency band, direction);
+`--enable` switches the given ones on.
 
 ## How filters combine
 
@@ -125,7 +140,8 @@ frame is measured on the bins nobody else claims, and its expected power in
 the shared bins follows from that. The extracted sound keeps its share, the
 suppressed one loses its share. In stereo recordings, how well a shared bin's
 level ratio and phase between the channels fit each sound's direction weighs
-in as well. In a test where a whistle crosses a kept call's overtone, the
+in as well. Automatically found sounds take part in this too: their patterns
+predict their power in every bin directly. In a test where a whistle crosses a kept call's overtone, the
 overtone now keeps its level (−0.3 dB) instead of losing 28 dB.
 
 ## Project layout
