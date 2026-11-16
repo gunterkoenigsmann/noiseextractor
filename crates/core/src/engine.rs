@@ -257,7 +257,8 @@ pub fn process_chunk(
 }
 
 /// Searches, for every event filter (and the preview, last) whose "same
-/// sound elsewhere" part matters (enabled filter or visible overlay), the
+/// sound elsewhere" part matters (enabled filter or drawn overlay, see
+/// [`Project::shows`]), the
 /// other occurrences overlapping the global frame range `range`.
 /// `channels` are the individual recording channels, used to compare where
 /// a candidate comes from with where the marked sound came from (ignored
@@ -273,8 +274,9 @@ pub fn find_occurrences(
         .filters
         .iter()
         .chain(project.preview.as_ref())
-        .map(|f| match &f.kind {
-            FilterKind::Event(e) if e.use_similar && (f.enabled || f.visible) => e
+        .enumerate()
+        .map(|(i, f)| match &f.kind {
+            FilterKind::Event(e) if e.use_similar && (f.enabled || project.shows(i)) => e
                 .analysis
                 .as_ref()
                 .and_then(|a| a.template.as_ref())

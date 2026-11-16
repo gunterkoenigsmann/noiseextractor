@@ -234,13 +234,25 @@ pub fn analyze_selection(
     analysis
 }
 
+/// How many RMS deviations of the marked part's own bins a found bin may
+/// be off its direction before it loses weight like a bin one tolerance
+/// off (see [`apply_direction`]). At 2, a bin that scatters like a typical
+/// one of the marked part keeps about 80 % of its weight.
+pub const SPREAD_FACTOR: f32 = 2.0;
+
 /// Uses the direction of the marked part (inside the rectangle) to judge
 /// what the analysis found outside of it: a bird's overtones reach the
 /// microphones with the same level ratio and delay as its fundamental,
 /// while a neighbour's tone that happens to sit on a harmonic or to swell
 /// at the same time comes from elsewhere. Each bin of the harmonic and the
 /// co-modulation masks is multiplied by its agreement with the marked
-/// part's direction (see [`crate::spatial::per_bin_agreement`]).
+/// part's direction (see [`crate::spatial::agreement_of`]).
+///
+/// The tolerances grow with the scatter of the marked part's own bins
+/// around its direction ([`SPREAD_FACTOR`] times their RMS deviation):
+/// in a room, reflections give every bin a slightly different level
+/// difference and phase, and a check stricter than the sound's agreement
+/// with itself would reject its own overtones.
 ///
 /// Returns `false` (and changes nothing) when no direction could be
 /// measured.
@@ -251,7 +263,7 @@ pub fn apply_direction(
     (k0, k1): (usize, usize),
     params: &AnalysisParams,
 ) -> bool {
-    use crate::spatial::{measure, per_bin_agreement, Cells};
+    use crate::spatial::{agreement_of, measure, per_bin_deviation, spread, Cells};
     let (frames, bins) = (analysis.frames, analysis.bins);
     if frames == 0 || bins == 0 {
         return false;
@@ -271,6 +283,9 @@ pub fn apply_direction(
     let Some(reference) = measure(channels, stft, &cells, params.max_delay_samples) else {
         return false;
     };
+    let (level_spread, delay_spread) = spread(&per_bin_deviation(channels, stft, &cells, &reference));
+    let level_tol = params.spatial_level_tolerance_db.max(SPREAD_FACTOR * level_spread);
+    let delay_tol = params.spatial_delay_tolerance_samples.max(SPREAD_FACTOR * delay_spread);
     let gate = |mask: &mut [Vec<f32>]| {
         let weights: Vec<f32> = mask.iter().flatten().copied().collect();
         let cells = Cells {
@@ -279,13 +294,11 @@ pub fn apply_direction(
             k0: 0,
             weights: &weights,
         };
-        let agree = per_bin_agreement(
-            channels,
-            stft,
-            &cells,
-            &reference,
-            params.spatial_level_tolerance_db,
-            params.spatial_delay_tolerance_samples,
+        let agree = agreement_of(
+            &per_bin_deviation(channels, stft, &cells, &reference),
+            bins,
+            level_tol,
+            delay_tol,
         );
         for row in mask.iter_mut() {
             row.iter_mut().zip(&agree).for_each(|(m, a)| *m *= a);
@@ -676,6 +689,99 @@ mod tests {
             .expect("direction");
         assert!((sig.pairs[0].level_db + 8.0).abs() < 1.0, "{sig:?}");
         assert!((sig.pairs[0].delay_samples - 3.0).abs() <= 0.5, "{sig:?}");
+    }
+
+    /// `src` recorded by two spaced microphones in a room: the second one
+    /// hears it `delay` samples later and `gain_db` louder, and each one
+    /// picks up its own reflections (an exponentially decaying random tail,
+    /// `reverb` times as strong as the direct sound, 60 ms time constant;
+    /// `seed` picks the room). That is what real recordings look like: per
+    /// bin, the level difference and the phase between the channels scatter
+    /// around the direct sound's values.
+    fn in_a_room(src: &[f32], sr: u32, gain_db: f32, delay: usize, reverb: f32, seed: u64) -> Vec<Vec<f32>> {
+        let n = src.len();
+        let tail = (0.25 * sr as f32) as usize;
+        let mut rng = seed;
+        (0..2)
+            .map(|c| {
+                let mut ir = vec![0.0f32; tail];
+                ir[c * delay] = if c == 0 { 1.0 } else { 10f32.powf(gain_db / 20.0) };
+                for (i, v) in ir.iter_mut().enumerate().skip(c * delay + 1) {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    // uniform in -0.5..0.5, scaled to unit variance by 3.4
+                    let r = (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                    *v += reverb * 3.4 * r * (-(i as f32) / (0.06 * sr as f32)).exp();
+                }
+                let mut y = vec![0.0f32; n];
+                for (i, &x) in src.iter().enumerate().filter(|(_, x)| **x != 0.0) {
+                    for (j, &h) in ir.iter().enumerate().take(n - i) {
+                        y[i + j] += x * h;
+                    }
+                }
+                y
+            })
+            .collect()
+    }
+
+    #[test]
+    fn direction_check_works_in_a_reverberant_room() {
+        // Regression test: in real (stereo, reverberant) recordings the
+        // direction check used to veto the harmonics of the marked sound
+        // itself, so nothing turned red in the spectrogram, while mono files
+        // worked. A neighbour from elsewhere must still be told apart.
+        let sr = 16000;
+        // The sources of `stereo_duet`, before they are placed.
+        let n = 2 * sr as usize;
+        let (mut bird, mut other) = (vec![0.0f32; n], vec![0.0f32; n]);
+        let mut phase = 0.0f32;
+        for i in 0..n {
+            let t = i as f32 / sr as f32;
+            phase += 2.0 * std::f32::consts::PI * (300.0 + 150.0 * t / 2.0) / sr as f32;
+            let env = (std::f32::consts::PI * t / 2.0).sin();
+            bird[i] = env * (0.5 * phase.sin() + 0.25 * (2.0 * phase).sin());
+            other[i] = env * 0.15 * (3.0 * phase + 0.7).sin();
+        }
+        let b = in_a_room(&bird, sr, -2.0, 5, 0.03, 7);
+        let o = in_a_room(&other, sr, 14.0, 0, 0.03, 8);
+        let ch: Vec<Vec<f32>> = b
+            .iter()
+            .zip(&o)
+            .map(|(x, y)| x.iter().zip(y).map(|(a, b)| a + b).collect())
+            .collect();
+        let mono: Vec<f32> = ch[0].iter().zip(&ch[1]).map(|(a, b)| 0.5 * (a + b)).collect();
+        let cfg = StftConfig {
+            fft_size: 1024,
+            hop: 256,
+        };
+        let stft = Stft::new(cfg);
+        let sel = Selection {
+            start_s: 0.3,
+            end_s: 1.7,
+            low_hz: 280.0,
+            high_hz: 470.0,
+        };
+        let a = analyze_selection(
+            &mono,
+            &ch,
+            sr,
+            &stft,
+            &sel,
+            &NoiseEstimate::default(),
+            &AnalysisParams::default(),
+        );
+        // Mean harmonic mask along the m-th partial of the pitch track.
+        let along = |m: f32| {
+            let (mut sum, mut count) = (0.0, 0);
+            for t in 0..a.frames {
+                let Some(p) = a.pitch_track[t] else { continue };
+                let k = (m * p).round() as usize;
+                sum += a.harmonics[t][k - 1..=k + 1].iter().cloned().fold(0.0f32, f32::max);
+                count += 1;
+            }
+            sum / count.max(1) as f32
+        };
+        assert!(along(2.0) > 0.7, "own octave vetoed: mean mask {:.2}", along(2.0));
+        assert!(along(3.0) < 0.15, "neighbour kept: mean mask {:.2}", along(3.0));
     }
 
     #[test]
