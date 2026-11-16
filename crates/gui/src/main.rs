@@ -79,7 +79,7 @@ enum Background {
     /// A file finished loading (or failed).
     Loaded(PathBuf, anyhow::Result<AudioData>),
     /// The analysis of selection number `.0` finished.
-    Analysed(u64, RegionAnalysis),
+    Analysed(u64, Arc<RegionAnalysis>),
     /// Export progress in percent, or the final result.
     ExportProgress(usize),
     /// Export finished.
@@ -765,6 +765,8 @@ fn finish_drag(s: &mut State, ui: Ui, start: (f32, f32), end: (f32, f32)) {
     });
     let Some(doc) = &s.doc else { return };
     let mono = doc.engine.mono().clone();
+    // The individual tracks tell where the marked sound comes from.
+    let audio = doc.audio.clone();
     let sr = doc.audio.sample_rate;
     let cfg = s.project.stft;
     let noise = s.project.analysis_noise();
@@ -772,8 +774,8 @@ fn finish_drag(s: &mut State, ui: Ui, start: (f32, f32), end: (f32, f32)) {
     let serial = s.selection_serial;
     let tx = s.tx.clone();
     std::thread::spawn(move || {
-        let a = analyze_selection(&mono, sr, &Stft::new(cfg), &sel, &noise, &params);
-        let _ = tx.send(Background::Analysed(serial, a));
+        let a = analyze_selection(&mono, &audio.channels, sr, &Stft::new(cfg), &sel, &noise, &params);
+        let _ = tx.send(Background::Analysed(serial, Arc::new(a)));
     });
 }
 
@@ -938,7 +940,7 @@ fn tick(s: &mut State, ui: Ui) {
                             },
                             0,
                         );
-                        e.analysis = Some(Arc::new(a));
+                        e.analysis = Some(a);
                         push_project(s);
                     }
                 }

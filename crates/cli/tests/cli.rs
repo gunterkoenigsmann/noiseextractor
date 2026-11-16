@@ -209,3 +209,92 @@ fn marking_one_call_suppresses_all_repetitions() {
         );
     }
 }
+
+/// Stereo version of [`write_repeated_calls`]: the calls at 0.4 and 1.4 s
+/// come from the left (right channel 8 dB quieter and 3 samples later), the
+/// identical call at 2.4 s from the right (left channel 8 dB quieter).
+fn write_stereo_calls(path: &Path) -> AudioData {
+    let sr = 16000;
+    let len = 3 * sr;
+    let mut rng = 11u64;
+    let mut ch: Vec<Vec<f32>> = (0..2)
+        .map(|_| {
+            (0..len)
+                .map(|_| {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.01
+                })
+                .collect()
+        })
+        .collect();
+    let quiet = 10f32.powf(-8.0 / 20.0);
+    for (start, gains, delays) in [
+        (0.4f32, [1.0, quiet], [0, 3]),
+        (1.4, [1.0, quiet], [0, 3]),
+        (2.4, [quiet, 1.0], [0, 0]),
+    ] {
+        let s = (start * sr as f32) as usize;
+        let n = (0.35 * sr as f32) as usize;
+        let mut phase = 0.0f32;
+        for i in 0..n {
+            let t = i as f32 / n as f32;
+            phase += 2.0 * std::f32::consts::PI * (900.0 + 700.0 * t) / sr as f32;
+            let env = (std::f32::consts::PI * t).sin();
+            let v = env * (0.3 * phase.sin() + 0.12 * (2.0 * phase).sin());
+            for c in 0..2 {
+                ch[c][s + i + delays[c]] += gains[c] * v;
+            }
+        }
+    }
+    let audio = AudioData::new(sr as u32, ch);
+    audio.save_wav(path).unwrap();
+    audio
+}
+
+#[test]
+fn stereo_repetition_from_another_place_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("stereo.wav");
+    let project = dir.path().join("p.json");
+    let output = dir.path().join("out.wav");
+    let audio = write_stereo_calls(&input);
+    let out = bin()
+        .arg("mark")
+        .arg(&input)
+        .args(["--time", "0.4:0.75", "--freq", "850:1650", "--save-project"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        report.contains("direction: channel 1 vs 0: level -8."),
+        "report:\n{report}"
+    );
+    assert!(report.contains("same sound found 2 times"), "report:\n{report}");
+
+    let st = bin()
+        .arg("process")
+        .arg(&input)
+        .arg("--project")
+        .arg(&project)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let b = AudioData::load(&output).unwrap();
+    // Louder channel of each call: left for the first two, right for the third.
+    for (start, c, removed) in [(0.4f32, 0, true), (1.4, 0, true), (2.4, 1, false)] {
+        let r = ((start + 0.1) * 16000.0) as usize..((start + 0.25) * 16000.0) as usize;
+        let ratio = rms(&b.channels[c][r.clone()]) / rms(&audio.channels[c][r]);
+        if removed {
+            assert!(ratio < 0.2, "call at {start} s survived ({ratio})");
+        } else {
+            assert!(
+                ratio > 0.8,
+                "call from the other place at {start} s was removed ({ratio})"
+            );
+        }
+    }
+}

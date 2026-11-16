@@ -365,14 +365,31 @@ fn print_report(project: &Project, audio: &AudioData) {
             .filter(|&k| a.comodulated.iter().any(|f| f[k] > 0.5))
             .count();
         println!("  co-modulated bins: {comod}");
+        if let Some(sig) = a.template.as_ref().and_then(|t| t.spatial.as_ref()) {
+            for (i, p) in sig.pairs.iter().enumerate() {
+                println!(
+                    "  direction: channel {} vs 0: level {:+.1} dB, delay {:+.2} samples",
+                    i + 1,
+                    p.level_db,
+                    p.delay_samples
+                );
+            }
+        }
         match (&a.template, e.use_similar) {
             (Some(tpl), true) => {
-                let found = find_in_range(tpl, &mono, &stft, 0..total_frames, &e.similar);
+                let found = find_in_range(tpl, &mono, &audio.channels, &stft, 0..total_frames, &e.similar);
                 println!("  same sound found {} times:", found.len());
                 for o in found {
                     let t = o.frame as f64 * project.stft.hop as f64 / sample_rate as f64;
                     let note = if o.is_original(tpl) { ", the marked one" } else { "" };
-                    println!("    at {t:.3} s (match {:.2}, shifted {} bins{note})", o.score, o.shift);
+                    let place = o
+                        .spatial_agreement
+                        .map(|a| format!(", same place {a:.2}"))
+                        .unwrap_or_default();
+                    println!(
+                        "    at {t:.3} s (match {:.2}, shifted {} bins{place}{note})",
+                        o.score, o.shift
+                    );
                 }
             }
             (None, _) => println!("  nothing distinctive to search for elsewhere"),

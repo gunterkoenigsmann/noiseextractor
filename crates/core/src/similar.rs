@@ -28,18 +28,29 @@
 //! suppression) looks at a fixed neighbourhood that [`find_in_range`] always
 //! computes completely.
 
+use crate::spatial::{agreement, measure, Cells, Signature};
 use crate::stft::Stft;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 /// Tuning of the search for similar occurrences.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SimilarParams {
     /// Correlation (0..1) above which a place counts as another occurrence.
     pub threshold: f32,
     /// Largest frequency shift in bins tried when matching; small values
     /// tolerate slightly higher or lower repetitions.
     pub max_shift_bins: usize,
+    /// How much the spatial cues of multi-channel recordings count (0..1):
+    /// the shape score is multiplied by `1 - w + w·agreement`, so with
+    /// w = 1 a repetition from a different place is rejected completely,
+    /// with w = 0 the direction is ignored. No effect on mono files.
+    pub spatial_weight: f32,
+    /// Level difference (dB) at which the spatial agreement drops to e^-½.
+    pub level_tolerance_db: f32,
+    /// Delay difference (samples) at which the agreement drops to e^-½.
+    pub delay_tolerance_samples: f32,
 }
 
 impl Default for SimilarParams {
@@ -48,6 +59,9 @@ impl Default for SimilarParams {
         Self {
             threshold: 0.6,
             max_shift_bins: 2,
+            spatial_weight: 0.6,
+            level_tolerance_db: 3.0,
+            delay_tolerance_samples: 2.0,
         }
     }
 }
@@ -77,6 +91,15 @@ pub struct Template {
     /// Noise power per bin (all bins) used for the features, so every chunk
     /// computes identical features.
     pub noise: Vec<f32>,
+    /// Membership of each patch cell (union of all parts), frame-major like
+    /// `values`; selects the cells used for spatial measurements.
+    members: Vec<f32>,
+    /// Where the marked sound came from (multi-channel recordings only;
+    /// set by [`Template::attach_spatial`]).
+    pub spatial: Option<Signature>,
+    /// Largest inter-channel delay searched when measuring directions, in
+    /// samples (the same for the marked sound and its repetitions).
+    pub max_delay_samples: f32,
 }
 
 /// One place where the template matched.
@@ -86,8 +109,12 @@ pub struct Occurrence {
     pub frame: i64,
     /// Frequency shift in bins relative to the template.
     pub shift: i32,
-    /// Correlation with the template (0..1).
+    /// Combined score (0..1): shape correlation, reduced by spatial
+    /// disagreement in multi-channel recordings.
     pub score: f32,
+    /// Agreement of the occurrence's direction with the marked sound's
+    /// (1 = same place), `None` when no spatial cues were available.
+    pub spatial_agreement: Option<f32>,
 }
 
 /// Feature of one bin: log power with the noise floor added, so silence
@@ -128,6 +155,10 @@ impl Template {
         for frame in &power[t0..=t1] {
             values.extend((k0..=k1).map(|k| feature(frame[k], noise[k])));
         }
+        let cell_members: Vec<f32> = members[t0..=t1]
+            .iter()
+            .flat_map(|row| row[k0..=k1].iter().copied())
+            .collect();
         let mean = values.iter().sum::<f32>() / values.len() as f32;
         values.iter_mut().for_each(|v| *v -= mean);
         let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -144,7 +175,35 @@ impl Template {
             values,
             norm,
             noise: noise.to_vec(),
+            members: cell_members,
+            spatial: None,
+            max_delay_samples: 0.0,
         })
+    }
+
+    /// The template's member cells placed at global frame `frame`, shifted
+    /// by `shift` bins, for spatial measurements.
+    fn cells(&self, frame: i64, shift: i32) -> Option<Cells<'_>> {
+        let k0 = self.k0 as i64 + shift as i64;
+        if k0 < 0 || k0 as usize + self.width() > self.noise.len() {
+            return None;
+        }
+        Some(Cells {
+            first_frame: frame,
+            frames: self.frames,
+            k0: k0 as usize,
+            weights: &self.members,
+        })
+    }
+
+    /// Measures where the marked sound came from, so repetitions can be
+    /// checked for the same direction, searching delays up to
+    /// ±`max_delay_samples`. Leaves `spatial` at `None` for mono recordings.
+    pub fn attach_spatial(&mut self, channels: &[Vec<f32>], stft: &Stft, max_delay_samples: f32) {
+        self.max_delay_samples = max_delay_samples;
+        self.spatial = self
+            .cells(self.first_frame, 0)
+            .and_then(|cells| measure(channels, stft, &cells, max_delay_samples));
     }
 
     /// Normalised cross-correlation of the template with the patch of
@@ -183,9 +242,16 @@ impl Template {
 /// called from any chunk. An occurrence at offset `o` is reported if its
 /// best score (over the allowed shifts) reaches the threshold and is the
 /// maximum within ±half a template length; ties go to the earlier offset.
+///
+/// With several `channels` and a template that knows its direction, every
+/// offset whose shape score reaches the threshold is also checked for
+/// coming from the same place (see [`crate::spatial`]); the combined score
+/// is used for the threshold and the peak picking. This is decided per
+/// offset, so chunks still agree with each other.
 pub fn find_in_range(
     template: &Template,
     mono: &[f32],
+    channels: &[Vec<f32>],
     stft: &Stft,
     range: Range<i64>,
     params: &SimilarParams,
@@ -209,7 +275,7 @@ pub fn find_in_range(
         .collect();
 
     let shifts = -(params.max_shift_bins as i32)..=(params.max_shift_bins as i32);
-    let scores: Vec<(f32, i32)> = (scored.start..scored.end)
+    let shape_scores: Vec<(f32, i32)> = (scored.start..scored.end)
         .map(|o| {
             let row = (o - feat_first) as usize;
             shifts
@@ -225,11 +291,38 @@ pub fn find_in_range(
                 })
         })
         .collect();
+    let spatial = template
+        .spatial
+        .as_ref()
+        .filter(|_| channels.len() >= 2 && params.spatial_weight > 0.0);
+    let scores: Vec<(f32, i32, Option<f32>)> = shape_scores
+        .into_iter()
+        .enumerate()
+        .map(|(i, (score, shift))| {
+            let Some(reference) = spatial.filter(|_| score >= params.threshold) else {
+                return (score, shift, None);
+            };
+            let o = scored.start + i as i64;
+            let found = template
+                .cells(o, shift)
+                .and_then(|cells| measure(channels, stft, &cells, template.max_delay_samples));
+            let agree = found.map_or(0.0, |sig| {
+                agreement(
+                    reference,
+                    &sig,
+                    params.level_tolerance_db,
+                    params.delay_tolerance_samples,
+                )
+            });
+            let w = params.spatial_weight.clamp(0.0, 1.0);
+            (score * (1.0 - w + w * agree), shift, Some(agree))
+        })
+        .collect();
 
     let at = |o: i64| scores[(o - scored.start) as usize];
     let mut out = Vec::new();
     for o in cand {
-        let (score, shift) = at(o);
+        let (score, shift, spatial_agreement) = at(o);
         if score < params.threshold {
             continue;
         }
@@ -239,7 +332,12 @@ pub fn find_in_range(
         // later ones: exactly one offset of a plateau wins.
         let is_peak = (lo..o).all(|p| at(p).0 < score) && (o + 1..=hi).all(|p| at(p).0 <= score);
         if is_peak {
-            out.push(Occurrence { frame: o, shift, score });
+            out.push(Occurrence {
+                frame: o,
+                shift,
+                score,
+                spatial_agreement,
+            });
         }
     }
     out
@@ -371,6 +469,7 @@ mod tests {
         let all = find_in_range(
             &tpl,
             &x,
+            &[],
             &stft,
             0..stft.config().frame_count(x.len()) as i64,
             &SimilarParams::default(),
@@ -396,12 +495,12 @@ mod tests {
         let tpl = template(&x, &stft, sr);
         let total = stft.config().frame_count(x.len()) as i64;
         let p = SimilarParams::default();
-        let whole = find_in_range(&tpl, &x, &stft, 0..total, &p);
+        let whole = find_in_range(&tpl, &x, &[], &stft, 0..total, &p);
         let mut pieces = Vec::new();
         let mut a = 0;
         while a < total {
             let b = (a + 37).min(total);
-            pieces.extend(find_in_range(&tpl, &x, &stft, a..b, &p));
+            pieces.extend(find_in_range(&tpl, &x, &[], &stft, a..b, &p));
             a = b;
         }
         pieces.sort_by_key(|o| o.frame);
@@ -420,7 +519,7 @@ mod tests {
             hop: 128,
         });
         let tpl = template(&x, &stft, sr);
-        let found = find_in_range(&tpl, &x, &stft, 0..20, &SimilarParams::default());
+        let found = find_in_range(&tpl, &x, &[], &stft, 0..20, &SimilarParams::default());
         assert_eq!(found.len(), 1, "{found:?}");
         // For a gliding chirp a shift in frequency and a shift in time look
         // alike, so the match may trade one for the other; it must however
@@ -440,6 +539,7 @@ mod tests {
         let all = find_in_range(
             &tpl,
             &x,
+            &[],
             &stft,
             0..stft.config().frame_count(x.len()) as i64,
             &SimilarParams::default(),
@@ -470,6 +570,7 @@ mod tests {
             frame: 10,
             shift: 1,
             score: 1.0,
+            spatial_agreement: None,
         };
         let mut out = vec![0.0; 4];
         let target_power = [1.0, 1.0, 100.0, 1.0];
@@ -497,5 +598,85 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, vec![0.0; 4]);
+    }
+
+    /// Places `src` into two channels with gain (dB) and delay (whole
+    /// samples) on the right channel, adding it to `channels`.
+    fn add_panned(channels: &mut [Vec<f32>], src: &[f32], gain_db: f32, delay: usize) {
+        let g = 10f32.powf(gain_db / 20.0);
+        for i in 0..src.len() {
+            channels[0][i] += src[i];
+            if i + delay < channels[1].len() {
+                channels[1][i + delay] += g * src[i];
+            }
+        }
+    }
+
+    /// Stereo scene: chirps at 0.5 and 2.0 s placed with gain -8 dB / delay
+    /// 3 samples on the right channel, a third identical chirp at 3.2 s with
+    /// `other_gain_db` / `other_delay`. Returns the channels and the mono mix.
+    fn stereo_scene(sr: u32, other_gain_db: f32, other_delay: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let len = 4 * sr as usize;
+        let mut left_bird = vec![0.0; len];
+        chirp(&mut left_bird, sr, 0.5, 0.4, 1000.0, 1800.0, 0.3);
+        chirp(&mut left_bird, sr, 2.0, 0.4, 1000.0, 1800.0, 0.3);
+        let mut other_bird = vec![0.0; len];
+        chirp(&mut other_bird, sr, 3.2, 0.4, 1000.0, 1800.0, 0.3);
+        let mut ch = vec![vec![0.0f32; len]; 2];
+        add_panned(&mut ch, &left_bird, -8.0, 3);
+        add_panned(&mut ch, &other_bird, other_gain_db, other_delay);
+        let mono = ch[0].iter().zip(&ch[1]).map(|(a, b)| 0.5 * (a + b)).collect();
+        (ch, mono)
+    }
+
+    #[test]
+    fn stereo_repetition_with_only_another_delay_is_rejected() {
+        // Same level ratio, but the sound arrives 12 instead of 3 samples
+        // later on the right: a different place at the same distance ratio.
+        let sr = 16000;
+        let (ch, mono) = stereo_scene(sr, -8.0, 12);
+        let stft = Stft::new(StftConfig {
+            fft_size: 512,
+            hop: 128,
+        });
+        let mut tpl = template(&mono, &stft, sr);
+        tpl.attach_spatial(&ch, &stft, 16.0);
+        let range = 0..stft.config().frame_count(mono.len()) as i64;
+        let found = find_in_range(&tpl, &mono, &ch, &stft, range, &SimilarParams::default());
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn stereo_repetition_from_another_place_is_rejected() {
+        let sr = 16000;
+        // The marked chirp (0.5 s) and one repetition (2.0 s) come from the
+        // left, a third identical chirp (3.2 s) from the right.
+        let (ch, mono) = stereo_scene(sr, 8.0, 0);
+        let len = mono.len();
+        let stft = Stft::new(StftConfig {
+            fft_size: 512,
+            hop: 128,
+        });
+        let mut tpl = template(&mono, &stft, sr);
+        tpl.attach_spatial(&ch, &stft, 16.0);
+        let sig = tpl.spatial.clone().expect("stereo signature");
+        assert!((sig.pairs[0].level_db + 8.0).abs() < 1.0, "{sig:?}");
+        assert!((sig.pairs[0].delay_samples - 3.0).abs() <= 0.5, "{sig:?}");
+
+        let range = 0..stft.config().frame_count(len) as i64;
+        let params = SimilarParams::default();
+        let found = find_in_range(&tpl, &mono, &ch, &stft, range.clone(), &params);
+        let times: Vec<f32> = found.iter().map(|o| o.frame as f32 * 128.0 / sr as f32).collect();
+        assert_eq!(found.len(), 2, "expected the two left chirps, got {times:?}");
+        assert!(found.iter().all(|o| o.spatial_agreement.unwrap() > 0.8), "{found:?}");
+        assert!(times.iter().all(|&t| t < 3.0), "{times:?}");
+
+        // Without spatial weighting (or mono) all three are found.
+        let blind = SimilarParams {
+            spatial_weight: 0.0,
+            ..params.clone()
+        };
+        assert_eq!(find_in_range(&tpl, &mono, &ch, &stft, range.clone(), &blind).len(), 3);
+        assert_eq!(find_in_range(&tpl, &mono, &[], &stft, range, &params).len(), 3);
     }
 }

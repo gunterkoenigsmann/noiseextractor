@@ -174,7 +174,7 @@ pub fn process_chunk(
 
     let g_start = ctx as usize; // offset of frame cC-P-W in `power`
     let g_len = (c + 2 * pad + warm) as usize;
-    let occurrences = find_occurrences(project, mono, stft, (first - pad)..(first + c + pad));
+    let occurrences = find_occurrences(project, mono, &audio.channels, stft, (first - pad)..(first + c + pad));
     let gains = compute_gains(
         project,
         &power[g_start..g_start + g_len],
@@ -251,9 +251,13 @@ pub fn process_chunk(
 /// Searches, for every event filter (and the preview, last) whose "same
 /// sound elsewhere" part matters (enabled filter or visible overlay), the
 /// other occurrences overlapping the global frame range `range`.
+/// `channels` are the individual recording channels, used to compare where
+/// a candidate comes from with where the marked sound came from (ignored
+/// for mono recordings).
 pub fn find_occurrences(
     project: &Project,
     mono: &[f32],
+    channels: &[Vec<f32>],
     stft: &Stft,
     range: std::ops::Range<i64>,
 ) -> Vec<Vec<Occurrence>> {
@@ -266,7 +270,7 @@ pub fn find_occurrences(
                 .analysis
                 .as_ref()
                 .and_then(|a| a.template.as_ref())
-                .map(|tpl| find_in_range(tpl, mono, stft, range.clone(), &e.similar))
+                .map(|tpl| find_in_range(tpl, mono, channels, stft, range.clone(), &e.similar))
                 .unwrap_or_default(),
             _ => Vec::new(),
         })
