@@ -393,6 +393,11 @@ pub fn analyze_power(
         .collect();
     let tonal = !tracked.is_empty() && tracked.iter().sum::<f32>() / tracked.len() as f32 >= 0.6;
 
+    // How far the envelope's shape can be trusted as evidence: 0 for a flat
+    // envelope (coefficient of variation below 5 %, i.e. only noise
+    // ripple), 1 for one that clearly swells and fades (above 20 %).
+    let envelope_trust = smoothstep(0.05, 0.2, coefficient_of_variation(&env_active));
+
     let mut harmonics = vec![vec![0.0f32; bins]; frames];
     let mut partials = Vec::new();
     let ratios = if tonal {
@@ -435,9 +440,13 @@ pub fn analyze_power(
         let coverage = occupied as f32 / usable as f32;
         let corr = pearson(&track, &env_active).max(0.0);
         // Coverage is the main evidence (the partial follows the drifting
-        // pitch); a shared envelope adds confidence. A steady tone gives no
-        // envelope evidence, so coverage alone can reach the threshold.
-        let score = coverage * (0.6 + 0.4 * corr);
+        // pitch); a shared envelope adds confidence. How much a missing
+        // correlation may count against a partial depends on whether the
+        // envelope carries information at all: a steady tone's envelope is
+        // flat apart from noise, so its correlation is meaningless and must
+        // not hold the score down (issue #16: the octave of a steady tone
+        // only got a mask of ~0.35, so suppressing it left the octave).
+        let score = coverage * (1.0 - envelope_trust * 0.4 * (1.0 - corr));
         let weight = smoothstep(params.harmonic_threshold, params.harmonic_threshold + 0.25, score);
         if weight <= 0.0 {
             continue;
@@ -782,6 +791,63 @@ mod tests {
         };
         assert!(along(2.0) > 0.7, "own octave vetoed: mean mask {:.2}", along(2.0));
         assert!(along(3.0) < 0.15, "neighbour kept: mean mask {:.2}", along(3.0));
+    }
+
+    /// Issue #16: a steady tone (constant envelope inside the selection)
+    /// with a clean octave at high SNR. The octave belongs to the sound as
+    /// surely as the fundamental, so its harmonic mask must be close to 1,
+    /// not merely above the threshold.
+    #[test]
+    fn steady_tone_octave_gets_a_full_mask() {
+        let sr = 16000;
+        let n = 3 * sr as usize;
+        let mut rng = 777u64;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let noise = ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.04;
+                let tone = if (1.0..2.0).contains(&t) {
+                    let w = 2.0 * std::f32::consts::PI * 660.0 * t;
+                    0.4 * w.sin() + 0.2 * (2.0 * w).sin()
+                } else {
+                    0.0
+                };
+                tone + noise
+            })
+            .collect();
+        let cfg = StftConfig {
+            fft_size: 1024,
+            hop: 256,
+        };
+        let stft = Stft::new(cfg);
+        // Same selection as the CLI test of #16: only the fundamental, and
+        // well inside the tone, so the envelope is flat.
+        let sel = Selection {
+            start_s: 1.1,
+            end_s: 1.9,
+            low_hz: 550.0,
+            high_hz: 780.0,
+        };
+        let a = analyze_selection(
+            &x,
+            &[],
+            sr,
+            &stft,
+            &sel,
+            &NoiseEstimate::default(),
+            &AnalysisParams::default(),
+        );
+        assert!(
+            a.partials.iter().any(|p| p.ratio == 2.0),
+            "octave not found: {:?}",
+            a.partials
+        );
+        let k_oct = (1320.0 * cfg.fft_size as f32 / sr as f32).round() as usize;
+        let mid = a.first_frame + (a.frames / 2) as i64;
+        let (_, harm, _) = a.frame(mid).unwrap();
+        let m = harm[k_oct - 1..=k_oct + 1].iter().cloned().fold(0.0f32, f32::max);
+        assert!(m > 0.9, "octave mask only {m}");
     }
 
     #[test]
