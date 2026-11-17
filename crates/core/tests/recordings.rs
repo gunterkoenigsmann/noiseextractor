@@ -60,3 +60,14 @@ fn the_owl_calls_are_found_as_one_sound_and_can_be_extracted() {
     let between = power(&out, 3.0, 7.0) / power(&audio, 3.0, 7.0);
     assert!(between < 0.05, "background kept: {between:.2}");
 }
+
+#[test]
+fn the_cricket_recording_loads_whole() {
+    let audio = fixture("cricket-bursts.ogg");
+    assert_eq!(audio.sample_rate, 48000);
+    assert_eq!(audio.channels.len(), 2);
+    let seconds = audio.channels[0].len() as f64 / 48000.0;
+    assert!((seconds - 184.9).abs() < 0.2, "{seconds} s");
+    // A loud burst (3 .. 5 s) stands far above the quiet stretch before it.
+    assert!(power(&audio, 3.5, 5.0) > 100.0 * power(&audio, 0.5, 2.5));
+}

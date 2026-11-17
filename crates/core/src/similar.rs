@@ -28,6 +28,7 @@
 //! suppression) looks at a fixed neighbourhood that [`find_in_range`] always
 //! computes completely.
 
+use crate::rhythm::Rhythm;
 use crate::spatial::{agreement, measure, Cells, Signature};
 use crate::stft::Stft;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,9 @@ pub struct SimilarParams {
     pub level_tolerance_db: f32,
     /// Delay difference (samples) at which the agreement drops to e^-½.
     pub delay_tolerance_samples: f32,
+    /// Pulsed sounds only (see [`crate::rhythm`]): how far (dB) the band
+    /// must be above the noise floor on average for a repetition.
+    pub min_level_db: f32,
 }
 
 impl Default for SimilarParams {
@@ -62,6 +66,7 @@ impl Default for SimilarParams {
             spatial_weight: 0.6,
             level_tolerance_db: 3.0,
             delay_tolerance_samples: 2.0,
+            min_level_db: 3.0,
         }
     }
 }
@@ -100,6 +105,14 @@ pub struct Template {
     /// Largest inter-channel delay searched when measuring directions, in
     /// samples (the same for the marked sound and its repetitions).
     pub max_delay_samples: f32,
+    /// The rhythm of a pulsed sound. When set, repetitions are found by
+    /// rhythm and band shape (see [`crate::rhythm`]) instead of the 2-D
+    /// correlation, and may be longer or shorter than the template.
+    pub rhythm: Option<Rhythm>,
+    /// Largest membership of each patch bin over all template frames: the
+    /// band a pulsed sound occupies, used for the direction of its
+    /// repetitions.
+    band: Vec<f32>,
 }
 
 /// One place where the template matched.
@@ -107,6 +120,9 @@ pub struct Template {
 pub struct Occurrence {
     /// Global frame where the matched patch starts.
     pub frame: i64,
+    /// Length in frames: the template's length, or for pulsed sounds the
+    /// length of the found burst.
+    pub frames: usize,
     /// Frequency shift in bins relative to the template.
     pub shift: i32,
     /// Combined score (0..1): shape correlation, reduced by spatial
@@ -159,6 +175,11 @@ impl Template {
             .iter()
             .flat_map(|row| row[k0..=k1].iter().copied())
             .collect();
+        let width = k1 - k0 + 1;
+        let band: Vec<f32> = (0..width)
+            .map(|i| cell_members.chunks(width).map(|row| row[i]).fold(0.0, f32::max))
+            .collect();
+        let rhythm = Rhythm::build(&power[t0..=t1], noise, k0, k1);
         let mean = values.iter().sum::<f32>() / values.len() as f32;
         values.iter_mut().for_each(|v| *v -= mean);
         let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -178,6 +199,8 @@ impl Template {
             members: cell_members,
             spatial: None,
             max_delay_samples: 0.0,
+            rhythm,
+            band,
         })
     }
 
@@ -256,6 +279,9 @@ pub fn find_in_range(
     range: Range<i64>,
     params: &SimilarParams,
 ) -> Vec<Occurrence> {
+    if let Some(rhythm) = &template.rhythm {
+        return find_rhythmic(template, rhythm, mono, channels, stft, range, params);
+    }
     let t = template.frames as i64;
     let radius = (t / 2).max(1);
     let total_frames = stft.config().frame_count(mono.len()) as i64;
@@ -334,6 +360,7 @@ pub fn find_in_range(
         if is_peak {
             out.push(Occurrence {
                 frame: o,
+                frames: template.frames,
                 shift,
                 score,
                 spatial_agreement,
@@ -343,11 +370,167 @@ pub fn find_in_range(
     out
 }
 
+/// Rhythm scores of the window starts `lo .. hi` (see [`Rhythm::score`]).
+fn rhythm_scores(
+    template: &Template,
+    rhythm: &Rhythm,
+    mono: &[f32],
+    stft: &Stft,
+    lo: i64,
+    hi: i64,
+    params: &SimilarParams,
+) -> Vec<f32> {
+    let w = rhythm.window;
+    let power = stft.analyze(mono, lo, (hi - lo) as usize + w - 1).power();
+    let levels = rhythm.levels(&power, &template.noise);
+    (0..(hi - lo) as usize)
+        .map(|i| rhythm.score(&levels, i, params.min_level_db))
+        .collect()
+}
+
+/// [`find_in_range`] for pulsed sounds.
+///
+/// Every window start whose rhythm score reaches the threshold is a hit;
+/// hits less than a window apart belong to the same burst, which becomes
+/// one occurrence from its first hit to the end of its last window. A
+/// burst may reach far beyond `range`, so the scanned span grows until
+/// both of its ends are at least a window away from any hit (or at the
+/// recording's ends). Every chunk therefore sees the same bursts.
+fn find_rhythmic(
+    template: &Template,
+    rhythm: &Rhythm,
+    mono: &[f32],
+    channels: &[Vec<f32>],
+    stft: &Stft,
+    range: Range<i64>,
+    params: &SimilarParams,
+) -> Vec<Occurrence> {
+    let w = rhythm.window as i64;
+    let gap = w;
+    let total_frames = stft.config().frame_count(mono.len()) as i64;
+    // Window starts run over 0 ..= last.
+    let last = total_frames - w;
+    if last < 0 {
+        return Vec::new();
+    }
+    let mut lo = (range.start - w - gap).clamp(0, last);
+    let mut hi = (range.end + gap).clamp(lo + 1, last + 1);
+    let mut grow = 4 * w;
+    let scores = loop {
+        let scores = rhythm_scores(template, rhythm, mono, stft, lo, hi, params);
+        let hit = |i: usize| scores[i] >= params.threshold;
+        let edge = (gap as usize).min(scores.len());
+        let open_left = lo > 0 && (0..edge).any(hit);
+        let open_right = hi <= last && (scores.len() - edge..scores.len()).any(hit);
+        if !open_left && !open_right {
+            break scores;
+        }
+        if open_left {
+            lo = (lo - grow).max(0);
+        }
+        if open_right {
+            hi = (hi + grow).min(last + 1);
+        }
+        grow *= 2;
+    };
+    // Group hits into bursts: (first start, last start, best score).
+    let mut bursts: Vec<(i64, i64, f32)> = Vec::new();
+    for (i, &s) in scores.iter().enumerate() {
+        if s < params.threshold {
+            continue;
+        }
+        let o = lo + i as i64;
+        match bursts.last_mut() {
+            Some(b) if o - b.1 <= gap => {
+                b.1 = o;
+                b.2 = b.2.max(s);
+            }
+            _ => bursts.push((o, o, s)),
+        }
+    }
+    let spatial = template
+        .spatial
+        .as_ref()
+        .filter(|_| channels.len() >= 2 && params.spatial_weight > 0.0);
+    bursts
+        .into_iter()
+        .map(|(a, b, score)| (a, (b - a + w) as usize, score))
+        .filter(|&(a, frames, _)| a < range.end && a + frames as i64 > range.start)
+        .filter_map(|(a, frames, score)| {
+            let mut occ = Occurrence {
+                frame: a,
+                frames,
+                shift: 0,
+                score,
+                spatial_agreement: None,
+            };
+            if let Some(reference) = spatial {
+                // The direction of the burst's band, measured over at most
+                // a template length (enough cells, bounded cost).
+                let n = frames.min(template.frames.max(rhythm.window));
+                let weights: Vec<f32> = (0..n).flat_map(|_| template.band.iter().copied()).collect();
+                let cells = Cells {
+                    first_frame: a,
+                    frames: n,
+                    k0: template.k0,
+                    weights: &weights,
+                };
+                let agree = measure(channels, stft, &cells, template.max_delay_samples).map_or(0.0, |sig| {
+                    agreement(
+                        reference,
+                        &sig,
+                        params.level_tolerance_db,
+                        params.delay_tolerance_samples,
+                    )
+                });
+                let wgt = params.spatial_weight.clamp(0.0, 1.0);
+                occ.score = score * (1.0 - wgt + wgt * agree);
+                occ.spatial_agreement = Some(agree);
+            }
+            (occ.score >= params.threshold).then_some(occ)
+        })
+        .collect()
+}
+
 impl Occurrence {
-    /// Whether this is the marked sound itself (the template matches its
-    /// own position, give or take a few frames).
+    /// First frame after the occurrence.
+    pub fn end(&self) -> i64 {
+        self.frame + self.frames as i64
+    }
+
+    /// Whether this is the marked sound itself: it matches the template's
+    /// own position give or take a few frames, or (pulsed sounds) is the
+    /// burst that overlaps the template by at least half its length.
     pub fn is_original(&self, template: &Template) -> bool {
-        (self.frame - template.first_frame).abs() <= (template.frames as i64 / 2).max(1)
+        if template.rhythm.is_none() {
+            // Same length as the template: give or take a few frames.
+            return (self.frame - template.first_frame).abs() <= (template.frames as i64 / 2).max(1);
+        }
+        let t_end = template.first_frame + template.frames as i64;
+        let overlap = self.end().min(t_end) - self.frame.max(template.first_frame);
+        2 * overlap >= template.frames as i64
+    }
+
+    /// Whether the occurrence adds anything at global frame `frame`: the
+    /// frame lies inside it, and not where the marked sound itself already
+    /// covers it. A burst of a pulsed sound that contains the marked part
+    /// still extends it to the burst's other frames.
+    pub fn applies_to(&self, template: &Template, frame: i64) -> bool {
+        if frame < self.frame || frame >= self.end() {
+            return false;
+        }
+        if template.rhythm.is_some() {
+            !(template.first_frame..template.first_frame + template.frames as i64).contains(&frame)
+        } else {
+            !self.is_original(template)
+        }
+    }
+
+    /// The template frame (0-based) that corresponds to global frame
+    /// `frame` of this occurrence. Bursts of pulsed sounds may be longer
+    /// than the template; they wrap around.
+    pub fn template_frame(&self, template: &Template, frame: i64) -> usize {
+        ((frame - self.frame).max(0) as usize) % template.frames.max(1)
     }
 }
 
@@ -376,12 +559,27 @@ pub fn add_occurrence_mask(
     out: &mut [f32],
 ) {
     let rel = frame - occ.frame;
-    if rel < 0 || rel as usize >= template.frames {
+    if rel < 0 || rel >= occ.frames as i64 {
         return;
     }
     let weight = occurrence_weight(occ.score, params);
+    // Pulsed sounds: the pulses of a repetition do not line up with the
+    // template's, so every frame gets the band the sound occupies (its
+    // membership over the whole template); the presence term below keeps
+    // the gaps between pulses free. Up to 32 template frames are sampled.
+    let stride = (template.frames / 32).max(1);
+    let membership_of = |k: usize| -> f32 {
+        if template.rhythm.is_some() {
+            (0..template.frames)
+                .step_by(stride)
+                .map(|t| member(t, k))
+                .fold(0.0, f32::max)
+        } else {
+            member(rel as usize, k)
+        }
+    };
     for k in template.k0..=template.k1 {
-        let m = member(rel as usize, k);
+        let m = membership_of(k);
         if m <= 0.0 {
             continue;
         }
@@ -568,6 +766,7 @@ mod tests {
         tpl.k1 = 3;
         let occ = Occurrence {
             frame: 10,
+            frames: tpl.frames,
             shift: 1,
             score: 1.0,
             spatial_agreement: None,
@@ -678,5 +877,184 @@ mod tests {
         };
         assert_eq!(find_in_range(&tpl, &mono, &ch, &stft, range.clone(), &blind).len(), 3);
         assert_eq!(find_in_range(&tpl, &mono, &[], &stft, range, &params).len(), 3);
+    }
+
+    /// Adds band-limited noise (40 partials between 3 and 6 kHz) gated into
+    /// pulses at `rate` Hz (40 % duty, raised-cosine edges) from `start_s`
+    /// for `len` seconds; `rate` 0 gives a steady burst.
+    fn pulse_burst(out: &mut [f32], sr: u32, start_s: f32, len: f32, rate: f32, amp: f32, seed: u64) {
+        let mut rng = seed;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let partials: Vec<(f32, f32)> = (0..40)
+            .map(|_| (3000.0 + 3000.0 * next(), 2.0 * std::f32::consts::PI * next()))
+            .collect();
+        let start = (start_s * sr as f32) as usize;
+        let n = ((len * sr as f32) as usize).min(out.len().saturating_sub(start));
+        for i in 0..n {
+            let t = i as f32 / sr as f32;
+            let gate = if rate > 0.0 {
+                let phase = (t * rate).fract();
+                if phase < 0.4 {
+                    (std::f32::consts::PI * phase / 0.4).sin()
+                } else {
+                    0.0
+                }
+            } else {
+                1.0
+            };
+            let v: f32 = partials
+                .iter()
+                .map(|&(f, ph)| (2.0 * std::f32::consts::PI * f * t + ph).sin())
+                .sum();
+            out[start + i] += amp * gate * v / 40.0;
+        }
+    }
+
+    /// Noise plus pulse bursts at 6 Hz: the marked one (0.5 s, 2 s long),
+    /// a 20 dB quieter one (4 s, 1.2 s long), a long one under a steady
+    /// tone (7 s, 3 s long); decoys in the same band: pulses at 2 Hz (11 s)
+    /// and steady noise (13.5 s).
+    fn insect_scene(sr: u32) -> Vec<f32> {
+        let mut rng = 5u64;
+        let mut x: Vec<f32> = (0..16 * sr)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.002
+            })
+            .collect();
+        pulse_burst(&mut x, sr, 0.5, 2.0, 6.0, 0.3, 1);
+        pulse_burst(&mut x, sr, 4.0, 1.2, 6.0, 0.03, 2);
+        pulse_burst(&mut x, sr, 7.0, 3.0, 6.0, 0.3, 3);
+        for i in (7 * sr as usize)..(10 * sr as usize) {
+            x[i] += 0.2 * (2.0 * std::f32::consts::PI * 4000.0 * i as f32 / sr as f32).sin();
+        }
+        pulse_burst(&mut x, sr, 11.0, 2.0, 2.0, 0.3, 4);
+        pulse_burst(&mut x, sr, 13.5, 1.5, 0.0, 0.3, 5);
+        x
+    }
+
+    /// Template of the marked burst (0.5 .. 2.5 s, 2.5 .. 7 kHz) with the
+    /// noise measured in the quiet stretch at the end.
+    fn insect_template(x: &[f32], stft: &Stft, sr: u32) -> Template {
+        let cfg = stft.config();
+        let frame = |s: f32| (s * sr as f32 / cfg.hop as f32) as i64;
+        let quiet = stft.analyze(x, frame(15.2), 20).power();
+        let noise: Vec<f32> = (0..cfg.bins())
+            .map(|k| quiet.iter().map(|f| f[k]).sum::<f32>() / quiet.len() as f32)
+            .collect();
+        let (a, b) = (frame(0.5), frame(2.5));
+        let power = stft.analyze(x, a, (b - a) as usize).power();
+        let (k0, k1) = (cfg.hz_to_bin(2500.0, sr) as usize, cfg.hz_to_bin(7000.0, sr) as usize);
+        let members: Vec<Vec<f32>> = (0..power.len())
+            .map(|_| {
+                (0..cfg.bins())
+                    .map(|k| if (k0..=k1).contains(&k) { 1.0 } else { 0.0 })
+                    .collect()
+            })
+            .collect();
+        Template::build(&power, a, &noise, &members).expect("template")
+    }
+
+    #[test]
+    fn chirps_are_not_taken_for_pulsed_sounds() {
+        let sr = 16000;
+        let x = scene(sr);
+        let stft = Stft::new(StftConfig::default());
+        assert!(template(&x, &stft, sr).rhythm.is_none());
+    }
+
+    #[test]
+    fn pulsed_bursts_are_found_by_rhythm_whatever_their_level_and_length() {
+        let sr = 16000;
+        let x = insect_scene(sr);
+        let stft = Stft::new(StftConfig::default());
+        let hop = stft.config().hop as f32;
+        let tpl = insect_template(&x, &stft, sr);
+        let rhythm = tpl.rhythm.as_ref().expect("pulsed");
+        let rate = sr as f32 / hop / rhythm.period;
+        assert!((rate - 6.0).abs() < 0.8, "pulse rate {rate}");
+        let total = stft.config().frame_count(x.len()) as i64;
+        let found = find_in_range(&tpl, &x, &[], &stft, 0..total, &SimilarParams::default());
+        let spans: Vec<(f32, f32)> = found
+            .iter()
+            .map(|o| {
+                let s = o.frame as f32 * hop / sr as f32;
+                (s, s + o.frames as f32 * hop / sr as f32)
+            })
+            .collect();
+        assert_eq!(found.len(), 3, "{spans:?}");
+        for ((s, e), (want_s, want_e)) in spans.iter().zip([(0.5, 2.5), (4.0, 5.2), (7.0, 10.0)]) {
+            assert!((s - want_s).abs() < 0.4 && (e - want_e).abs() < 0.4, "{spans:?}");
+        }
+        assert!(found[0].is_original(&tpl));
+        assert!(!found[1].is_original(&tpl) && !found[2].is_original(&tpl));
+        // A long burst is applied beyond the template's length.
+        let late = found[2].frame + tpl.frames as i64 + 5;
+        assert!(found[2].applies_to(&tpl, late));
+        assert!(found[2].template_frame(&tpl, late) < tpl.frames);
+        // The marked burst only adds frames outside the marked part.
+        assert!(!found[0].applies_to(&tpl, tpl.first_frame + 3));
+    }
+
+    #[test]
+    fn pulsed_bursts_are_the_same_whichever_chunk_asks() {
+        let sr = 16000;
+        let x = insect_scene(sr);
+        let stft = Stft::new(StftConfig::default());
+        let tpl = insect_template(&x, &stft, sr);
+        let total = stft.config().frame_count(x.len()) as i64;
+        let params = SimilarParams::default();
+        let whole = find_in_range(&tpl, &x, &[], &stft, 0..total, &params);
+        let mut pieced: Vec<Occurrence> = Vec::new();
+        for start in (0..total).step_by(16) {
+            for o in find_in_range(&tpl, &x, &[], &stft, start..(start + 16).min(total), &params) {
+                if !pieced.contains(&o) {
+                    pieced.push(o);
+                }
+            }
+        }
+        assert_eq!(pieced, whole);
+    }
+
+    #[test]
+    fn mask_of_a_pulsed_burst_covers_the_band_in_every_frame() {
+        let sr = 16000;
+        let x = insect_scene(sr);
+        let stft = Stft::new(StftConfig::default());
+        let tpl = insect_template(&x, &stft, sr);
+        let occ = Occurrence {
+            frame: 1000,
+            frames: 3 * tpl.frames,
+            shift: 0,
+            score: 1.0,
+            spatial_agreement: None,
+        };
+        let mut power = tpl.noise.clone();
+        let k = (tpl.k0 + tpl.k1) / 2;
+        power[k] *= 1000.0;
+        let mut out = vec![0.0; power.len()];
+        // Beyond the template's length, and with membership only in the
+        // template's first frame: the band still counts.
+        let member = |t: usize, kk: usize| {
+            if t == 0 && (tpl.k0..=tpl.k1).contains(&kk) {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        add_occurrence_mask(
+            &tpl,
+            &occ,
+            &SimilarParams::default(),
+            1000 + 2 * tpl.frames as i64,
+            &power,
+            &member,
+            &mut out,
+        );
+        assert!(out[k] > 0.9);
+        assert_eq!(out[tpl.k0], 0.0, "no energy there, nothing to take");
     }
 }
