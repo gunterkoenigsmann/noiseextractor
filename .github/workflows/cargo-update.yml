@@ -9,7 +9,7 @@
 # may need code changes) and the GitHub Actions; this workflow does the rest.
 #
 # Timing: Saturdays, so that a green update is merged well before the weekly
-# snap rebuild (snap-publish.yml, Mondays 03:17 UTC) and a red one leaves a
+# snap rebuild (snap-publish.yml, Mondays 04:17 UTC) and a red one leaves a
 # weekend to look at it.
 #
 # How the PR gets tested and merged without a personal token:

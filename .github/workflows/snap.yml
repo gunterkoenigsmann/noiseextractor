@@ -1,0 +1,103 @@
+# Builds the snap (snap/snapcraft.yaml) and smoke-tests it: installs it,
+# runs the command line tool on packaging/smoke-test.wav and starts the GUI
+# under Xvfb. Publishing is .github/workflows/snap-publish.yml; docs/snap.md
+# has the release steps. (Adapted from losslessaudiocut's snap.yml.)
+name: Snap
+
+on:
+  push:
+    branches: [main]
+  # Only the PRs that change the recipe or this workflow: a snap build takes
+  # about 40 minutes (wxWidgets from source in a fresh LXD container) and
+  # sometimes much longer while it downloads from the Snap Store, so other
+  # PRs do not wait for it. The build after their merge to main shows
+  # whether the snap still needs a library.
+  pull_request:
+    paths:
+      - snap/**
+      - .github/workflows/snap.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One build per branch or PR: a newer push replaces the running build. Only
+# the newest commit of main matters for the package anyway.
+concurrency:
+  group: snap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build snap (${{ matrix.arch }})
+    # One build per architecture, each on a native runner (snapcraft does
+    # not cross-build this recipe).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # No cache inside the LXD build: Rust toolchain, all crates and wxWidgets
+    # are built from source. Downloads from the Snap Store (LXD, the GNOME
+    # SDK) are sometimes slow from GitHub's runners and add an hour or more,
+    # so the limit only catches a real hang.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: snapcore/action-build@v1
+        id: build
+      # Snapcraft's own log has the details its console output leaves out.
+      - name: Upload snapcraft log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapcraft-log-${{ matrix.arch }}
+          path: ~/.local/state/snapcraft/log/
+      - name: Upload snap
+        uses: actions/upload-artifact@v7
+        with:
+          name: snap-${{ matrix.arch }}
+          path: ${{ steps.build.outputs.snap }}
+          if-no-files-found: error
+      # --dangerous: a local file, not signed by the store. The runtime
+      # (gnome-46-2404) is a default provider, but install it explicitly so
+      # a missing one fails here and not in the GUI start below.
+      - name: Install snap
+        run: |
+          sudo snap install gnome-46-2404 gtk-common-themes
+          sudo snap install --dangerous "${{ steps.build.outputs.snap }}"
+          snap connections noiseextractor
+      # The CLI is confined like the GUI and links the same staged
+      # libraries. The input is under $HOME (/home/runner/work), which the
+      # home plug covers, and so is the output.
+      # A library in the snap that shadows a newer one of the gnome runtime
+      # shows up as "undefined symbol" when GTK or gdk-pixbuf loads a module;
+      # such warnings fail the job.
+      - name: Command line smoke test
+        run: |
+          set -x
+          noiseextractor.cli --help 2> stderr.txt
+          cat stderr.txt
+          # (`! grep` would not stop a `bash -e` script.)
+          if grep -qi "undefined symbol" stderr.txt; then exit 1; fi
+          noiseextractor.cli denoise packaging/smoke-test.wav -o "$HOME/out.wav"
+          test -s "$HOME/out.wav"
+          grep -q '^MimeType=audio/x-wav;' /snap/noiseextractor/current/meta/gui/noiseextractor.desktop
+      # The GUI must come up with a file and keep running; `timeout` ends it
+      # after 20 s with exit status 124, which is the success case. A missing
+      # library, GTK runtime or a crash at start-up gives any other status.
+      - name: GUI smoke test
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
+          set +e
+          xvfb-run -a timeout 20 noiseextractor packaging/smoke-test.wav 2> stderr.txt
+          status=$?
+          cat stderr.txt
+          echo "exit status: $status"
+          test "$status" -eq 124 || exit 1
+          grep -qi "undefined symbol" stderr.txt && exit 1
+          exit 0

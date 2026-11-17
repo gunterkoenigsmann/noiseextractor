@@ -5,7 +5,8 @@
 //! script each list the supported types in their own syntax. These tests
 //! read them from the repository and compare, so adding a format to
 //! `FILE_TYPES` fails here until every package offers it, and a package
-//! cannot claim a type the program does not open. (Adapted from
+//! cannot claim a type the program does not open. The snap's own desktop
+//! file must equal the Linux one apart from its icon. (Adapted from
 //! losslessaudiocut's `crates/lac-app/tests/packaging.rs`.)
 
 use noiseextractor_core::audio::FILE_TYPES;
@@ -146,4 +147,42 @@ fn smoke_test_recording_loads() {
     let audio = noiseextractor_core::AudioData::load(&path).expect("loads");
     assert_eq!(audio.sample_rate, 16_000);
     assert_eq!(audio.len(), 16_000);
+}
+
+#[test]
+fn snap_desktop_file_matches_the_linux_one() {
+    // The snap ships its own desktop file (snap/gui) because its icon lives
+    // in the snap's meta/gui instead of the host's icon theme; everything
+    // else, above all the MIME types, must stay the same as in the .deb and
+    // the AppImage.
+    let linux = repo_file("packaging/linux/noiseextractor.desktop");
+    let snap = repo_file("snap/gui/noiseextractor.desktop");
+    for key in [
+        "Type",
+        "Name",
+        "GenericName",
+        "Comment",
+        "Exec",
+        "Terminal",
+        "Categories",
+        "Keywords",
+        "MimeType",
+    ] {
+        assert_eq!(desktop_value(&snap, key), desktop_value(&linux, key), "{key}");
+    }
+    assert_eq!(
+        desktop_value(&snap, "Icon"),
+        Some("${SNAP}/meta/gui/noiseextractor.svg")
+    );
+}
+
+#[test]
+fn snap_icon_is_the_app_icon() {
+    // snapcraft copies snap/gui into meta/gui; a symlink to the icon in
+    // packaging/icons would not survive a checkout on Windows, so it is a
+    // copy, and this keeps the copy current.
+    assert_eq!(
+        repo_file("snap/gui/noiseextractor.svg"),
+        repo_file("packaging/icons/noiseextractor.svg")
+    );
 }

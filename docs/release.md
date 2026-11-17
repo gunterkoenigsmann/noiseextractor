@@ -34,7 +34,8 @@ Every package holds the GUI and the command line tool `noiseextractor-cli`:
 The packages offer the program under "Open with" for the audio types it
 reads (`FILE_TYPES` in `crates/core/src/audio.rs`); it never becomes the
 default program. `crates/core/tests/packaging.rs` checks that the desktop
-file, `Info.plist` and the installer list exactly these types.
+file, `Info.plist` and the installer list exactly these types, and that the
+snap's desktop file (`snap/gui`) matches the other one.
 
 ## What each run checks
 
@@ -71,6 +72,9 @@ page does the same for any branch.
    merged pull requests, after the text of
    `docs/release-notes/vX.Y.Z.md` if that exists.
 4. A tag with a suffix, such as `v1.2.0-rc1`, becomes a pre-release.
+5. The snap's stable channel gets the release at the next weekly rebuild
+   (Mondays), or right away with *Snap publish* → *Run workflow*; see
+   [snap.md](snap.md).
 
 ## Unsigned packages
 
