@@ -431,10 +431,12 @@ fn solo_and_without_split_the_recording_at_the_marked_tone() {
     // Solo: the tone, and nothing before it.
     assert!(rms(&solo[tone.clone()]) > 0.85 * rms(&a[tone.clone()]));
     assert!(rms(&solo[noise.clone()]) < 0.05 * rms(&a[noise.clone()]));
-    // Without: the noise before the tone untouched, the fundamental gone
-    // (its octave is only partly found by the analysis, issue filed).
+    // Without: the noise before the tone untouched, the fundamental and
+    // its octave gone. Leaving the octave alone would keep 0.45 of the
+    // tone's RMS (issue #16), so 0.15 checks that the octave is removed too.
     assert!(rms(&without[noise.clone()]) > 0.95 * rms(&a[noise]));
-    assert!(rms(&without[tone.clone()]) < 0.5 * rms(&a[tone.clone()]));
+    let left = rms(&without[tone.clone()]) / rms(&a[tone.clone()]);
+    assert!(left < 0.15, "without keeps {left} of the tone");
     // Together (in power) they are the recording.
     let sum = (rms(&solo[tone.clone()]).powi(2) + rms(&without[tone.clone()]).powi(2)).sqrt();
     let ratio = sum / rms(&a[tone]);
