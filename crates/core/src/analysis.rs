@@ -236,9 +236,39 @@ pub fn analyze_selection(
         analysis.model = crate::share::SourceModel::build(span, &noise_power, &analysis, params.harmonic_tolerance);
     }
     if let Some(template) = analysis.template.as_mut() {
-        template.attach_spatial(channels, stft, params.max_delay_samples);
+        let channel_noise = if channels.len() >= 2 {
+            channel_noise(channels, stft, ctx_start, (ctx_end - ctx_start) as usize, noise)
+        } else {
+            Vec::new()
+        };
+        template.attach_spatial(channels, stft, params.max_delay_samples, channel_noise);
     }
     analysis
+}
+
+/// Noise power per bin of each of `channels`, over `frames` frames from
+/// global frame `first`. A noise profile describes the mono mix only, so
+/// each channel gets its own adaptive estimate (with the profile's
+/// estimator's quantile when `noise` is adaptive, else the default one).
+fn channel_noise(
+    channels: &[Vec<f32>],
+    stft: &Stft,
+    first: i64,
+    frames: usize,
+    noise: &NoiseEstimate,
+) -> Vec<Vec<f32>> {
+    let adaptive = match noise {
+        NoiseEstimate::Adaptive { .. } => noise.clone(),
+        NoiseEstimate::Profile(_) => NoiseEstimate::default(),
+    };
+    let NoiseEstimate::Adaptive { quantile } = adaptive else {
+        unreachable!("the default noise estimate is adaptive")
+    };
+    let bins = stft.config().bins();
+    channels
+        .iter()
+        .map(|ch| crate::noise::estimate_noise(&stft.analyze(ch, first, frames).power(), bins, quantile))
+        .collect()
 }
 
 /// How many RMS deviations of the marked part's own bins a found bin may
@@ -285,6 +315,7 @@ pub fn apply_direction(
         first_frame: analysis.first_frame,
         frames,
         k0,
+        noise: None,
         weights: &marked,
     };
     let Some(reference) = measure(channels, stft, &cells, params.max_delay_samples) else {
@@ -299,6 +330,7 @@ pub fn apply_direction(
             first_frame: analysis.first_frame,
             frames,
             k0: 0,
+            noise: None,
             weights: &weights,
         };
         let agree = agreement_of(

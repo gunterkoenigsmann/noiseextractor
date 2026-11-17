@@ -5,6 +5,7 @@ use noiseextractor_core::discover::{discover, DiscoverParams};
 use noiseextractor_core::engine::process_all;
 use noiseextractor_core::filter::{FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::NoiseEstimate;
+use noiseextractor_core::similar::{find_in_range, SimilarParams};
 use noiseextractor_core::stft::{Stft, StftConfig};
 use noiseextractor_core::AudioData;
 use std::path::Path;
@@ -110,4 +111,50 @@ fn the_cricket_pulses_are_a_broadband_sound_without_partials() {
         .expect("no pulse rate");
     let rate = audio.sample_rate as f32 / (StftConfig::default().hop as f32 * r.period);
     assert!((5.0..7.0).contains(&rate), "pulsed at {rate} Hz");
+}
+
+#[test]
+fn the_loud_cricket_bursts_come_from_the_marked_place() {
+    // Issue #22: the loud bursts are the marked insect and must agree on
+    // the direction. The quiet ones at 45, 52 and 63 s measure about
+    // -5 dB against -7.2 dB, consistently in every sub-band and at 20 dB
+    // above the noise, so they are taken to come from another place
+    // (decided by the maintainer) and are only required to be found.
+    let audio = fixture("cricket-bursts.ogg");
+    let cfg = StftConfig::default();
+    let stft = Stft::new(cfg);
+    let mono = audio.mono();
+    let sel = Selection {
+        start_s: 3.0,
+        end_s: 5.2,
+        low_hz: 2000.0,
+        high_hz: 20000.0,
+    };
+    let a = analyze_selection(
+        &mono,
+        &audio.channels,
+        audio.sample_rate,
+        &stft,
+        &sel,
+        &NoiseEstimate::default(),
+        &AnalysisParams::default(),
+    );
+    let tpl = a.template.expect("template");
+    let total = cfg.frame_count(mono.len()) as i64;
+    let found = find_in_range(&tpl, &mono, &audio.channels, &stft, 0..total, &SimilarParams::default());
+    let at = |t: f64| {
+        found.iter().find(|o| {
+            let start = o.frame as f64 * cfg.hop as f64 / audio.sample_rate as f64;
+            let end = o.end() as f64 * cfg.hop as f64 / audio.sample_rate as f64;
+            start - 0.5 <= t && t <= end
+        })
+    };
+    for t in [9.5, 18.5, 31.0, 57.0, 70.5, 76.5, 83.5, 90.0, 96.5] {
+        let o = at(t).unwrap_or_else(|| panic!("loud burst at {t} s not found"));
+        let place = o.spatial_agreement.expect("stereo");
+        assert!(place > 0.95, "burst at {t} s: same place {place:.2}");
+    }
+    for t in [45.0, 52.0, 63.0] {
+        assert!(at(t).is_some(), "quiet burst at {t} s not found");
+    }
 }
