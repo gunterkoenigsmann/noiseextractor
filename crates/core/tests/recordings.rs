@@ -158,3 +158,55 @@ fn the_loud_cricket_bursts_come_from_the_marked_place() {
         assert!(at(t).is_some(), "quiet burst at {t} s not found");
     }
 }
+
+#[test]
+fn cricket_bursts_are_found_whole_and_without_blips() {
+    // Issue #23, direction ignored: each real burst is found once and
+    // about as long as it is, and nothing lasting only one matching window
+    // (faint pulsing before 30 s, rustling at 182 s) is reported. The
+    // bursts at 173 and 177 s pulse at 1-2 Hz and come from almost straight
+    // ahead, so they are not taken for this cricket.
+    let audio = fixture("cricket-bursts.ogg");
+    let cfg = StftConfig::default();
+    let stft = Stft::new(cfg);
+    let mono = audio.mono();
+    let sel = Selection {
+        start_s: 3.0,
+        end_s: 5.2,
+        low_hz: 2000.0,
+        high_hz: 20000.0,
+    };
+    let a = analyze_selection(
+        &mono,
+        &audio.channels,
+        audio.sample_rate,
+        &stft,
+        &sel,
+        &NoiseEstimate::default(),
+        &AnalysisParams::default(),
+    );
+    let tpl = a.template.expect("template");
+    let params = SimilarParams {
+        spatial_weight: 0.0,
+        ..Default::default()
+    };
+    let total = cfg.frame_count(mono.len()) as i64;
+    let seconds = |f: i64| f as f64 * cfg.hop as f64 / audio.sample_rate as f64;
+    let spans: Vec<(f64, f64)> = find_in_range(&tpl, &mono, &audio.channels, &stft, 0..total, &params)
+        .iter()
+        .map(|o| (seconds(o.frame), seconds(o.end())))
+        .collect();
+    for (s, e) in &spans {
+        assert!(e - s > 1.3, "blip {s:.1}..{e:.1} s in {spans:?}");
+        assert!(
+            !(26.0..29.5).contains(s) && *s < 180.0,
+            "spurious hit at {s:.1} s in {spans:?}"
+        );
+    }
+    for t in [
+        4.0, 10.0, 19.0, 31.5, 45.5, 52.0, 63.5, 104.0, 109.5, 153.5, 160.5, 167.5,
+    ] {
+        let n = spans.iter().filter(|(s, e)| *s <= t && t <= *e).count();
+        assert_eq!(n, 1, "burst at {t} s found {n} times in {spans:?}");
+    }
+}
