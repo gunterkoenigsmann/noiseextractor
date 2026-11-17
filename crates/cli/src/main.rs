@@ -451,7 +451,13 @@ fn print_report(project: &Project, audio: &AudioData) {
             .map(|&b| project.stft.bin_to_hz(b, sample_rate))
             .collect();
         println!("filter {:?} ({:?})", f.name, f.action);
-        if let (Some(lo), Some(hi)) = (
+        if let Some((lo, hi)) = a.broadband {
+            println!(
+                "  broadband sound, {:.1} .. {:.1} kHz",
+                project.stft.bin_to_hz(lo as f32, sample_rate) / 1000.0,
+                project.stft.bin_to_hz(hi as f32, sample_rate) / 1000.0
+            );
+        } else if let (Some(lo), Some(hi)) = (
             track.iter().cloned().reduce(f32::min),
             track.iter().cloned().reduce(f32::max),
         ) {

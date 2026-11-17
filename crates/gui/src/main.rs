@@ -68,7 +68,7 @@ use noiseextractor_core::filter::{EventFilter, Filter, FilterAction, FilterKind,
 use noiseextractor_core::noise::{mean_power, NoiseEstimate};
 use noiseextractor_core::render::render_rgb;
 use noiseextractor_core::similar::SimilarParams;
-use noiseextractor_core::stft::Stft;
+use noiseextractor_core::stft::{Stft, StftConfig};
 use noiseextractor_core::{AudioData, Engine, EngineConfig, Focus, Listen, Pick};
 use overview::{Overview, Peaks};
 use panes::{Contents, Pane, Panes};
@@ -1489,14 +1489,26 @@ fn start_analysis(s: &mut State, target: Target) {
     });
 }
 
-/// One line about an analysis for the status bar and the log.
-fn describe_analysis(a: &RegionAnalysis) -> String {
+/// One line about an analysis for the status bar and the log. `cfg` and
+/// `sample_rate` convert bins and frames to Hz.
+fn describe_analysis(a: &RegionAnalysis, cfg: StftConfig, sample_rate: u32) -> String {
     let found: Vec<String> = a.partials.iter().map(|p| format!("{:.2}", p.ratio)).collect();
-    let mut text = if found.is_empty() {
+    let mut text = if let Some((lo, hi)) = a.broadband {
+        // A noise band has no pitch, so there are no partials to report.
+        format!(
+            "Broadband sound, {:.1} .. {:.1} kHz",
+            cfg.bin_to_hz(lo as f32, sample_rate) / 1000.0,
+            cfg.bin_to_hz(hi as f32, sample_rate) / 1000.0
+        )
+    } else if found.is_empty() {
         "No related partials found".to_string()
     } else {
         format!("Related partials at {} x the tracked pitch", found.join(", "))
     };
+    if let Some(r) = a.template.as_ref().and_then(|t| t.rhythm.as_ref()) {
+        let hz = sample_rate as f32 / (cfg.hop as f32 * r.period);
+        text += &format!("; pulsed at {hz:.1} Hz");
+    }
     if let Some(sig) = a.template.as_ref().and_then(|t| t.spatial.as_ref()) {
         for (i, p) in sig.pairs.iter().enumerate() {
             text += &format!(
@@ -1798,7 +1810,8 @@ fn tick(s: &mut State, ui: Ui) {
                     }
                 }
                 if taken {
-                    report(ui, &describe_analysis(&a));
+                    let sr = s.doc.as_ref().map_or(1, |d| d.audio.sample_rate);
+                    report(ui, &describe_analysis(&a, s.project.stft, sr));
                     push_project(s);
                 }
             }

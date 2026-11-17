@@ -16,6 +16,9 @@ extract them, together with everything the program finds to belong to them.
   ratios (overtones, and sub-harmonics if you marked an overtone), so a
   drifting pitch is no problem. Resonances that do not move with the pitch
   but swell and fade together with it are found by common modulation.
+  A sound without a pitch (insect pulses, a hiss, rustling) is recognised as
+  a noise band: then no partials are searched, the marked band itself is the
+  sound, and the analysis reports its extent instead of a pitch.
 * **Find the same sound elsewhere.** The marked sound, together with
   everything found to belong to it, becomes a spectro-temporal template. It
   is matched against the whole recording (normalised cross-correlation,

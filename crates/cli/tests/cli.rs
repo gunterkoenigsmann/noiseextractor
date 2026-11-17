@@ -499,3 +499,30 @@ fn solo_of_a_missing_filter_is_an_error() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no filter 2"));
 }
+
+#[test]
+fn mark_reports_insect_pulses_as_broadband_without_partials() {
+    // Issue #24: the cricket's noise pulses used to get a "pitch" jumping
+    // between 8 and 19 kHz and eight made-up partials.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/fixtures/cricket-bursts.ogg");
+    let out = bin()
+        .arg("mark")
+        .arg(&fixture)
+        .args([
+            "--time",
+            "3.0:5.2",
+            "--freq",
+            "2000:20000",
+            "--name",
+            "cricket",
+            "--extract",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("broadband sound"), "{report}");
+    assert!(report.contains("pulsed at"), "{report}");
+    assert!(!report.contains("dominant frequency"), "{report}");
+    assert!(!report.contains("related partial"), "{report}");
+}
