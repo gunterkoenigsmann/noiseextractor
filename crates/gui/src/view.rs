@@ -64,6 +64,17 @@ impl Viewport {
         self.clamp(width);
     }
 
+    /// Shows samples `start..end` across a panel `width` pixels wide, as far
+    /// as the zoom limits and the recording allow. A span too short for the
+    /// deepest zoom stays centred.
+    pub fn show_range(&mut self, start: usize, end: usize, width: u32) {
+        let (a, b) = (start.min(end) as f64, start.max(end) as f64);
+        let w = width.max(1) as f64;
+        self.view.samples_per_px = ((b - a) / w).clamp(MIN_SAMPLES_PER_PX, self.max_spp(width));
+        self.view.start_sample = (a + b) / 2.0 - self.view.samples_per_px * w / 2.0;
+        self.clamp(width);
+    }
+
     /// Scrolls by `dx` pixels (positive = later in time).
     pub fn scroll(&mut self, dx: f32, width: u32) {
         self.view.start_sample += dx as f64 * self.view.samples_per_px;
@@ -152,6 +163,19 @@ mod tests {
         assert_eq!(v.visible_range(1000), (0, 48_000));
         v.scroll(500.0, 1000);
         assert_eq!(v.view.start_sample, 0.0, "cannot scroll past the end when fitted");
+    }
+
+    #[test]
+    fn show_range_zooms_to_the_span() {
+        let mut v = Viewport::fit(48_000, 48_000, 1000);
+        v.show_range(30_000, 10_000, 1000);
+        assert_eq!(v.visible_range(1000), (10_000, 30_000));
+        // Shorter than the deepest zoom allows: centred on the span.
+        v.show_range(20_000, 20_100, 1000);
+        assert_eq!(v.visible_range(1000), (19_550, 20_550));
+        // At the end of the recording: clamped inside it.
+        v.show_range(47_900, 48_000, 1000);
+        assert_eq!(v.visible_range(1000), (47_000, 48_000));
     }
 
     #[test]
