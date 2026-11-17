@@ -275,13 +275,12 @@ pub fn refresh(bar: &MenuBar, kind: Kind, list: &RecentFiles) {
 mod tests {
     use super::*;
 
-    /// A path that is absolute on every platform (Windows needs a drive).
+    /// A path that is absolute on every platform (Windows needs a drive),
+    /// in the form [`RecentFiles::add`] stores it: on Windows,
+    /// `std::path::absolute` also turns `/` into `\\`.
     fn p(s: &str) -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(format!("C:{s}"))
-        } else {
-            PathBuf::from(s)
-        }
+        let raw = if cfg!(windows) { format!("C:{s}") } else { s.to_string() };
+        std::path::absolute(&raw).unwrap_or_else(|_| PathBuf::from(raw))
     }
 
     #[test]
