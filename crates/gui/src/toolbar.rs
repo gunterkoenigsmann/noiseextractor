@@ -31,6 +31,19 @@ pub enum Item {
         /// What to draw.
         icon: Icon,
     },
+    /// One of a group of mutually exclusive buttons (adjacent radio items
+    /// form a group); shows which mode is on. The state is set from the
+    /// program with `ToolBar::toggle_tool`, see `set_listen` in `main.rs`.
+    Radio {
+        /// Menu command id, shared with the radio menu item.
+        id: i32,
+        /// Short label.
+        label: &'static str,
+        /// Tooltip, naming the keyboard shortcut.
+        help: &'static str,
+        /// What to draw.
+        icon: Icon,
+    },
     /// A divider between groups of tools.
     Separator,
 }
@@ -68,6 +81,24 @@ pub const ITEMS: &[Item] = &[
         label: "Play",
         help: "Play / pause the selection or from the play head (Space, Ctrl+P)",
         icon: Icon::PlayPause,
+    },
+    Item::Radio {
+        id: crate::ID_HEAR_ALL,
+        label: "Hear all",
+        help: "Hear everything (Ctrl+1)",
+        icon: Icon::HearAll,
+    },
+    Item::Radio {
+        id: crate::ID_HEAR_SOLO,
+        label: "Hear sound",
+        help: "Hear only the picked sound: the selection, else the filter picked in the list (Ctrl+2)",
+        icon: Icon::HearSolo,
+    },
+    Item::Radio {
+        id: crate::ID_HEAR_WITHOUT,
+        label: "Hear without",
+        help: "Hear everything but the picked sound (Ctrl+3)",
+        icon: Icon::HearWithout,
     },
     Item::Separator,
     Item::Tool {
@@ -158,6 +189,12 @@ pub enum Icon {
     Export,
     /// Play triangle next to pause bars.
     PlayPause,
+    /// A speaker sending out sound waves: everything.
+    HearAll,
+    /// A speaker with only the (green) picked sound.
+    HearSolo,
+    /// A speaker with the (red) picked sound struck out.
+    HearWithout,
     /// The (green) selection with a (red) minus.
     Suppress,
     /// The (green) selection with an arrow out of it.
@@ -175,12 +212,15 @@ pub enum Icon {
 impl Icon {
     /// All icons, for tests.
     #[cfg(test)]
-    const ALL: [Icon; 11] = [
+    const ALL: [Icon; 14] = [
         Icon::OpenAudio,
         Icon::OpenProject,
         Icon::Save,
         Icon::Export,
         Icon::PlayPause,
+        Icon::HearAll,
+        Icon::HearSolo,
+        Icon::HearWithout,
         Icon::Suppress,
         Icon::Extract,
         Icon::LearnNoise,
@@ -200,6 +240,8 @@ impl Icon {
             format!(r#"fill="none" stroke="{fg}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round""#);
         // A folder; both "open" icons use it.
         let folder = format!(r#"<path d="M2 6h7l2 2h11v12H2z" {line}/>"#);
+        // A small speaker on the left; the "hear" icons use it.
+        let speaker = format!(r#"<path d="M2 9h3l4-4v14l-4-4H2z" fill="{fg}"/>"#);
         match self {
             Icon::OpenAudio => format!(
                 r#"{folder}<path d="M5 14l2-3 2 5 2-6 2 7 2-4 2 1" fill="none" stroke="{sel}" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>"#
@@ -215,6 +257,15 @@ impl Icon {
             ),
             Icon::PlayPause => format!(
                 r#"<path d="M3 4l10 8-10 8z" fill="{fg}"/><rect x="15" y="5" width="2.5" height="14" fill="{fg}"/><rect x="19.5" y="5" width="2.5" height="14" fill="{fg}"/>"#
+            ),
+            Icon::HearAll => {
+                format!(r#"{speaker}<path d="M12 9a4 4 0 0 1 0 6M15 6a8 8 0 0 1 0 12M18 3a12 12 0 0 1 0 18" {line}/>"#)
+            }
+            Icon::HearSolo => format!(
+                r#"{speaker}<path d="M12 12l2-4 2 8 2-6 2 4 2-2" fill="none" stroke="{sel}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>"#
+            ),
+            Icon::HearWithout => format!(
+                r#"{speaker}<path d="M12 9a4 4 0 0 1 0 6M15 6a8 8 0 0 1 0 12" {line}/><path d="M13 20L23 4" stroke="{found}" stroke-width="2.5" stroke-linecap="round"/>"#
             ),
             Icon::Suppress => format!(
                 r#"<rect x="2" y="4" width="20" height="16" fill="none" stroke="{sel}" stroke-width="2" stroke-dasharray="3 2"/><path d="M7 12h10" stroke="{found}" stroke-width="3" stroke-linecap="round"/>"#
@@ -247,11 +298,10 @@ impl Icon {
 }
 
 /// Creates the frame's toolbar from [`ITEMS`]. Clicks reach the frame's
-/// `on_menu` handler with the tool's id.
-pub fn create(frame: &Frame) {
-    let Some(tb) = frame.create_tool_bar(Some(ToolBarStyle::Default | ToolBarStyle::Flat), ID_ANY as i32) else {
-        return;
-    };
+/// `on_menu` handler with the tool's id. Returns the toolbar so radio
+/// tools can be kept in step with the program's state.
+pub fn create(frame: &Frame) -> Option<ToolBar> {
+    let tb = frame.create_tool_bar(Some(ToolBarStyle::Default | ToolBarStyle::Flat), ID_ANY as i32)?;
     let palette = Palette::current();
     for item in ITEMS {
         match *item {
@@ -262,10 +312,20 @@ pub fn create(frame: &Frame) {
                     .unwrap_or_default();
                 tb.add_tool_bundle(id, label, &bundle, help);
             }
+            Item::Radio { id, label, help, icon } => {
+                // wxDragon adds radio tools from a plain bitmap only, so
+                // render the bundle at the toolbar's scale (HiDPI).
+                let bitmap = BitmapBundle::from_svg_text(&icon.svg(&palette), Size::new(ICON_SIZE, ICON_SIZE))
+                    .and_then(|b| b.get_bitmap_for(&tb));
+                if let Some(bitmap) = bitmap {
+                    tb.add_radio_tool(id, label, &bitmap, help);
+                }
+            }
             Item::Separator => tb.add_separator(),
         }
     }
     tb.realize();
+    Some(tb)
 }
 
 #[cfg(test)]
@@ -278,7 +338,9 @@ mod tests {
         ITEMS
             .iter()
             .filter_map(|item| match *item {
-                Item::Tool { id, label, help, icon } => Some((id, label, help, icon)),
+                Item::Tool { id, label, help, icon } | Item::Radio { id, label, help, icon } => {
+                    Some((id, label, help, icon))
+                }
                 Item::Separator => None,
             })
             .collect()
@@ -321,6 +383,9 @@ mod tests {
             crate::ID_ADD_EXTRACT,
             crate::ID_LEARN_NOISE,
             crate::ID_FIND_SOUNDS,
+            crate::ID_HEAR_ALL,
+            crate::ID_HEAR_SOLO,
+            crate::ID_HEAR_WITHOUT,
         ];
         for (id, label, _, _) in tools() {
             assert!(menu_ids.contains(&id), "{label} has no menu command");
@@ -355,6 +420,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn radio_tools_cover_every_listening_mode_in_one_group() {
+        // The listening modes are one radio group: adjacent, in menu order.
+        let radios: Vec<usize> = ITEMS
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| matches!(it, Item::Radio { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(radios.windows(2).all(|w| w[1] == w[0] + 1), "radio tools split");
+        let ids: Vec<i32> = radios
+            .iter()
+            .map(|&i| match ITEMS[i] {
+                Item::Radio { id, .. } => id,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(ids, crate::LISTEN_MENU.map(|(_, id)| id));
     }
 
     #[test]

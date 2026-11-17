@@ -12,6 +12,7 @@
 //! noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract \
 //!     --save-project p.json
 //! noiseextractor-cli process in.flac --project p.json -o out.wav
+//! noiseextractor-cli process in.flac --project p.json --solo 2 -o bird.wav
 //! noiseextractor-cli spectrogram in.flac --project p.json -o view.png
 //! ```
 
@@ -25,6 +26,7 @@ use noiseextractor_core::audio::WavStreamWriter;
 use noiseextractor_core::discover::{discover, DiscoverParams, Discovery};
 use noiseextractor_core::engine::{process_all, ChunkLayout, ChunkResult};
 use noiseextractor_core::filter::{Filter, FilterAction, FilterKind, Project};
+use noiseextractor_core::listen::{Listen, Pick};
 use noiseextractor_core::noise::{mean_power, GainRule, NoiseEstimate};
 use noiseextractor_core::render::{render_rgb, View};
 use noiseextractor_core::similar::find_in_range;
@@ -66,6 +68,14 @@ enum Command {
         /// Output WAV file.
         #[arg(short, long)]
         output: PathBuf,
+        /// Write only the sound of filter N (1 = first in the project), as
+        /// the GUI's "Hear the picked sound only" plays it.
+        #[arg(long, value_name = "N", conflicts_with = "without")]
+        solo: Option<usize>,
+        /// Write everything but the sound of filter N (1 = first), as the
+        /// GUI's "Hear everything but the picked sound" plays it.
+        #[arg(long, value_name = "N")]
+        without: Option<usize>,
     },
     /// Background noise reduction with explicit parameters.
     Denoise {
@@ -195,12 +205,31 @@ fn run(cli: Cli) -> Result<()> {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     anyhow::ensure!(cli.chunk_frames >= 1, "--chunk-frames must be at least 1");
     match cli.command {
-        Command::Process { input, project, output } => {
+        Command::Process {
+            input,
+            project,
+            output,
+            solo,
+            without,
+        } => {
             let audio = load(&input)?;
             let mut project = match project {
                 Some(p) => Project::load(&p)?,
                 None => Project::default(),
             };
+            let (mode, n) = match (solo, without) {
+                (Some(n), _) => (Listen::Solo, Some(n)),
+                (None, Some(n)) => (Listen::Without, Some(n)),
+                (None, None) => (Listen::All, None),
+            };
+            if let Some(n) = n {
+                anyhow::ensure!(
+                    (1..=project.filters.len()).contains(&n),
+                    "no filter {n}: the project has {} (numbered from 1)",
+                    project.filters.len()
+                );
+                project = project.for_listening(mode, Some(Pick::Filter(n - 1)));
+            }
             project.prepare(&audio);
             write_processed(&audio, &project, cli.chunk_frames, threads, &output)
         }
