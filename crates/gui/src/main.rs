@@ -51,6 +51,7 @@ mod overview;
 mod panes;
 mod player;
 mod scrub;
+mod toolbar;
 mod view;
 
 use detection::{Group, Param};
@@ -100,6 +101,15 @@ const ID_HEAR_ALL: i32 = ID_HIGHEST + 9;
 const ID_HEAR_SOLO: i32 = ID_HIGHEST + 10;
 /// View > Hear everything but the picked sound ([`Listen::Without`]).
 const ID_HEAR_WITHOUT: i32 = ID_HIGHEST + 11;
+
+/// Filter > Suppress selection (also a button in the filter pane).
+const ID_ADD_SUPPRESS: i32 = ID_HIGHEST + 20;
+/// Filter > Extract selection (also a button in the filter pane).
+const ID_ADD_EXTRACT: i32 = ID_HIGHEST + 21;
+/// Filter > Learn noise from selection (also a button in the filter pane).
+const ID_LEARN_NOISE: i32 = ID_HIGHEST + 22;
+/// Filter > Find sounds (also a button in the filter pane).
+const ID_FIND_SOUNDS: i32 = ID_HIGHEST + 23;
 
 /// The listening modes with their menu ids, in menu order.
 const LISTEN_MENU: [(Listen, i32); 3] = [
@@ -209,6 +219,8 @@ const REANALYSE_DELAY: Duration = Duration::from_millis(200);
 struct Ui {
     /// Main window.
     frame: Frame,
+    /// The toolbar (`None` if it could not be created).
+    toolbar: Option<ToolBar>,
     /// The dockable panes.
     panes: Panes,
     /// Spectrogram drawing area.
@@ -366,6 +378,31 @@ fn build_ui() -> Ui {
             "Toggle linear / logarithmic frequency axis",
         )
         .append_separator();
+    // The filter pane's most used buttons, as menu commands so the toolbar
+    // and keyboard can reach them too.
+    let filter_menu = Menu::builder()
+        .append_item(
+            ID_ADD_SUPPRESS,
+            "&Suppress selection",
+            "Add a filter that suppresses the selected sound",
+        )
+        .append_item(
+            ID_ADD_EXTRACT,
+            "E&xtract selection",
+            "Add a filter that keeps only the selected sound",
+        )
+        .append_separator()
+        .append_item(
+            ID_LEARN_NOISE,
+            "&Learn noise from selection",
+            "Learn the background noise from the selection",
+        )
+        .append_item(
+            ID_FIND_SOUNDS,
+            "&Find sounds\tCtrl+F",
+            "Find the recording's sounds, in the selection if there is one",
+        )
+        .build();
     for pane in Pane::ALL {
         view_menu = view_menu.append_check_item(pane.menu_id(), pane.menu_label(), pane.menu_help());
     }
@@ -373,8 +410,10 @@ fn build_ui() -> Ui {
         MenuBar::builder()
             .append(file_menu, "&File")
             .append(view_menu.build(), "&View")
+            .append(filter_menu, "Fi&lter")
             .build(),
     );
+    let toolbar = toolbar::create(&frame);
     StatusBar::builder(&frame)
         .with_fields_count(3)
         .with_status_widths(vec![-1, 260, 220])
@@ -496,6 +535,7 @@ fn build_ui() -> Ui {
 
     Ui {
         frame,
+        toolbar,
         panes,
         canvas,
         overview,
@@ -640,6 +680,10 @@ fn bind_events(state: &Shared, ui: Ui) {
             }
             request_repaint();
         }
+        ID_ADD_SUPPRESS => add_filter_from_selection(&st, ui, FilterAction::Suppress),
+        ID_ADD_EXTRACT => add_filter_from_selection(&st, ui, FilterAction::Extract),
+        ID_LEARN_NOISE => learn_noise(&st, ui),
+        ID_FIND_SOUNDS => start_discovery(&mut st.borrow_mut(), ui),
         ID_QUIT => ui.frame.close(true),
         id => match Pane::for_menu_id(id) {
             Some(pane) => ui.panes.toggle(pane),
@@ -1163,6 +1207,11 @@ fn set_listen(s: &mut State, ui: Ui, mode: Listen) {
     if let Some(bar) = ui.frame.get_menu_bar() {
         for (l, id) in LISTEN_MENU {
             bar.check_item(id, l == mode);
+        }
+    }
+    if let Some(tb) = ui.toolbar {
+        for (l, id) in LISTEN_MENU {
+            tb.toggle_tool(id, l == mode);
         }
     }
     let pick = listen_pick(s.current_filter, s.project.preview.is_some());
