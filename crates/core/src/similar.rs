@@ -113,6 +113,10 @@ pub struct Template {
     /// band a pulsed sound occupies, used for the direction of its
     /// repetitions.
     band: Vec<f32>,
+    /// Noise power per bin of each channel around the marked sound, so
+    /// that the direction of a faint repetition is measured from what
+    /// stands above the noise (see [`Cells::noise`]). Empty when unknown.
+    pub channel_noise: Vec<Vec<f32>>,
 }
 
 /// One place where the template matched.
@@ -201,6 +205,7 @@ impl Template {
             max_delay_samples: 0.0,
             rhythm,
             band,
+            channel_noise: Vec::new(),
         })
     }
 
@@ -216,17 +221,33 @@ impl Template {
             frames: self.frames,
             k0: k0 as usize,
             weights: &self.members,
+            noise: self.channel_noise(),
         })
     }
 
     /// Measures where the marked sound came from, so repetitions can be
     /// checked for the same direction, searching delays up to
     /// ±`max_delay_samples`. Leaves `spatial` at `None` for mono recordings.
-    pub fn attach_spatial(&mut self, channels: &[Vec<f32>], stft: &Stft, max_delay_samples: f32) {
+    /// `channel_noise` is the noise power per bin of each channel (or empty
+    /// if unknown); it is kept for measuring repetitions the same way.
+    pub fn attach_spatial(
+        &mut self,
+        channels: &[Vec<f32>],
+        stft: &Stft,
+        max_delay_samples: f32,
+        channel_noise: Vec<Vec<f32>>,
+    ) {
         self.max_delay_samples = max_delay_samples;
+        self.channel_noise = channel_noise;
         self.spatial = self
             .cells(self.first_frame, 0)
             .and_then(|cells| measure(channels, stft, &cells, max_delay_samples));
+    }
+
+    /// [`Template::channel_noise`] as [`Cells::noise`]: `None` unless there
+    /// is one noise spectrum per channel.
+    fn channel_noise(&self) -> Option<&[Vec<f32>]> {
+        (self.channel_noise.len() >= 2).then_some(self.channel_noise.as_slice())
     }
 
     /// Normalised cross-correlation of the template with the patch of
@@ -474,6 +495,7 @@ fn find_rhythmic(
                     frames: n,
                     k0: template.k0,
                     weights: &weights,
+                    noise: template.channel_noise(),
                 };
                 let agree = measure(channels, stft, &cells, template.max_delay_samples).map_or(0.0, |sig| {
                     agreement(
@@ -839,7 +861,7 @@ mod tests {
             hop: 128,
         });
         let mut tpl = template(&mono, &stft, sr);
-        tpl.attach_spatial(&ch, &stft, 16.0);
+        tpl.attach_spatial(&ch, &stft, 16.0, Vec::new());
         let range = 0..stft.config().frame_count(mono.len()) as i64;
         let found = find_in_range(&tpl, &mono, &ch, &stft, range, &SimilarParams::default());
         assert_eq!(found.len(), 2, "{found:?}");
@@ -857,7 +879,7 @@ mod tests {
             hop: 128,
         });
         let mut tpl = template(&mono, &stft, sr);
-        tpl.attach_spatial(&ch, &stft, 16.0);
+        tpl.attach_spatial(&ch, &stft, 16.0, Vec::new());
         let sig = tpl.spatial.clone().expect("stereo signature");
         assert!((sig.pairs[0].level_db + 8.0).abs() < 1.0, "{sig:?}");
         assert!((sig.pairs[0].delay_samples - 3.0).abs() <= 0.5, "{sig:?}");

@@ -68,6 +68,15 @@ pub struct Cells<'a> {
     pub k0: usize,
     /// Membership weights, `frames × width`, frame-major.
     pub weights: &'a [f32],
+    /// Noise power per bin (all bins) of each channel, if known. A faint
+    /// sound's cells hold a good deal of background noise, which in a
+    /// diffuse field is about equally loud in every channel and has random
+    /// phase; it pulls the measured level difference towards 0 dB and
+    /// blurs the delay, so a quiet repetition from the same place looks as
+    /// if it came from elsewhere (issue #22). With the noise known, each
+    /// cell is weighted by how far it stands above the noise and the noise
+    /// power is taken out of the level sums (see [`PairSums::add_above_noise`]).
+    pub noise: Option<&'a [Vec<f32>]>,
 }
 
 /// Step of the delay search in samples.
@@ -98,15 +107,36 @@ impl PairSums {
     /// Adds one cell of bin index `i` with membership weight `w`, whose
     /// spectrum is `a` in the reference channel and `b` in the other one.
     pub fn add(&mut self, i: usize, w: f32, a: Complex32, b: Complex32) {
+        self.add_above_noise(i, w, a, b, (0.0, 0.0));
+    }
+
+    /// Like [`PairSums::add`] for a cell whose channels carry the noise
+    /// powers `(n_a, n_b)`.
+    ///
+    /// Noise adds its power to both channels on average, so subtracting it
+    /// from the level sums leaves the source's own level ratio. That is
+    /// only unbiased if the level weight does not depend on the cell's own
+    /// (noisy) power, so the level sums keep the plain membership weight
+    /// `w`. The delay votes are unit phasors, which noise does not bias but
+    /// scatters; there the weight is scaled by the cell's share above the
+    /// noise, `1 − (n_a + n_b) / (|a|² + |b|²)`, so noise-only cells
+    /// hardly vote.
+    pub fn add_above_noise(&mut self, i: usize, w: f32, a: Complex32, b: Complex32, (n_a, n_b): (f32, f32)) {
         if w <= 0.0 {
             return;
         }
-        self.e_ref[i] += (w * a.norm_sqr()) as f64;
-        self.e_other[i] += (w * b.norm_sqr()) as f64;
+        let (p_a, p_b) = (a.norm_sqr(), b.norm_sqr());
+        self.e_ref[i] += (w * (p_a - n_a)) as f64;
+        self.e_other[i] += (w * (p_b - n_b)) as f64;
+        let vote = if n_a + n_b > 0.0 {
+            w * (1.0 - (n_a + n_b) / (p_a + p_b).max(1e-30)).max(0.0)
+        } else {
+            w
+        };
         let cross = a * b.conj();
         let mag = cross.norm();
         if mag > 1e-20 {
-            self.votes[i] += cross * (w / mag);
+            self.votes[i] += cross * (vote / mag);
         }
     }
 }
@@ -122,12 +152,16 @@ fn pair_sums(channels: &[Vec<f32>], stft: &Stft, cells: &Cells) -> Vec<PairSums>
     let reference = &spectra[0];
     spectra[1..]
         .iter()
-        .map(|other| {
+        .enumerate()
+        .map(|(c, other)| {
+            // Index of this channel in `channels` (and in `cells.noise`).
+            let c = c + 1;
             let mut sums = PairSums::new(width);
             for t in 0..cells.frames {
                 for i in 0..width {
                     let k = cells.k0 + i;
-                    sums.add(i, cells.weights[t * width + i], reference[t][k], other[t][k]);
+                    let noise = cells.noise.map_or((0.0, 0.0), |n| (n[0][k], n[c][k]));
+                    sums.add_above_noise(i, cells.weights[t * width + i], reference[t][k], other[t][k], noise);
                 }
             }
             sums
@@ -349,13 +383,20 @@ pub fn per_bin_agreement(
 
 /// How well two signatures agree, 1 for identical, falling off like a
 /// Gaussian with the given tolerances (product over channel pairs).
+///
+/// A delay difference within what the two measurements can pin down
+/// (their [`PairCue::delay_uncertainty`], combined in quadrature) counts as
+/// none, as in [`per_bin_deviation`]: a faint or narrow-band sound leaves
+/// its delay open by several samples, and a delay picked anywhere on that
+/// plateau says nothing about a different place.
 pub fn agreement(a: &Signature, b: &Signature, level_tolerance_db: f32, delay_tolerance_samples: f32) -> f32 {
     a.pairs
         .iter()
         .zip(&b.pairs)
         .map(|(x, y)| {
             let dl = (x.level_db - y.level_db) / level_tolerance_db.max(1e-3);
-            let dd = (x.delay_samples - y.delay_samples) / delay_tolerance_samples.max(1e-3);
+            let open = x.delay_uncertainty.hypot(y.delay_uncertainty);
+            let dd = ((x.delay_samples - y.delay_samples).abs() - open).max(0.0) / delay_tolerance_samples.max(1e-3);
             (-0.5 * (dl * dl + dd * dd)).exp()
         })
         .product()
@@ -395,9 +436,63 @@ mod tests {
             first_frame: 10,
             frames: 20,
             k0: 2,
+            noise: None,
             weights: &weights,
         };
         measure(ch, &stft, &cells, 32.0).unwrap()
+    }
+
+    /// Issue #22: the same stereo source (−7 dB, 3 samples), once loud and
+    /// once 20 dB quieter in diffuse noise (independent, equally loud in
+    /// both channels). Without knowing the noise, the quiet one's level
+    /// difference is pulled towards 0 dB and it looks as if it came from
+    /// elsewhere; with the noise known it measures like the loud one.
+    #[test]
+    fn faint_source_in_diffuse_noise_keeps_its_direction() {
+        let stft = Stft::new(StftConfig {
+            fft_size: 512,
+            hop: 128,
+        });
+        let mut rng = 4242u64;
+        let mut white = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let noise: Vec<Vec<f32>> = (0..2).map(|_| (0..8000).map(|_| 0.2 * white()).collect()).collect();
+        let mix = |gain: f32| -> Vec<Vec<f32>> {
+            stereo(-7.0, 3)
+                .iter()
+                .zip(&noise)
+                .map(|(s, n)| s.iter().zip(n).map(|(s, n)| gain * s + n).collect())
+                .collect()
+        };
+        // Noise power per bin and channel, as a template would know it.
+        let noise_power: Vec<Vec<f32>> = noise
+            .iter()
+            .map(|ch| crate::noise::mean_power(&stft.analyze(ch, 0, 60).power(), 257))
+            .collect();
+        // The cells the source occupies (its partials reach bin ~42), as a
+        // template's membership would select them.
+        let weights = vec![1.0; 20 * 40];
+        let cells = |noise| Cells {
+            first_frame: 10,
+            frames: 20,
+            k0: 2,
+            noise,
+            weights: &weights,
+        };
+        let known = Some(noise_power.as_slice());
+        let loud = measure(&mix(1.0), &stft, &cells(known), 32.0).unwrap();
+        let faint_blind = measure(&mix(0.1), &stft, &cells(None), 32.0).unwrap();
+        let faint = measure(&mix(0.1), &stft, &cells(known), 32.0).unwrap();
+        assert!((loud.pairs[0].level_db + 7.0).abs() < 0.5, "{loud:?}");
+        // The noise does pull the blind measurement towards 0 dB ...
+        assert!(faint_blind.pairs[0].level_db > -5.5, "{faint_blind:?}");
+        // ... and knowing it undoes that.
+        assert!((faint.pairs[0].level_db + 7.0).abs() < 1.0, "{faint:?}");
+        let same = |s: &Signature| agreement(&loud, s, 3.0, 2.0);
+        assert!(same(&faint) > 0.9, "same place {}", same(&faint));
+        assert!(same(&faint) > same(&faint_blind) + 0.1);
     }
 
     #[test]
@@ -422,6 +517,7 @@ mod tests {
             first_frame: 0,
             frames: 1,
             k0: 0,
+            noise: None,
             weights: &weights,
         };
         assert!(measure(&[vec![0.0; 1000]], &stft, &cells, 8.0).is_none());
@@ -473,6 +569,7 @@ mod tests {
             first_frame: 10,
             frames: 20,
             k0: 2,
+            noise: None,
             weights: &weights,
         };
         let mean = |ch: &[Vec<f32>]| {
