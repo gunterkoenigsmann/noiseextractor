@@ -442,6 +442,42 @@ fn solo_and_without_split_the_recording_at_the_marked_tone() {
 }
 
 #[test]
+fn solo_of_two_filters_plays_both_sounds() {
+    // The tone's fundamental and its octave marked as two filters: each
+    // solo keeps one of them, "--solo 2,3" keeps both.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    let project = dir.path().join("p.json");
+    let audio = write_test_audio(&input);
+    for (i, freq) in ["550:780", "1200:1450"].into_iter().enumerate() {
+        let mut cmd = bin();
+        cmd.arg("mark").arg(&input).args(["--time", "1.1:1.9", "--freq", freq]);
+        if i > 0 {
+            cmd.arg("--project").arg(&project);
+        }
+        let out = cmd.arg("--save-project").arg(&project).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let p = Project::load(&project).unwrap();
+    assert_eq!(p.filters.len(), 3, "noise reduction + two marks");
+    let tone = 20000..28000;
+    let energy = |x: &[f32]| rms(&x[tone.clone()]).powi(2);
+    let low = process_with(&input, &project, &dir.path().join("low.wav"), &["--solo", "2"]);
+    let high = process_with(&input, &project, &dir.path().join("high.wav"), &["--solo", "3"]);
+    let both = process_with(&input, &project, &dir.path().join("both.wav"), &["--solo", "2,3"]);
+    // The two picks are heard together: their energies add up (they
+    // hardly overlap), and together they are the whole tone.
+    let input_energy = rms(&audio.channels[0][tone.clone()]).powi(2);
+    assert!(energy(&low) > 0.3 * input_energy && energy(&high) > 0.2 * input_energy);
+    let sum = energy(&low) + energy(&high);
+    assert!((energy(&both) - sum).abs() < 0.1 * sum, "{} vs {sum}", energy(&both));
+    assert!(energy(&both) > 0.9 * input_energy);
+    // Removing both leaves next to nothing of the tone.
+    let without = process_with(&input, &project, &dir.path().join("w.wav"), &["--without", "2,3"]);
+    assert!(energy(&without) < 0.01 * input_energy);
+}
+
+#[test]
 fn solo_of_a_missing_filter_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.wav");
