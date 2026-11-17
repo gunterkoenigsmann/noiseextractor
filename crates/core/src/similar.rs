@@ -473,9 +473,16 @@ fn find_rhythmic(
         .spatial
         .as_ref()
         .filter(|_| channels.len() >= 2 && params.spatial_weight > 0.0);
+    // A burst must last at least two windows (or half the marked sound,
+    // if that is shorter): a single window that happens to pulse is too
+    // little evidence, and such blips turned up in faint pulsing and right
+    // after loud bursts (issue #23). The length is decided from the whole
+    // burst, which the scan above always sees, so chunks agree.
+    let min_frames = (2 * w).min((template.frames as i64 / 2).max(w + 1));
     bursts
         .into_iter()
         .map(|(a, b, score)| (a, (b - a + w) as usize, score))
+        .filter(|&(_, frames, _)| frames as i64 >= min_frames)
         .filter(|&(a, frames, _)| a < range.end && a + frames as i64 > range.start)
         .filter_map(|(a, frames, score)| {
             let mut occ = Occurrence {
@@ -1019,6 +1026,31 @@ mod tests {
         assert!(found[2].template_frame(&tpl, late) < tpl.frames);
         // The marked burst only adds frames outside the marked part.
         assert!(!found[0].applies_to(&tpl, tpl.first_frame + 3));
+    }
+
+    /// Issue #23: a pulse train that fills only about one matching window
+    /// (three pulses in 0.5 s, alone in 3 s of noise appended to the scene)
+    /// is too little evidence and is not reported as a burst.
+    #[test]
+    fn a_blip_of_one_window_is_not_a_burst() {
+        let sr = 16000;
+        let mut x = insect_scene(sr);
+        let tail: Vec<f32> = x[(15 * sr) as usize..]
+            .iter()
+            .cycle()
+            .take(3 * sr as usize)
+            .copied()
+            .collect();
+        x.extend(tail);
+        pulse_burst(&mut x, sr, 17.0, 0.5, 6.0, 0.3, 6);
+        let stft = Stft::new(StftConfig::default());
+        let hop = stft.config().hop as f32;
+        let tpl = insect_template(&x, &stft, sr);
+        let total = stft.config().frame_count(x.len()) as i64;
+        let found = find_in_range(&tpl, &x, &[], &stft, 0..total, &SimilarParams::default());
+        let starts: Vec<f32> = found.iter().map(|o| o.frame as f32 * hop / sr as f32).collect();
+        assert_eq!(found.len(), 3, "starts {starts:?}");
+        assert!(starts.iter().all(|&s| s < 16.0), "starts {starts:?}");
     }
 
     #[test]
