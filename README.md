@@ -99,10 +99,12 @@ libraries.
 | Open a recording | File > Open audio (Ctrl+O), or pass it on the command line |
 | Mark a sound | Drag a rectangle in the spectrogram |
 | Turn it into a filter | *Suppress selection* or *Extract selection* |
+| Switch filters on / off | Click a filter's box, or press Space to switch all picked filters |
 | See what a filter does | Pick it in the filter list: its target is drawn (green / red / orange), for a noise reduction what it takes away (red); *Show in spectrogram* keeps it drawn when another filter is picked |
 | Tune what belongs to it and what counts as a repetition | Sliders in the *Detection settings* pane (they edit the fresh selection, or the selected sound filter; hover a slider for an explanation) |
 | Set the play head | Click |
 | Play / pause | Space (plays the selection if there is one), or Ctrl+P |
+| Hear only the marked sound / everything but it | View > *Hear the picked sound only* (Ctrl+2) / *Hear everything but the picked sound* (Ctrl+3); *Hear everything* (Ctrl+1) goes back. The sound is the selection being edited, else the filter(s) picked in the list (Ctrl/Shift+click picks several, which are then heard or removed together) (whether it suppresses or extracts, and even if it is switched off or a suggestion). Other sounds are suppressed in solo, so where they overlap only the picked sound's share is heard. Blue shows what you hear; export is not affected |
 | Scrub (hear the audio under the pointer) | Drag with the right mouse button |
 | Zoom time / scroll / zoom frequency | Wheel / Shift+wheel / Ctrl+wheel |
 | Jump elsewhere in a long recording | Drag the frame in the waveform overview, or click beside it |
@@ -124,6 +126,7 @@ noiseextractor-cli mark in.flac --time 12.3:13.1 --freq 2000:4500 --name blackbi
     --extract --project p.json --save-project p.json
 noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract --save-project p.json
 noiseextractor-cli process in.flac --project p.json -o out.wav
+noiseextractor-cli process in.flac --project p.json --solo 2,3 -o two-sounds.wav   # or --without 2,3
 noiseextractor-cli spectrogram in.flac --project p.json -o view.png --max-hz 10000
 ```
 

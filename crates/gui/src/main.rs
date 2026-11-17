@@ -27,6 +27,13 @@
 //! spectrogram" is off: what an event filter targets in green / red /
 //! orange, what a noise reduction takes away in red.
 //!
+//! View > Hear ... (Ctrl+1/2/3) chooses what is played and drawn in blue:
+//! everything, only the picked sound (the selection being edited, else the
+//! filters picked in the list; Ctrl/Shift+click picks several), or
+//! everything but it. The mode stays until
+//! changed and follows the pick; see `noiseextractor_core::listen`. Export
+//! always writes the project as set up, whatever is being heard.
+//!
 //! "Find sounds" looks for the recurring sounds the recording (or the
 //! selected stretch) is made of (see `noiseextractor_core::discover`) and
 //! adds them to the list as suggestions: switched off and hidden until
@@ -40,15 +47,18 @@
 #![warn(missing_docs, clippy::missing_docs_in_private_items)]
 
 mod detection;
+mod filter_list;
 mod log;
 mod overview;
 mod panes;
 mod player;
 mod recent;
 mod scrub;
+mod toolbar;
 mod view;
 
 use detection::{Group, Param};
+use filter_list::FilterList;
 use noiseextractor_core::analysis::{analyze_selection, AnalysisParams, RegionAnalysis, Selection};
 use noiseextractor_core::audio::WavStreamWriter;
 use noiseextractor_core::discover::{discover, DiscoverParams, Discovery};
@@ -58,7 +68,7 @@ use noiseextractor_core::noise::{mean_power, NoiseEstimate};
 use noiseextractor_core::render::render_rgb;
 use noiseextractor_core::similar::SimilarParams;
 use noiseextractor_core::stft::Stft;
-use noiseextractor_core::{AudioData, Engine, EngineConfig, Focus};
+use noiseextractor_core::{AudioData, Engine, EngineConfig, Focus, Listen, Pick};
 use overview::{Overview, Peaks};
 use panes::{Contents, Pane, Panes};
 use player::Player;
@@ -90,6 +100,28 @@ const ID_ZOOM_FIT: i32 = ID_HIGHEST + 6;
 const ID_LOG_FREQ: i32 = ID_HIGHEST + 7;
 /// File > Quit.
 const ID_QUIT: i32 = ID_HIGHEST + 8;
+/// View > Hear everything ([`Listen::All`]).
+const ID_HEAR_ALL: i32 = ID_HIGHEST + 9;
+/// View > Hear the picked sound only ([`Listen::Solo`]).
+const ID_HEAR_SOLO: i32 = ID_HIGHEST + 10;
+/// View > Hear everything but the picked sound ([`Listen::Without`]).
+const ID_HEAR_WITHOUT: i32 = ID_HIGHEST + 11;
+
+/// Filter > Suppress selection (also a button in the filter pane).
+const ID_ADD_SUPPRESS: i32 = ID_HIGHEST + 20;
+/// Filter > Extract selection (also a button in the filter pane).
+const ID_ADD_EXTRACT: i32 = ID_HIGHEST + 21;
+/// Filter > Learn noise from selection (also a button in the filter pane).
+const ID_LEARN_NOISE: i32 = ID_HIGHEST + 22;
+/// Filter > Find sounds (also a button in the filter pane).
+const ID_FIND_SOUNDS: i32 = ID_HIGHEST + 23;
+
+/// The listening modes with their menu ids, in menu order.
+const LISTEN_MENU: [(Listen, i32); 3] = [
+    (Listen::All, ID_HEAR_ALL),
+    (Listen::Solo, ID_HEAR_SOLO),
+    (Listen::Without, ID_HEAR_WITHOUT),
+];
 
 /// Supported input formats for the open dialog (from
 /// `noiseextractor_core::audio::FILE_TYPES`, which the packages' file
@@ -162,6 +194,10 @@ struct State {
     rx: Receiver<Background>,
     /// Index of the filter shown in the detail controls.
     current_filter: Option<usize>,
+    /// Rows picked in the filter list (several with Ctrl/Shift+click);
+    /// only meaningful while they include [`State::current_filter`], see
+    /// [`filter_list::effective_picks`].
+    picked: Vec<usize>,
     /// Engine revision at the last repaint.
     last_revision: u64,
     /// Play head (samples) when not playing.
@@ -170,6 +206,9 @@ struct State {
     filter_counter: usize,
     /// Status shown while something runs in the background.
     busy: Option<String>,
+    /// What is heard (and drawn in blue): everything, only the picked
+    /// sound, or everything but it (see [`listen_picks`]).
+    listen: Listen,
     /// File > Recent recordings, remembered between runs.
     recent_audio: RecentFiles,
     /// File > Recent projects, remembered between runs.
@@ -177,6 +216,21 @@ struct State {
 }
 
 impl State {
+    /// Shows filter `index` in the details and makes it the only pick
+    /// (used when the program, not a click in the list, moves the focus).
+    fn focus_filter(&mut self, index: Option<usize>) {
+        self.current_filter = index;
+        self.picked = index.into_iter().collect();
+    }
+
+    /// The filters the listening modes refer to (see [`listen_picks`]).
+    fn listen_picks(&self) -> Vec<Pick> {
+        listen_picks(
+            &filter_list::effective_picks(&self.picked, self.current_filter),
+            self.project.preview.is_some(),
+        )
+    }
+
     /// The recent-files list of `kind`.
     fn recent_mut(&mut self, kind: RecentKind) -> &mut RecentFiles {
         match kind {
@@ -211,6 +265,8 @@ const REANALYSE_DELAY: Duration = Duration::from_millis(200);
 struct Ui {
     /// Main window.
     frame: Frame,
+    /// The toolbar (`None` if it could not be created).
+    toolbar: Option<ToolBar>,
     /// The dockable panes.
     panes: Panes,
     /// Spectrogram drawing area.
@@ -221,8 +277,8 @@ struct Ui {
     detection_title: StaticText,
     /// One slider and value label per [`Param::ALL`] entry.
     detection: [(Slider, StaticText); Param::ALL.len()],
-    /// The filter list; checked = enabled.
-    filters: CheckListBox,
+    /// The filter list; ticked = enabled, several rows can be picked.
+    filters: FilterList,
     /// Name of the current filter.
     name: TextCtrl,
     /// Overlay visibility of the current filter.
@@ -301,10 +357,12 @@ fn main() {
             tx,
             rx,
             current_filter: Some(0),
+            picked: vec![0],
             last_revision: 0,
             playhead: 0,
             filter_counter: 1,
             busy: None,
+            listen: Listen::All,
             recent_audio: recent::load(RecentKind::Audio),
             recent_projects: recent::load(RecentKind::Project),
         }));
@@ -366,6 +424,22 @@ fn build_ui() -> Ui {
             "&Play / pause\tCtrl+P",
             "Play the selection or from the play head",
         )
+        .append_radio_item(
+            ID_HEAR_ALL,
+            "Hear &everything\tCtrl+1",
+            "Play the output of all enabled filters",
+        )
+        .append_radio_item(
+            ID_HEAR_SOLO,
+            "Hear the picked sound &only\tCtrl+2",
+            "Play only the sound of the selection or of the filter picked in the list",
+        )
+        .append_radio_item(
+            ID_HEAR_WITHOUT,
+            "Hear everything &but the picked sound\tCtrl+3",
+            "Play the output with the sound of the selection or of the picked filter removed",
+        )
+        .append_separator()
         .append_item(ID_ZOOM_FIT, "Show &whole recording\tCtrl+0", "Zoom out completely")
         .append_item(
             ID_LOG_FREQ,
@@ -373,6 +447,31 @@ fn build_ui() -> Ui {
             "Toggle linear / logarithmic frequency axis",
         )
         .append_separator();
+    // The filter pane's most used buttons, as menu commands so the toolbar
+    // and keyboard can reach them too.
+    let filter_menu = Menu::builder()
+        .append_item(
+            ID_ADD_SUPPRESS,
+            "&Suppress selection",
+            "Add a filter that suppresses the selected sound",
+        )
+        .append_item(
+            ID_ADD_EXTRACT,
+            "E&xtract selection",
+            "Add a filter that keeps only the selected sound",
+        )
+        .append_separator()
+        .append_item(
+            ID_LEARN_NOISE,
+            "&Learn noise from selection",
+            "Learn the background noise from the selection",
+        )
+        .append_item(
+            ID_FIND_SOUNDS,
+            "&Find sounds\tCtrl+F",
+            "Find the recording's sounds, in the selection if there is one",
+        )
+        .build();
     for pane in Pane::ALL {
         view_menu = view_menu.append_check_item(pane.menu_id(), pane.menu_label(), pane.menu_help());
     }
@@ -380,8 +479,10 @@ fn build_ui() -> Ui {
         MenuBar::builder()
             .append(file_menu, "&File")
             .append(view_menu.build(), "&View")
+            .append(filter_menu, "Fi&lter")
             .build(),
     );
+    let toolbar = toolbar::create(&frame);
     StatusBar::builder(&frame)
         .with_fields_count(3)
         .with_status_widths(vec![-1, 260, 220])
@@ -397,8 +498,8 @@ fn build_ui() -> Ui {
     // Scrolled, so the docked pane works at any height.
     let side = ScrolledWindow::builder(&frame).build();
     side.set_scroll_rate(0, 10);
-    let filters = CheckListBox::builder(&side).with_size(Size::new(280, 140)).build();
-    filters.set_min_size(Size::new(200, 90));
+    let filters = FilterList::new(&side, Size::new(280, 140));
+    filters.ctrl().set_min_size(Size::new(200, 90));
     let add_suppress = Button::builder(&side).with_label("Suppress selection").build();
     let add_extract = Button::builder(&side).with_label("Extract selection").build();
     let delete = Button::builder(&side).with_label("Delete").build();
@@ -438,13 +539,23 @@ fn build_ui() -> Ui {
     let split = Button::builder(&side).with_label("Split").build();
     let discard = Button::builder(&side).with_label("Discard suggestions").build();
     let legend = StaticText::builder(&side)
-        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere,\n  or a found sound you picked\nOrange: both\n\nDrag to select, click to set play head,\nright-drag to scrub, wheel zooms\n(Shift scrolls, Ctrl: frequency), Space plays.")
+        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere,\n  or a found sound you picked\nOrange: both\n\nDrag to select, click to set play head,\nright-drag to scrub, wheel zooms\n(Shift scrolls, Ctrl: frequency), Space plays,\nCtrl+2 / Ctrl+3: hear the picked sound\nalone / removed, Ctrl+1: everything.")
         .build();
 
     let s = BoxSizer::builder(Orientation::Vertical).build();
     let label = |text: &str| StaticText::builder(&side).with_label(text).build();
-    s.add(&label("Filters (checked = active)"), 0, SizerFlag::All, 4);
-    s.add(&filters, 1, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 4);
+    s.add(
+        &label("Filters (ticked = active, Space switches;\nCtrl/Shift+click picks several)"),
+        0,
+        SizerFlag::All,
+        4,
+    );
+    s.add(
+        &filters.ctrl(),
+        1,
+        SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right,
+        4,
+    );
     let row1 = BoxSizer::builder(Orientation::Horizontal).build();
     row1.add(&add_suppress, 1, SizerFlag::All, 2);
     row1.add(&add_extract, 1, SizerFlag::All, 2);
@@ -503,6 +614,7 @@ fn build_ui() -> Ui {
 
     Ui {
         frame,
+        toolbar,
         panes,
         canvas,
         overview,
@@ -623,6 +735,13 @@ fn bind_events(state: &Shared, ui: Ui) {
             }
         }
         ID_PLAY => toggle_play(&mut st.borrow_mut()),
+        id if LISTEN_MENU.iter().any(|&(_, m)| m == id) => {
+            let mode = LISTEN_MENU
+                .iter()
+                .find(|&&(_, m)| m == id)
+                .map_or(Listen::All, |&(l, _)| l);
+            set_listen(&mut st.borrow_mut(), ui, mode);
+        }
         ID_ZOOM_FIT => {
             let mut s = st.borrow_mut();
             let width = canvas_size(ui).0;
@@ -641,6 +760,10 @@ fn bind_events(state: &Shared, ui: Ui) {
             }
             request_repaint();
         }
+        ID_ADD_SUPPRESS => add_filter_from_selection(&st, ui, FilterAction::Suppress),
+        ID_ADD_EXTRACT => add_filter_from_selection(&st, ui, FilterAction::Extract),
+        ID_LEARN_NOISE => learn_noise(&st, ui),
+        ID_FIND_SOUNDS => start_discovery(&mut st.borrow_mut(), ui),
         ID_QUIT => ui.frame.close(true),
         id => {
             if let Some(cmd) = RecentCommand::for_menu_id(id) {
@@ -829,25 +952,40 @@ fn bind_events(state: &Shared, ui: Ui) {
 
     // --- filter list and details ---
     let st = state.clone();
-    ui.filters.on_selected(move |e| {
-        if let Some(i) = e.get_selection() {
-            let mut s = st.borrow_mut();
-            s.current_filter = Some(i as usize);
-            // Picking a filter means looking at it: a selection that was not
-            // turned into a filter is dropped, and the picked filter is drawn
-            // (see `push_project`).
-            s.project.preview = None;
-            push_project(&s);
-            refresh_details(&s, ui);
-            refresh_detection(&s, ui);
+    ui.filters.on_pick(move |picked, clicked| {
+        // Rebuilding the list selects rows, too; those events arrive while
+        // the state is borrowed and are not the user's.
+        let Ok(mut s) = st.try_borrow_mut() else { return };
+        match clicked {
+            Some(row) => {
+                s.current_filter = Some(row);
+                // Picking a filter means looking at it: a selection that
+                // was not turned into a filter is dropped, and the picked
+                // filter is drawn (see `push_project`).
+                s.project.preview = None;
+            }
+            // A row was deselected: keep the details on a picked row.
+            None if !s.current_filter.is_some_and(|c| picked.contains(&c)) => {
+                if let Some(&last) = picked.last() {
+                    s.current_filter = Some(last);
+                }
+            }
+            None => {}
         }
+        s.picked = picked;
+        push_project(&s);
+        refresh_details(&s, ui);
+        refresh_detection(&s, ui);
     });
     let st = state.clone();
-    ui.filters.on_toggled(move |e| {
-        let Some(i) = e.get_selection() else { return };
-        let mut s = st.borrow_mut();
-        if let Some(f) = s.project.filters.get_mut(i as usize) {
-            f.enabled = ui.filters.is_checked(i);
+    ui.filters.on_toggle(move |rows| {
+        let Ok(mut s) = st.try_borrow_mut() else { return };
+        let rows: Vec<usize> = rows.into_iter().filter(|&i| i < s.project.filters.len()).collect();
+        let states: Vec<bool> = rows.iter().map(|&i| s.project.filters[i].enabled).collect();
+        let on = filter_list::toggled_state(&states);
+        for &i in &rows {
+            s.project.filters[i].enabled = on;
+            ui.filters.set_enabled(i, on);
         }
         push_project(&s);
     });
@@ -912,11 +1050,12 @@ fn bind_events(state: &Shared, ui: Ui) {
         };
         s.project.filters.remove(i);
         s.project.prune_decompositions();
-        s.current_filter = if s.project.filters.is_empty() {
+        let next = if s.project.filters.is_empty() {
             None
         } else {
             Some(i.min(s.project.filters.len() - 1))
         };
+        s.focus_filter(next);
         push_project(&s);
         refresh_filter_list(&s, ui);
     });
@@ -955,10 +1094,11 @@ fn bind_events(state: &Shared, ui: Ui) {
         let mut s = st.borrow_mut();
         let n = s.project.discard_suggestions();
         let len = s.project.filters.len();
-        s.current_filter = s
+        let next = s
             .current_filter
             .filter(|_| len > 0)
             .map(|i| i.min(len.saturating_sub(1)));
+        s.focus_filter(next);
         push_project(&s);
         refresh_filter_list(&s, ui);
         report(ui, &format!("Discarded {n} suggestion(s)"));
@@ -1113,7 +1253,7 @@ fn open_project(st: &Shared, ui: Ui, path: &Path) {
     let mut s = st.borrow_mut();
     s.remember(ui, RecentKind::Project, path);
     s.project_path = Some(path.to_path_buf());
-    s.current_filter = if project.filters.is_empty() { None } else { Some(0) };
+    s.focus_filter(if project.filters.is_empty() { None } else { Some(0) });
     if let Some(doc) = &s.doc {
         project.prepare(&doc.audio);
         if project.stft != doc.engine.project().stft {
@@ -1178,12 +1318,59 @@ fn run_recent(st: &Shared, ui: Ui, cmd: RecentCommand) {
 /// background (nearest to the focus first). The filter picked in the list
 /// is drawn as if it were visible, so picking it shows what it does; while
 /// a fresh selection is being edited, only that is highlighted.
+///
+/// In the solo and "without" listening modes the engine gets the project
+/// derived for that mode instead ([`Project::for_listening`]), so what is
+/// played and drawn in blue is the picked sound alone or the rest.
 fn push_project(s: &State) {
     if let Some(doc) = &s.doc {
-        let mut project = s.project.clone();
-        project.highlight = highlighted_filter(s.current_filter, project.preview.is_some());
+        let mut project = s.project.for_listening(s.listen, &s.listen_picks());
+        project.highlight = highlighted_filter(s.current_filter, s.project.preview.is_some());
         doc.engine.set_project(project);
     }
+}
+
+/// The sounds the solo and "without" listening modes refer to: the
+/// selection being edited if there is one (it is what the user just
+/// marked), else the filters `picked` in the list.
+fn listen_picks(picked: &[usize], editing_selection: bool) -> Vec<Pick> {
+    if editing_selection {
+        vec![Pick::Preview]
+    } else {
+        picked.iter().map(|&i| Pick::Filter(i)).collect()
+    }
+}
+
+/// Switches the listening mode, keeps the View menu's radio items in
+/// step (the mode may also be chosen elsewhere, e.g. a toolbar) and
+/// reprocesses; playback goes on and is heard in the new mode as soon as
+/// the chunks around the play head are done.
+fn set_listen(s: &mut State, ui: Ui, mode: Listen) {
+    s.listen = mode;
+    if let Some(bar) = ui.frame.get_menu_bar() {
+        for (l, id) in LISTEN_MENU {
+            bar.check_item(id, l == mode);
+        }
+    }
+    if let Some(tb) = ui.toolbar {
+        for (l, id) in LISTEN_MENU {
+            tb.toggle_tool(id, l == mode);
+        }
+    }
+    let n = s.listen_picks().len();
+    let what = match (mode, n) {
+        (Listen::All, _) => "Hearing everything".to_string(),
+        (_, 0) => "Mark a sound or pick filters to hear them alone or without them".to_string(),
+        (Listen::Solo, n) => format!(
+            "Hearing only the {n} picked sound(s) (follows the selection, or the filters picked with Ctrl/Shift+click)"
+        ),
+        (Listen::Without, n) => format!(
+            "Hearing everything but the {n} picked sound(s) (follows the selection, or the filters picked with \
+             Ctrl/Shift+click)"
+        ),
+    };
+    report(ui, &what);
+    push_project(s);
 }
 
 /// The filter whose overlay is drawn although it may not be marked visible
@@ -1387,7 +1574,8 @@ fn add_filter_from_selection(st: &Shared, ui: Ui, action: FilterAction) {
         action,
         ..preview
     });
-    s.current_filter = Some(s.project.filters.len() - 1);
+    let last = s.project.filters.len() - 1;
+    s.focus_filter(Some(last));
     s.selection = None;
     push_project(&s);
     refresh_filter_list(&s, ui);
@@ -1460,7 +1648,7 @@ fn merge_dialog(st: &Shared, ui: Ui) {
     let mut s = st.borrow_mut();
     match s.project.merge(current, from) {
         Ok(i) => {
-            s.current_filter = Some(i);
+            s.focus_filter(Some(i));
             report(ui, "Merged");
         }
         Err(e) => report(ui, &format!("{e:#}")),
@@ -1478,7 +1666,7 @@ fn move_filter(st: &Shared, ui: Ui, delta: i32) {
         return;
     }
     s.project.filters.swap(i, j as usize);
-    s.current_filter = Some(j as usize);
+    s.focus_filter(Some(j as usize));
     push_project(&s);
     refresh_filter_list(&s, ui);
 }
@@ -1519,7 +1707,7 @@ fn learn_noise(st: &Shared, ui: Ui) {
     if let FilterKind::NoiseReduction(nr) = &mut s.project.filters[i].kind {
         nr.estimate = NoiseEstimate::Profile(profile);
     }
-    s.current_filter = Some(i);
+    s.focus_filter(Some(i));
     push_project(&s);
     refresh_filter_list(&s, ui);
     report(ui, "Noise profile learned from the selection");
@@ -1608,7 +1796,7 @@ fn tick(s: &mut State, ui: Ui) {
                         let (patterns, frames) = (found.decomposition.patterns.len(), found.frames_used);
                         let sounds = found.groups.len();
                         let first = s.project.add_discovery(found);
-                        s.current_filter = Some(first);
+                        s.focus_filter(Some(first));
                         push_project(s);
                         refresh_filter_list(s, ui);
                         report(
@@ -1754,23 +1942,25 @@ fn paint(s: &State, dc: &AutoBufferedPaintDC) {
 
 /// Rebuilds the filter list from the project and updates the details.
 fn refresh_filter_list(s: &State, ui: Ui) {
-    ui.filters.clear();
-    for (i, f) in s.project.filters.iter().enumerate() {
-        let kind = match (&f.kind, f.action) {
-            (FilterKind::NoiseReduction(_), FilterAction::Suppress) => "denoise",
-            (FilterKind::NoiseReduction(_), FilterAction::Extract) => "keep noise",
-            (FilterKind::Event(_), FilterAction::Suppress) => "suppress",
-            (FilterKind::Event(_), FilterAction::Extract) => "extract",
-            (FilterKind::Discovered(_), FilterAction::Suppress) => "found, suppress",
-            (FilterKind::Discovered(_), FilterAction::Extract) => "found, extract",
-        };
-        let note = if f.suggested { " (suggested)" } else { "" };
-        ui.filters.append(&format!("{} [{kind}]{note}", f.name));
-        ui.filters.check(i as u32, f.enabled);
-    }
-    if let Some(i) = s.current_filter.filter(|&i| i < s.project.filters.len()) {
-        ui.filters.set_selection(i as u32, true);
-    }
+    let rows: Vec<(String, bool)> = s
+        .project
+        .filters
+        .iter()
+        .map(|f| {
+            let kind = match (&f.kind, f.action) {
+                (FilterKind::NoiseReduction(_), FilterAction::Suppress) => "denoise",
+                (FilterKind::NoiseReduction(_), FilterAction::Extract) => "keep noise",
+                (FilterKind::Event(_), FilterAction::Suppress) => "suppress",
+                (FilterKind::Event(_), FilterAction::Extract) => "extract",
+                (FilterKind::Discovered(_), FilterAction::Suppress) => "found, suppress",
+                (FilterKind::Discovered(_), FilterAction::Extract) => "found, extract",
+            };
+            let note = if f.suggested { " (suggested)" } else { "" };
+            (format!("{} [{kind}]{note}", f.name), f.enabled)
+        })
+        .collect();
+    let picked = filter_list::effective_picks(&s.picked, s.current_filter);
+    ui.filters.set_rows(&rows, &picked, s.current_filter);
     refresh_details(s, ui);
 }
 
@@ -1922,6 +2112,32 @@ mod resources;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_selection_being_edited_is_heard_before_the_picked_filters() {
+        assert_eq!(listen_picks(&[2, 4], true), vec![Pick::Preview]);
+        assert_eq!(listen_picks(&[2, 4], false), vec![Pick::Filter(2), Pick::Filter(4)]);
+        assert!(listen_picks(&[], false).is_empty());
+        assert_eq!(listen_picks(&[], true), vec![Pick::Preview]);
+    }
+
+    #[test]
+    fn listening_modes_have_distinct_menu_ids() {
+        for (i, (_, a)) in LISTEN_MENU.iter().enumerate() {
+            assert!(LISTEN_MENU[i + 1..].iter().all(|(_, b)| a != b));
+            assert!(![
+                ID_OPEN_AUDIO,
+                ID_OPEN_PROJECT,
+                ID_SAVE_PROJECT,
+                ID_EXPORT,
+                ID_PLAY,
+                ID_ZOOM_FIT,
+                ID_LOG_FREQ,
+                ID_QUIT
+            ]
+            .contains(a));
+        }
+    }
 
     #[test]
     fn the_picked_filter_is_highlighted_unless_a_selection_is_edited() {

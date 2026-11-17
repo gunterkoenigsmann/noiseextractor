@@ -383,3 +383,117 @@ fn discovered_sound_can_be_extracted() {
     let (w0, w1) = range(1.2, 1.6);
     assert!(rms(&b[w0..w1]) < 0.2 * rms(&a[w0..w1]), "whistle kept");
 }
+
+/// Runs `process` with extra arguments and returns the first channel.
+fn process_with(input: &Path, project: &Path, output: &Path, extra: &[&str]) -> Vec<f32> {
+    let out = bin()
+        .arg("process")
+        .arg(input)
+        .arg("--project")
+        .arg(project)
+        .arg("-o")
+        .arg(output)
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    AudioData::load(output).unwrap().channels.remove(0)
+}
+
+#[test]
+fn solo_and_without_split_the_recording_at_the_marked_tone() {
+    // The tone is marked as a sound to *suppress*; solo plays it anyway,
+    // "without" plays the rest. Noise reduction is off so that the two
+    // add up (in power) to the recording.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    let project = dir.path().join("p.json");
+    let audio = write_test_audio(&input);
+    let st = bin()
+        .arg("mark")
+        .arg(&input)
+        .args(["--time", "1.1:1.9", "--freq", "550:780", "--save-project"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+    let mut p = Project::load(&project).unwrap();
+    p.filters[0].enabled = false;
+    p.save(&project).unwrap();
+
+    let solo = process_with(&input, &project, &dir.path().join("solo.wav"), &["--solo", "2"]);
+    let without = process_with(&input, &project, &dir.path().join("without.wav"), &["--without", "2"]);
+    let a = &audio.channels[0];
+    let (tone, noise) = (20000..28000, 3000..12000);
+    // The filter suppresses already, so "without" is the plain output.
+    let plain = process_with(&input, &project, &dir.path().join("plain.wav"), &[]);
+    assert!(without.iter().zip(&plain).all(|(x, y)| (x - y).abs() < 1e-6));
+    // Solo: the tone, and nothing before it.
+    assert!(rms(&solo[tone.clone()]) > 0.85 * rms(&a[tone.clone()]));
+    assert!(rms(&solo[noise.clone()]) < 0.05 * rms(&a[noise.clone()]));
+    // Without: the noise before the tone untouched, the fundamental gone
+    // (its octave is only partly found by the analysis, issue filed).
+    assert!(rms(&without[noise.clone()]) > 0.95 * rms(&a[noise]));
+    assert!(rms(&without[tone.clone()]) < 0.5 * rms(&a[tone.clone()]));
+    // Together (in power) they are the recording.
+    let sum = (rms(&solo[tone.clone()]).powi(2) + rms(&without[tone.clone()]).powi(2)).sqrt();
+    let ratio = sum / rms(&a[tone]);
+    assert!((0.9..1.1).contains(&ratio), "solo + without = {ratio} x the recording");
+}
+
+#[test]
+fn solo_of_two_filters_plays_both_sounds() {
+    // The tone's fundamental and its octave marked as two filters: each
+    // solo keeps one of them, "--solo 2,3" keeps both.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    let project = dir.path().join("p.json");
+    let audio = write_test_audio(&input);
+    for (i, freq) in ["550:780", "1200:1450"].into_iter().enumerate() {
+        let mut cmd = bin();
+        cmd.arg("mark").arg(&input).args(["--time", "1.1:1.9", "--freq", freq]);
+        if i > 0 {
+            cmd.arg("--project").arg(&project);
+        }
+        let out = cmd.arg("--save-project").arg(&project).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let p = Project::load(&project).unwrap();
+    assert_eq!(p.filters.len(), 3, "noise reduction + two marks");
+    let tone = 20000..28000;
+    let energy = |x: &[f32]| rms(&x[tone.clone()]).powi(2);
+    let low = process_with(&input, &project, &dir.path().join("low.wav"), &["--solo", "2"]);
+    let high = process_with(&input, &project, &dir.path().join("high.wav"), &["--solo", "3"]);
+    let both = process_with(&input, &project, &dir.path().join("both.wav"), &["--solo", "2,3"]);
+    // The two picks are heard together: their energies add up (they
+    // hardly overlap), and together they are the whole tone.
+    let input_energy = rms(&audio.channels[0][tone.clone()]).powi(2);
+    assert!(energy(&low) > 0.3 * input_energy && energy(&high) > 0.2 * input_energy);
+    let sum = energy(&low) + energy(&high);
+    assert!((energy(&both) - sum).abs() < 0.1 * sum, "{} vs {sum}", energy(&both));
+    assert!(energy(&both) > 0.9 * input_energy);
+    // Removing both leaves next to nothing of the tone.
+    let without = process_with(&input, &project, &dir.path().join("w.wav"), &["--without", "2,3"]);
+    assert!(energy(&without) < 0.01 * input_energy);
+}
+
+#[test]
+fn solo_of_a_missing_filter_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    write_test_audio(&input);
+    let proj = dir.path().join("p.json");
+    assert!(bin().arg("new-project").arg(&proj).status().unwrap().success());
+    let out = bin()
+        .arg("process")
+        .arg(&input)
+        .arg("--project")
+        .arg(&proj)
+        .arg("-o")
+        .arg(dir.path().join("out.wav"))
+        .args(["--solo", "2"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no filter 2"));
+}
