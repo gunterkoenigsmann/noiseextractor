@@ -27,6 +27,12 @@
 //! spectrogram" is off: what an event filter targets in green / red /
 //! orange, what a noise reduction takes away in red.
 //!
+//! View > Hear ... (Ctrl+1/2/3) chooses what is played and drawn in blue:
+//! everything, only the picked sound (the selection being edited, else the
+//! filter picked in the list), or everything but it. The mode stays until
+//! changed and follows the pick; see `noiseextractor_core::listen`. Export
+//! always writes the project as set up, whatever is being heard.
+//!
 //! "Find sounds" looks for the recurring sounds the recording (or the
 //! selected stretch) is made of (see `noiseextractor_core::discover`) and
 //! adds them to the list as suggestions: switched off and hidden until
@@ -57,7 +63,7 @@ use noiseextractor_core::noise::{mean_power, NoiseEstimate};
 use noiseextractor_core::render::render_rgb;
 use noiseextractor_core::similar::SimilarParams;
 use noiseextractor_core::stft::Stft;
-use noiseextractor_core::{AudioData, Engine, EngineConfig, Focus};
+use noiseextractor_core::{AudioData, Engine, EngineConfig, Focus, Listen, Pick};
 use overview::{Overview, Peaks};
 use panes::{Contents, Pane, Panes};
 use player::Player;
@@ -88,6 +94,19 @@ const ID_ZOOM_FIT: i32 = ID_HIGHEST + 6;
 const ID_LOG_FREQ: i32 = ID_HIGHEST + 7;
 /// File > Quit.
 const ID_QUIT: i32 = ID_HIGHEST + 8;
+/// View > Hear everything ([`Listen::All`]).
+const ID_HEAR_ALL: i32 = ID_HIGHEST + 9;
+/// View > Hear the picked sound only ([`Listen::Solo`]).
+const ID_HEAR_SOLO: i32 = ID_HIGHEST + 10;
+/// View > Hear everything but the picked sound ([`Listen::Without`]).
+const ID_HEAR_WITHOUT: i32 = ID_HIGHEST + 11;
+
+/// The listening modes with their menu ids, in menu order.
+const LISTEN_MENU: [(Listen, i32); 3] = [
+    (Listen::All, ID_HEAR_ALL),
+    (Listen::Solo, ID_HEAR_SOLO),
+    (Listen::Without, ID_HEAR_WITHOUT),
+];
 
 /// Supported input formats for the open dialog (from
 /// `noiseextractor_core::audio::FILE_TYPES`, which the packages' file
@@ -168,6 +187,9 @@ struct State {
     filter_counter: usize,
     /// Status shown while something runs in the background.
     busy: Option<String>,
+    /// What is heard (and drawn in blue): everything, only the picked
+    /// sound, or everything but it (see [`listen_pick`]).
+    listen: Listen,
 }
 
 /// A scrub: dragging with the right button plays short pieces of audio at
@@ -281,6 +303,7 @@ fn main() {
             playhead: 0,
             filter_counter: 1,
             busy: None,
+            listen: Listen::All,
         }));
         let ui = build_ui();
         bind_events(&state, ui);
@@ -320,6 +343,22 @@ fn build_ui() -> Ui {
             "&Play / pause\tCtrl+P",
             "Play the selection or from the play head",
         )
+        .append_radio_item(
+            ID_HEAR_ALL,
+            "Hear &everything\tCtrl+1",
+            "Play the output of all enabled filters",
+        )
+        .append_radio_item(
+            ID_HEAR_SOLO,
+            "Hear the picked sound &only\tCtrl+2",
+            "Play only the sound of the selection or of the filter picked in the list",
+        )
+        .append_radio_item(
+            ID_HEAR_WITHOUT,
+            "Hear everything &but the picked sound\tCtrl+3",
+            "Play the output with the sound of the selection or of the picked filter removed",
+        )
+        .append_separator()
         .append_item(ID_ZOOM_FIT, "Show &whole recording\tCtrl+0", "Zoom out completely")
         .append_item(
             ID_LOG_FREQ,
@@ -392,7 +431,7 @@ fn build_ui() -> Ui {
     let split = Button::builder(&side).with_label("Split").build();
     let discard = Button::builder(&side).with_label("Discard suggestions").build();
     let legend = StaticText::builder(&side)
-        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere,\n  or a found sound you picked\nOrange: both\n\nDrag to select, click to set play head,\nright-drag to scrub, wheel zooms\n(Shift scrolls, Ctrl: frequency), Space plays.")
+        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere,\n  or a found sound you picked\nOrange: both\n\nDrag to select, click to set play head,\nright-drag to scrub, wheel zooms\n(Shift scrolls, Ctrl: frequency), Space plays,\nCtrl+2 / Ctrl+3: hear the picked sound\nalone / removed, Ctrl+1: everything.")
         .build();
 
     let s = BoxSizer::builder(Orientation::Vertical).build();
@@ -576,6 +615,13 @@ fn bind_events(state: &Shared, ui: Ui) {
             }
         }
         ID_PLAY => toggle_play(&mut st.borrow_mut()),
+        id if LISTEN_MENU.iter().any(|&(_, m)| m == id) => {
+            let mode = LISTEN_MENU
+                .iter()
+                .find(|&&(_, m)| m == id)
+                .map_or(Listen::All, |&(l, _)| l);
+            set_listen(&mut st.borrow_mut(), ui, mode);
+        }
         ID_ZOOM_FIT => {
             let mut s = st.borrow_mut();
             let width = canvas_size(ui).0;
@@ -1084,12 +1130,54 @@ fn open_project(st: &Shared, ui: Ui, path: &Path) {
 /// background (nearest to the focus first). The filter picked in the list
 /// is drawn as if it were visible, so picking it shows what it does; while
 /// a fresh selection is being edited, only that is highlighted.
+///
+/// In the solo and "without" listening modes the engine gets the project
+/// derived for that mode instead ([`Project::for_listening`]), so what is
+/// played and drawn in blue is the picked sound alone or the rest.
 fn push_project(s: &State) {
     if let Some(doc) = &s.doc {
-        let mut project = s.project.clone();
-        project.highlight = highlighted_filter(s.current_filter, project.preview.is_some());
+        let pick = listen_pick(s.current_filter, s.project.preview.is_some());
+        let mut project = s.project.for_listening(s.listen, pick);
+        project.highlight = highlighted_filter(s.current_filter, s.project.preview.is_some());
         doc.engine.set_project(project);
     }
+}
+
+/// The sound the solo and "without" listening modes refer to: the
+/// selection being edited if there is one (it is what the user just
+/// marked), else the filter picked in the list.
+fn listen_pick(current: Option<usize>, editing_selection: bool) -> Option<Pick> {
+    if editing_selection {
+        Some(Pick::Preview)
+    } else {
+        current.map(Pick::Filter)
+    }
+}
+
+/// Switches the listening mode, keeps the View menu's radio items in
+/// step (the mode may also be chosen elsewhere, e.g. a toolbar) and
+/// reprocesses; playback goes on and is heard in the new mode as soon as
+/// the chunks around the play head are done.
+fn set_listen(s: &mut State, ui: Ui, mode: Listen) {
+    s.listen = mode;
+    if let Some(bar) = ui.frame.get_menu_bar() {
+        for (l, id) in LISTEN_MENU {
+            bar.check_item(id, l == mode);
+        }
+    }
+    let pick = listen_pick(s.current_filter, s.project.preview.is_some());
+    let what = match (mode, pick) {
+        (Listen::All, _) => "Hearing everything".to_string(),
+        (_, None) => "Mark a sound or pick a filter to hear it alone or without it".to_string(),
+        (Listen::Solo, Some(_)) => {
+            "Hearing only the picked sound (follows the selection or the picked filter)".to_string()
+        }
+        (Listen::Without, Some(_)) => {
+            "Hearing everything but the picked sound (follows the selection or the picked filter)".to_string()
+        }
+    };
+    report(ui, &what);
+    push_project(s);
 }
 
 /// The filter whose overlay is drawn although it may not be marked visible
@@ -1827,6 +1915,32 @@ mod resources;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_selection_being_edited_is_heard_before_the_picked_filter() {
+        assert_eq!(listen_pick(Some(2), true), Some(Pick::Preview));
+        assert_eq!(listen_pick(Some(2), false), Some(Pick::Filter(2)));
+        assert_eq!(listen_pick(None, false), None);
+        assert_eq!(listen_pick(None, true), Some(Pick::Preview));
+    }
+
+    #[test]
+    fn listening_modes_have_distinct_menu_ids() {
+        for (i, (_, a)) in LISTEN_MENU.iter().enumerate() {
+            assert!(LISTEN_MENU[i + 1..].iter().all(|(_, b)| a != b));
+            assert!(![
+                ID_OPEN_AUDIO,
+                ID_OPEN_PROJECT,
+                ID_SAVE_PROJECT,
+                ID_EXPORT,
+                ID_PLAY,
+                ID_ZOOM_FIT,
+                ID_LOG_FREQ,
+                ID_QUIT
+            ]
+            .contains(a));
+        }
+    }
 
     #[test]
     fn the_picked_filter_is_highlighted_unless_a_selection_is_edited() {
