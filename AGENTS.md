@@ -25,7 +25,9 @@
 * `crates/gui`: wxDragon front end with AUI panes (`panes.rs`). The view
   models are pure and unit-tested (`view.rs`, `overview.rs`, `scrub.rs`,
   `detection.rs`, the `Log` in `log.rs`, `Declick` in `player.rs`); keep
-  logic out of event handlers where possible. Status messages go through
+  logic out of event handlers where possible. The toolbar (`toolbar.rs`) only re-sends
+  menu command ids, so give a new toolbar button a menu item first; its
+  icons are inline SVGs with a light and a dark palette. Status messages go through
   `report()` so they also reach the log pane. Scrubbing and overview follow
   losslessaudiocut (gunterkoenigsmann/losslessaudiocut) on purpose; keep
   them alike.
