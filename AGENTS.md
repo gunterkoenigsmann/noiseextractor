@@ -38,9 +38,13 @@
 Pushing a tag `vX.Y.Z` builds, smoke-tests and publishes Debian packages,
 AppImages, Windows zips/installers and macOS DMGs
 (`.github/workflows/release.yml`, scripts in `packaging/`, steps in
-`docs/release.md`). Adding an input format means adding it to `FILE_TYPES`
-in `crates/core/src/audio.rs` and to the three packages' file associations;
-`crates/core/tests/packaging.rs` fails until they agree.
+`docs/release.md`). The snap (`snap/snapcraft.yaml`, steps in
+`docs/snap.md`) is built by `snap.yml` on every push to main and rebuilt
+and uploaded to edge (main) and stable (latest release) every Monday by
+`snap-publish.yml`. Adding an input format means adding it to `FILE_TYPES`
+in `crates/core/src/audio.rs` and to the packages' file associations (the
+snap's desktop file in `snap/gui` too); `crates/core/tests/packaging.rs`
+fails until they agree.
 
 ## Commands
 

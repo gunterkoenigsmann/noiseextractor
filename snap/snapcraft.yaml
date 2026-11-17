@@ -1,0 +1,176 @@
+# Snap package of noiseextractor: the GUI (`noiseextractor`) and the command
+# line tool (`noiseextractor.cli`, the `noiseextractor-cli` binary).
+#
+# Build locally with `snapcraft pack` (needs LXD or Multipass); CI builds it
+# in .github/workflows/snap.yml, and .github/workflows/snap-publish.yml
+# rebuilds and publishes it every week. docs/snap.md has the release steps.
+#
+# Adapted from losslessaudiocut's recipe (same wxDragon, same cpal/ALSA
+# playback); the comments there explain the workarounds in more detail.
+name: noiseextractor
+title: noiseextractor
+summary: Mark noises in a spectrogram and suppress or extract them
+description: |
+  noiseextractor shows the spectrogram of a recording and lets you mark a
+  noise in it: a bird call, a cricket, a hum or a click. It then finds what
+  else belongs to that noise (its harmonics, its resonances, its other
+  occurrences in the recording) and suppresses or extracts all of it.
+
+  Filters are kept as a list of named parts that can be shown, hidden and
+  disabled one by one, and an adaptive noise reduction removes constant
+  background noise without flattening the attack and decay of louder sounds.
+  `noiseextractor.cli` runs the same filter projects from the command line.
+license: GPL-3.0-or-later
+website: https://github.com/gunterkoenigsmann/noiseextractor
+source-code: https://github.com/gunterkoenigsmann/noiseextractor
+issues: https://github.com/gunterkoenigsmann/noiseextractor/issues
+# A copy of packaging/icons/noiseextractor.svg (crates/core/tests/packaging.rs
+# checks that they are equal): everything in snap/gui ends up in meta/gui,
+# where the desktop file finds it.
+icon: snap/gui/noiseextractor.svg
+# Version and grade come from git (see override-pull below): a tagged commit
+# is a release (grade stable), anything else a development build.
+adopt-info: noiseextractor
+
+base: core24
+confinement: strict
+
+# Each platform is built on its own architecture (GitHub's ubuntu-24.04-arm
+# runners for arm64, see the workflows): snapcraft only builds the
+# platforms whose architecture matches the machine it runs on.
+platforms:
+  amd64:
+  arm64:
+
+# cpal plays through ALSA. Inside the snap ALSA is pointed at the
+# PulseAudio protocol (snap/local/asound.conf); these layouts put the
+# snap's own ALSA plugins and data where libasound looks for them.
+layout:
+  /usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/alsa-lib:
+    bind: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/alsa-lib
+  /usr/share/alsa:
+    bind: $SNAP/usr/share/alsa
+
+apps:
+  noiseextractor:
+    command: bin/noiseextractor
+    # GTK 3 and its dependencies come from the gnome-46-2404 content snap,
+    # which also sets up fonts, themes, portals (file dialogs) and the
+    # desktop, x11 and wayland plugs.
+    extensions: [gnome]
+    plugs: &plugs
+      - home
+      - removable-media
+      - audio-playback
+    environment: &environment
+      ALSA_CONFIG_PATH: $SNAP/etc/asound.conf
+  cli:
+    command: bin/noiseextractor-cli
+    # Not for GTK (the CLI has no window): the extension also puts the
+    # staged libraries on the library path, the same way as for the GUI.
+    extensions: [gnome]
+    plugs: *plugs
+    environment: *environment
+
+parts:
+  # The Rust toolchain. With `rust-channel` the Rust plugin wants a rustup
+  # binary in the build environment and does not find one there in CI. A
+  # part named rust-deps is the plugin's documented alternative: it puts
+  # rustup's stable toolchain into ~/.cargo/bin, which the plugin adds to
+  # PATH.
+  rust-deps:
+    plugin: nil
+    build-packages:
+      - curl
+      - ca-certificates
+    override-build: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+      "$HOME/.cargo/bin/cargo" --version
+
+  noiseextractor:
+    plugin: rust
+    after: [rust-deps]
+    # "none": take cargo from rust-deps. Left out, the plugin still runs
+    # `rustup update stable` in its pull step, before rust-deps is built.
+    rust-channel: none
+    source: .
+    # Compile against Ubuntu's own GTK 3 headers (libgtk-3-dev below), the
+    # setup the normal CI job tests, instead of the gnome extension's SDK:
+    # with the SDK on CMAKE_PREFIX_PATH, wxWidgets' CMake picks up the SDK's
+    # <math.h>, which shadows libstdc++'s and breaks the build. At run time
+    # the binary uses the GTK of the gnome-46-2404 runtime, the same GTK 3
+    # ABI, only newer.
+    #
+    # Linking must use Ubuntu's libraries throughout as well. The extension
+    # puts the SDK's libraries on LD_LIBRARY_PATH, and ld would otherwise
+    # mix them with Ubuntu's (on arm64 an SDK libpangoft2 with Ubuntu's
+    # older libpango). ld searches -rpath-link directories before
+    # LD_LIBRARY_PATH, so this points it at Ubuntu's.
+    build-environment:
+      - CMAKE_PREFIX_PATH: ""
+      - PKG_CONFIG_PATH: ""
+      - RUSTFLAGS: "-C link-arg=-Wl,-rpath-link=/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR"
+    rust-path:
+      - crates/gui
+      - crates/cli
+    override-pull: |
+      craftctl default
+      # Inside the LXD build the project is owned by another user, which
+      # git refuses without safe.directory.
+      git_() { git -c safe.directory='*' -C "$CRAFT_PROJECT_DIR" "$@"; }
+      # The workspace version ([workspace.package] in Cargo.toml).
+      cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+      if tag="$(git_ describe --tags --exact-match 2>/dev/null)"; then
+        # A release: the tag without its leading "v" (v1.2.0 -> 1.2.0).
+        craftctl set version="${tag#v}"
+        craftctl set grade=stable
+      elif sha="$(git_ rev-parse --short=7 HEAD 2>/dev/null)"; then
+        # A development build, e.g. 0.1.0+git20261117.7bec07a (at most 32
+        # characters, the store's limit).
+        date="$(git_ log -1 --format=%cd --date=format:%Y%m%d)"
+        craftctl set version="${cargo_version}+git${date}.${sha}"
+        craftctl set grade=devel
+      else
+        # Built from a tarball without .git.
+        craftctl set version="${cargo_version}"
+        craftctl set grade=devel
+      fi
+    build-packages:
+      - git
+      # wxdragon downloads wxWidgets and builds it with CMake (Ninja if
+      # present).
+      - cmake
+      - ninja-build
+      # wxdragon-sys's build script downloads wxWidgets with reqwest and
+      # native-tls (openssl-sys); build time only, nothing ends up in the snap.
+      - libssl-dev
+      - g++
+      # bindgen (wxdragon-sys) needs libclang.
+      - clang
+      - libclang-dev
+      - pkg-config
+      # cpal's ALSA backend.
+      - libasound2-dev
+      # wxWidgets' GTK port (see build-environment above).
+      - libgtk-3-dev
+    stage-packages:
+      - libasound2t64
+      - libasound2-data
+      # The pulse plugin of ALSA (see snap/local/asound.conf).
+      - libasound2-plugins
+    prime:
+      - "*"
+      # Should a staged package pull in Ubuntu's librsvg, the gnome runtime's
+      # newer one must win: with the older one first on the library path,
+      # GTK's SVG icon loader fails ("undefined symbol:
+      # rsvg_handle_get_pixbuf_and_error"), as it did in losslessaudiocut.
+      - -usr/lib/*/librsvg-2.so*
+
+  alsa-config:
+    plugin: dump
+    source: snap/local
+    organize:
+      asound.conf: etc/asound.conf
+    stage:
+      - etc/asound.conf

@@ -1,0 +1,102 @@
+# Weekly rebuild and upload of the snap, so that it picks up security
+# updates of everything it bundles (the Ubuntu packages staged from the
+# archive: ALSA and its PulseAudio plugin; the Rust toolchain) even when our
+# code does not change:
+#
+# - edge:   the newest commit on main (the development build),
+# - stable: the newest GitHub release (its tag), skipped while there is none.
+#
+# Needs the repository secret SNAPCRAFT_STORE_CREDENTIALS (docs/snap.md says
+# how to create it). Without it the snaps are still built, but not uploaded.
+name: Snap publish
+
+on:
+  schedule:
+    # Mondays 04:17 UTC: off the full hour, when GitHub's schedulers are
+    # busiest, and an hour after losslessaudiocut's weekly snap rebuild.
+    - cron: "17 4 * * 1"
+  # Run it by hand, e.g. right after a release or a security fix.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never two uploads to the store at once.
+concurrency:
+  group: snap-publish
+  cancel-in-progress: false
+
+jobs:
+  # Decides what to build: main for edge, plus the latest release for
+  # stable if there is one.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          targets='[{"channel":"edge","ref":"main"}'
+          # 404 (no release yet) is not an error, just no stable build.
+          if tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null)" && [ -n "$tag" ]; then
+            echo "Latest release: $tag"
+            targets="$targets,{\"channel\":\"stable\",\"ref\":\"refs/tags/$tag\"}"
+          else
+            echo "::notice::No GitHub release yet; publishing edge only."
+          fi
+          targets="$targets]"
+          # Every channel for every architecture, each on a native runner.
+          targets="$(jq -c '[.[] | (. + {arch: "amd64", runner: "ubuntu-latest"}), (. + {arch: "arm64", runner: "ubuntu-24.04-arm"})]' <<< "$targets")"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: ${{ matrix.channel }} (${{ matrix.arch }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.targets) }}
+    runs-on: ${{ matrix.runner }}
+    # As long as in snap.yml: Snap Store downloads can be slow.
+    timeout-minutes: 180
+    env:
+      # Secrets cannot be used in `if:` directly; an env var can.
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.ref }}
+      # A release made before the snap recipe existed (v0.1.0) has none, so
+      # stable stays empty until the next release. grep then fails on the
+      # missing file, which also means "skip".
+      - name: Check the platform
+        id: check
+        run: |
+          if grep -qE '^  ${{ matrix.arch }}:' snap/snapcraft.yaml 2>/dev/null; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${{ matrix.ref }} has no snap recipe for ${{ matrix.arch }}; skipped."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: snapcore/action-build@v1
+        if: steps.check.outputs.build == 'true'
+        id: build
+      - name: Upload snap as artifact
+        if: steps.check.outputs.build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: snap-${{ matrix.channel }}-${{ matrix.arch }}
+          path: ${{ steps.build.outputs.snap }}
+          if-no-files-found: error
+      - name: Publish to ${{ matrix.channel }}
+        if: steps.check.outputs.build == 'true' && env.SNAPCRAFT_STORE_CREDENTIALS != ''
+        uses: snapcore/action-publish@v1
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: ${{ matrix.channel }}
+      - name: No store credentials
+        if: steps.check.outputs.build == 'true' && env.SNAPCRAFT_STORE_CREDENTIALS == ''
+        run: echo "::warning::SNAPCRAFT_STORE_CREDENTIALS is not set; built the snap but did not upload it (see docs/snap.md)."

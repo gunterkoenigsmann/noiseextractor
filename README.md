@@ -82,6 +82,11 @@ They hold the GUI and the command-line tool. The packages are not signed
 yet; [docs/release.md](docs/release.md) says how to get past the warnings,
 and how a release is made.
 
+On Linux there is also a snap (`sudo snap install noiseextractor`, or
+`--edge` for the newest development build; the command-line tool is then
+`noiseextractor.cli`). It is rebuilt every week so that it picks up Ubuntu's
+security updates; [docs/snap.md](docs/snap.md) has the details.
+
 ## Building
 
 You need a stable Rust toolchain, CMake and a C++ compiler. The GUI uses
