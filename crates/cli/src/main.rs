@@ -481,6 +481,10 @@ fn print_report(project: &Project, audio: &AudioData) {
         }
         match (&a.template, e.use_similar) {
             (Some(tpl), true) => {
+                if let Some(r) = &tpl.rhythm {
+                    let hz = sample_rate as f32 / (project.stft.hop as f32 * r.period);
+                    println!("  pulsed at {hz:.1} Hz: searching by rhythm and band");
+                }
                 let found = find_in_range(tpl, &mono, &audio.channels, &stft, 0..total_frames, &e.similar);
                 println!("  same sound found {} times:", found.len());
                 for o in found {
@@ -490,8 +494,14 @@ fn print_report(project: &Project, audio: &AudioData) {
                         .spatial_agreement
                         .map(|a| format!(", same place {a:.2}"))
                         .unwrap_or_default();
+                    let len = if tpl.rhythm.is_some() {
+                        let s = o.frames as f64 * project.stft.hop as f64 / sample_rate as f64;
+                        format!(", {s:.2} s long")
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "    at {t:.3} s (match {:.2}, shifted {} bins{place}{note})",
+                        "    at {t:.3} s (match {:.2}, shifted {} bins{len}{place}{note})",
                         o.score, o.shift
                     );
                 }
