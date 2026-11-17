@@ -7,11 +7,17 @@
 //! the engine, the bin sharing of [`crate::share`] and the display work
 //! unchanged; only the actions and on/off states differ:
 //!
-//! | mode               | picked filter     | every other enabled filter |
+//! Several sounds can be picked at once; they are then heard (or removed)
+//! together:
+//!
+//! | mode               | picked filters    | every other enabled filter |
 //! |--------------------|-------------------|----------------------------|
-//! | [`Listen::All`]    | as it is          | as it is                   |
+//! | [`Listen::All`]    | as they are       | as it is                   |
 //! | [`Listen::Solo`]   | on, **extract**   | **suppress**               |
 //! | [`Listen::Without`]| on, **suppress**  | as it is                   |
+//!
+//! Picked extract filters combine as a union, so a solo of a bird and a
+//! frog plays both.
 //!
 //! In solo, the other sounds are *suppressed* rather than switched off:
 //! where they share bins with the picked sound, the bins' energy is split
@@ -41,7 +47,7 @@ pub enum Listen {
     Without,
 }
 
-/// The sound [`Listen::Solo`] and [`Listen::Without`] refer to.
+/// A sound [`Listen::Solo`] and [`Listen::Without`] refer to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
     /// Filter number `.0` of the list.
@@ -51,32 +57,37 @@ pub enum Pick {
 }
 
 impl Project {
-    /// The project to process so that `mode` is heard for `pick` (see the
-    /// module documentation). Without a pick, or when the pick does not
-    /// exist, the project is returned as it is.
+    /// The project to process so that `mode` is heard for the sounds in
+    /// `picks` (see the module documentation). Picks that do not exist are
+    /// ignored; without any, the project is returned as it is.
     ///
     /// A picked preview becomes the last filter of the result (visible, so
     /// it is still drawn) and the result has no preview, so the selection
     /// is neither analysed nor searched for twice.
-    pub fn for_listening(&self, mode: Listen, pick: Option<Pick>) -> Project {
+    pub fn for_listening(&self, mode: Listen, picks: &[Pick]) -> Project {
         let mut p = self.clone();
         if mode == Listen::All {
             return p;
         }
-        let index = match pick {
-            Some(Pick::Filter(i)) if i < p.filters.len() => i,
-            Some(Pick::Preview) => match p.preview.take() {
-                Some(mut f) => {
-                    f.visible = true;
-                    p.filters.push(f);
-                    p.filters.len() - 1
+        let mut picked = vec![false; p.filters.len()];
+        for pick in picks {
+            match *pick {
+                Pick::Filter(i) if i < picked.len() => picked[i] = true,
+                Pick::Preview => {
+                    if let Some(mut f) = p.preview.take() {
+                        f.visible = true;
+                        p.filters.push(f);
+                        picked.push(true);
+                    }
                 }
-                None => return p,
-            },
-            _ => return p,
-        };
-        for (i, f) in p.filters.iter_mut().enumerate() {
-            if i == index {
+                Pick::Filter(_) => {}
+            }
+        }
+        if !picked.contains(&true) {
+            return p;
+        }
+        for (f, picked) in p.filters.iter_mut().zip(picked) {
+            if picked {
                 f.enabled = true;
                 f.action = match mode {
                     Listen::Solo => FilterAction::Extract,
@@ -145,12 +156,13 @@ mod tests {
     #[test]
     fn all_and_missing_picks_leave_the_project_alone() {
         let p = project(vec![marked("bird", FilterAction::Suppress, 0.8)]);
-        for (mode, pick) in [
-            (Listen::All, Some(Pick::Filter(1))),
-            (Listen::Solo, None),
-            (Listen::Solo, Some(Pick::Filter(7))),
-            (Listen::Without, Some(Pick::Preview)),
-        ] {
+        let cases: [(Listen, &[Pick]); 4] = [
+            (Listen::All, &[Pick::Filter(1)]),
+            (Listen::Solo, &[]),
+            (Listen::Solo, &[Pick::Filter(7)]),
+            (Listen::Without, &[Pick::Preview]),
+        ];
+        for (mode, pick) in cases {
             let q = p.for_listening(mode, pick);
             assert_eq!(q.filters.len(), 2);
             assert_eq!(q.filters[1].action, FilterAction::Suppress, "{mode:?} {pick:?}");
@@ -165,7 +177,7 @@ mod tests {
         let mut suggested = marked("bird", FilterAction::Suppress, 0.8);
         suggested.enabled = false;
         let p = project(vec![suggested, marked("owl", FilterAction::Extract, 0.3), off]);
-        let q = p.for_listening(Listen::Solo, Some(Pick::Filter(1)));
+        let q = p.for_listening(Listen::Solo, &[Pick::Filter(1)]);
         let state: Vec<_> = q.filters.iter().map(|f| (f.enabled, f.action)).collect();
         assert_eq!(
             state,
@@ -189,7 +201,7 @@ mod tests {
             marked("bird", FilterAction::Extract, 0.8),
             marked("owl", FilterAction::Extract, 0.3),
         ]);
-        let q = p.for_listening(Listen::Without, Some(Pick::Filter(1)));
+        let q = p.for_listening(Listen::Without, &[Pick::Filter(1)]);
         let actions: Vec<_> = q.filters.iter().map(|f| f.action).collect();
         assert_eq!(
             actions,
@@ -198,12 +210,60 @@ mod tests {
     }
 
     #[test]
+    fn several_picks_are_heard_or_removed_together() {
+        let p = project(vec![
+            marked("bird", FilterAction::Suppress, 0.8),
+            marked("frog", FilterAction::Extract, 0.5),
+            marked("car", FilterAction::Extract, 0.3),
+        ]);
+        let picks = [Pick::Filter(1), Pick::Filter(2)];
+        let solo: Vec<_> = p
+            .for_listening(Listen::Solo, &picks)
+            .filters
+            .iter()
+            .map(|f| f.action)
+            .collect();
+        assert_eq!(
+            solo,
+            [
+                FilterAction::Suppress, // noise reduction
+                FilterAction::Extract,  // bird
+                FilterAction::Extract,  // frog
+                FilterAction::Suppress  // car, not picked
+            ]
+        );
+        let without: Vec<_> = p
+            .for_listening(Listen::Without, &picks)
+            .filters
+            .iter()
+            .map(|f| f.action)
+            .collect();
+        assert_eq!(
+            without,
+            [
+                FilterAction::Suppress,
+                FilterAction::Suppress,
+                FilterAction::Suppress,
+                FilterAction::Extract // car keeps its own setting
+            ]
+        );
+        // A selection being edited can be heard along with picked filters.
+        let mut q = p.clone();
+        q.preview = Some(marked("Selection", FilterAction::Suppress, 0.8));
+        let r = q.for_listening(Listen::Solo, &[Pick::Filter(3), Pick::Preview]);
+        assert_eq!(r.filters.len(), 5);
+        assert_eq!(r.filters[3].action, FilterAction::Extract);
+        assert_eq!(r.filters[4].action, FilterAction::Extract);
+        assert_eq!(r.filters[1].action, FilterAction::Suppress);
+    }
+
+    #[test]
     fn a_picked_preview_becomes_a_drawn_filter() {
         let mut p = project(vec![]);
         let mut sel = marked("Selection", FilterAction::Suppress, 0.8);
         (sel.enabled, sel.visible) = (false, false);
         p.preview = Some(sel);
-        let q = p.for_listening(Listen::Solo, Some(Pick::Preview));
+        let q = p.for_listening(Listen::Solo, &[Pick::Preview]);
         assert!(q.preview.is_none());
         let f = q.filters.last().expect("preview appended");
         assert_eq!((f.name.as_str(), f.enabled, f.visible), ("Selection", true, true));
@@ -217,8 +277,8 @@ mod tests {
         // same mask are power complements: |solo|² + |without|² equals the
         // output with the picked filter switched off, bin by bin.
         let p = project(vec![marked("bird", FilterAction::Suppress, 0.8)]);
-        let solo = gains(&p.for_listening(Listen::Solo, Some(Pick::Filter(1))));
-        let without = gains(&p.for_listening(Listen::Without, Some(Pick::Filter(1))));
+        let solo = gains(&p.for_listening(Listen::Solo, &[Pick::Filter(1)]));
+        let without = gains(&p.for_listening(Listen::Without, &[Pick::Filter(1)]));
         let mut off = p.clone();
         off.filters[1].enabled = false;
         let rest = gains(&off);
@@ -241,7 +301,7 @@ mod tests {
             marked("bird", FilterAction::Extract, 0.8),
             marked("owl", FilterAction::Extract, 0.8),
         ]);
-        let solo = gains(&p.for_listening(Listen::Solo, Some(Pick::Filter(1))));
+        let solo = gains(&p.for_listening(Listen::Solo, &[Pick::Filter(1)]));
         let both = gains(&p);
         assert!(solo[1] < both[1], "solo {} vs both {}", solo[1], both[1]);
     }

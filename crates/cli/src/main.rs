@@ -12,7 +12,7 @@
 //! noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract \
 //!     --save-project p.json
 //! noiseextractor-cli process in.flac --project p.json -o out.wav
-//! noiseextractor-cli process in.flac --project p.json --solo 2 -o bird.wav
+//! noiseextractor-cli process in.flac --project p.json --solo 2,3 -o birds.wav
 //! noiseextractor-cli spectrogram in.flac --project p.json -o view.png
 //! ```
 
@@ -68,14 +68,14 @@ enum Command {
         /// Output WAV file.
         #[arg(short, long)]
         output: PathBuf,
-        /// Write only the sound of filter N (1 = first in the project), as
-        /// the GUI's "Hear the picked sound only" plays it.
-        #[arg(long, value_name = "N", conflicts_with = "without")]
-        solo: Option<usize>,
-        /// Write everything but the sound of filter N (1 = first), as the
-        /// GUI's "Hear everything but the picked sound" plays it.
-        #[arg(long, value_name = "N")]
-        without: Option<usize>,
+        /// Write only the sounds of filters N,M,... (1 = first in the
+        /// project), as the GUI's "Hear the picked sound only" plays them.
+        #[arg(long, value_name = "N,...", value_delimiter = ',', conflicts_with = "without")]
+        solo: Vec<usize>,
+        /// Write everything but the sounds of filters N,M,... (1 = first),
+        /// as the GUI's "Hear everything but the picked sound" plays it.
+        #[arg(long, value_name = "N,...", value_delimiter = ',')]
+        without: Vec<usize>,
     },
     /// Background noise reduction with explicit parameters.
     Denoise {
@@ -217,18 +217,22 @@ fn run(cli: Cli) -> Result<()> {
                 Some(p) => Project::load(&p)?,
                 None => Project::default(),
             };
-            let (mode, n) = match (solo, without) {
-                (Some(n), _) => (Listen::Solo, Some(n)),
-                (None, Some(n)) => (Listen::Without, Some(n)),
-                (None, None) => (Listen::All, None),
+            let (mode, numbers) = if !solo.is_empty() {
+                (Listen::Solo, solo)
+            } else {
+                (Listen::Without, without)
             };
-            if let Some(n) = n {
-                anyhow::ensure!(
-                    (1..=project.filters.len()).contains(&n),
-                    "no filter {n}: the project has {} (numbered from 1)",
-                    project.filters.len()
-                );
-                project = project.for_listening(mode, Some(Pick::Filter(n - 1)));
+            if !numbers.is_empty() {
+                let mut picks = Vec::new();
+                for n in numbers {
+                    anyhow::ensure!(
+                        (1..=project.filters.len()).contains(&n),
+                        "no filter {n}: the project has {} (numbered from 1)",
+                        project.filters.len()
+                    );
+                    picks.push(Pick::Filter(n - 1));
+                }
+                project = project.for_listening(mode, &picks);
             }
             project.prepare(&audio);
             write_processed(&audio, &project, cli.chunk_frames, threads, &output)
