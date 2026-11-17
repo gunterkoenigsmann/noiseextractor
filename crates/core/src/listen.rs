@@ -150,7 +150,7 @@ mod tests {
     /// Gain of every bin of frame 0 with power 1 everywhere.
     fn gains(p: &Project) -> Vec<f32> {
         let power = vec![vec![1.0f32; 3]; 4];
-        compute_gains(p, &power, 0, &power, 0, &[], &[]).gain[0].clone()
+        compute_gains(p, &power, 0, &crate::noise::NoiseContext::new(&power, 0), 0, &[], &[]).gain[0].clone()
     }
 
     #[test]

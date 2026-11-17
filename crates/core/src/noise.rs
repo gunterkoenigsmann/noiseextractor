@@ -23,6 +23,45 @@
 use crate::stats::{expint_e1, quantile};
 use serde::{Deserialize, Serialize};
 
+/// Spacing, in STFT frames, of the global grid on which the adaptive noise
+/// estimate is taken (issue #3). Each grid point gets one estimate, and the
+/// frames in between interpolate linearly, so the noise spectrum used for a
+/// frame depends only on the frame's position in the recording, never on
+/// how the recording is cut into processing chunks: no steps at chunk
+/// borders. 64 frames are 0.68 s at 48 kHz with the default hop.
+pub const NOISE_GRID: i64 = 64;
+/// Frames on each side of a grid point that its estimate looks at: 2.7 s at
+/// 48 kHz with the default hop, as many as a default chunk with its context
+/// used to see.
+pub const NOISE_SPAN: i64 = 256;
+
+/// Mono power frames from which the adaptive noise estimate is taken:
+/// `power[i]` is global frame `first_frame + i`. Frames outside the
+/// recording must be left out, as zeros would drag the estimate down.
+#[derive(Clone, Copy, Debug)]
+pub struct NoiseContext<'a> {
+    /// Power frames, one per STFT frame.
+    pub power: &'a [Vec<f32>],
+    /// Global index of `power[0]`.
+    pub first_frame: i64,
+}
+
+impl<'a> NoiseContext<'a> {
+    /// Context `power` starting at global frame `first_frame`.
+    pub fn new(power: &'a [Vec<f32>], first_frame: i64) -> Self {
+        Self { power, first_frame }
+    }
+
+    /// Frames `NOISE_GRID`-aligned estimates need around the global frames
+    /// `first .. first + n`: the range a [`NoiseContext`] should cover for
+    /// [`NoiseReduction::noise_track`] to see every frame it uses.
+    pub fn needed(first: i64, n: usize) -> std::ops::Range<i64> {
+        let lo = first.div_euclid(NOISE_GRID) * NOISE_GRID;
+        let hi = (first + n.max(1) as i64 - 1).div_euclid(NOISE_GRID) * NOISE_GRID + NOISE_GRID;
+        (lo - NOISE_SPAN)..(hi + NOISE_SPAN)
+    }
+}
+
 /// Which gain rule turns the SNR estimates into a mask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GainRule {
@@ -37,8 +76,9 @@ pub enum GainRule {
 /// How the noise spectrum is obtained.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NoiseEstimate {
-    /// Estimated automatically from the quietest frames around each chunk.
-    /// `quantile` is the fraction of frames assumed to contain only noise.
+    /// Estimated automatically from the quietest frames nearby (see
+    /// [`NoiseReduction::noise_track`]). `quantile` is the fraction of
+    /// frames assumed to contain only noise.
     Adaptive {
         /// Fraction (0..1) of the quietest frames treated as noise.
         quantile: f32,
@@ -108,19 +148,66 @@ impl NoiseReduction {
         n
     }
 
+    /// Noise power per bin for each of the global frames `first ..
+    /// first + n`, taken from `context`.
+    ///
+    /// A fixed profile is the same for every frame. The adaptive estimate is
+    /// taken at every multiple of [`NOISE_GRID`] from the frames within
+    /// [`NOISE_SPAN`] of it (as far as `context` holds them), and frames in
+    /// between interpolate linearly between their two grid points. So a
+    /// frame's noise only depends on where it is in the recording, and the
+    /// estimate glides instead of stepping from chunk to chunk.
+    pub fn noise_track(&self, context: &NoiseContext, first: i64, n: usize, bins: usize) -> Vec<Vec<f32>> {
+        if !matches!(self.estimate, NoiseEstimate::Adaptive { .. }) {
+            return vec![self.noise_power(&[], bins); n];
+        }
+        let at = |grid: i64| -> Vec<f32> {
+            let start = context.first_frame;
+            let lo = (grid - NOISE_SPAN - start).clamp(0, context.power.len() as i64) as usize;
+            let hi = (grid + NOISE_SPAN - start).clamp(lo as i64, context.power.len() as i64) as usize;
+            self.noise_power(&context.power[lo..hi], bins)
+        };
+        let mut out = Vec::with_capacity(n);
+        let mut left_grid = first.div_euclid(NOISE_GRID) * NOISE_GRID;
+        let (mut left, mut right) = (at(left_grid), at(left_grid + NOISE_GRID));
+        for t in first..first + n as i64 {
+            if t >= left_grid + NOISE_GRID {
+                left_grid += NOISE_GRID;
+                left = std::mem::take(&mut right);
+                right = at(left_grid + NOISE_GRID);
+            }
+            let w = (t - left_grid) as f32 / NOISE_GRID as f32;
+            out.push(left.iter().zip(&right).map(|(a, b)| a + w * (b - a)).collect());
+        }
+        out
+    }
+
     /// Computes the gain for every frame and bin of `power`, given the noise
     /// power `noise`. The first frames act as warm-up for the recursive ξ
     /// estimate; callers that process chunks start a few frames early.
     pub fn gains(&self, power: &[Vec<f32>], noise: &[f32]) -> Vec<Vec<f32>> {
+        self.gains_with(power, |_| noise)
+    }
+
+    /// [`NoiseReduction::gains`] with a noise spectrum per frame:
+    /// `noise[t]` belongs to `power[t]` (see [`NoiseReduction::noise_track`]).
+    pub fn gains_tracked(&self, power: &[Vec<f32>], noise: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        self.gains_with(power, |t| &noise[t])
+    }
+
+    /// Shared implementation of the gain functions; `noise(t)` is the noise
+    /// power per bin for frame `t` of `power`.
+    fn gains_with<'n>(&self, power: &[Vec<f32>], noise: impl Fn(usize) -> &'n [f32]) -> Vec<Vec<f32>> {
         let alpha = self.smoothing.clamp(0.0, 0.999);
         let floor = self.gain_floor();
-        let bins = noise.len();
+        let bins = power.first().map_or(0, |_| noise(0).len());
         // |Â(t-1)|² / N, i.e. G(t-1)²·γ(t-1); starts at "no speech".
         let mut prev_clean_snr = vec![0.0f32; bins];
         let mut out = Vec::with_capacity(power.len());
-        for frame in power {
+        for (t, frame) in power.iter().enumerate() {
+            let noise = noise(t);
             let mut g = vec![1.0f32; bins];
-            for k in 0..bins.min(frame.len()) {
+            for k in 0..bins.min(frame.len()).min(noise.len()) {
                 let n = noise[k].max(1e-20);
                 let gamma = (frame[k] / n).min(1e6);
                 let xi = (alpha * prev_clean_snr[k] + (1.0 - alpha) * (gamma - 1.0).max(0.0)).max(XI_MIN);
@@ -315,6 +402,65 @@ mod tests {
         };
         let n = nr.noise_power(&[], 5);
         assert_eq!(n, vec![0.0, 0.5, 1.0, 1.5, 2.0]);
+    }
+
+    /// Power frames whose noise power in every bin is `level(t)` for global
+    /// frame `t` (no randomness, so every quantile equals the level).
+    fn ramp(frames: i64, bins: usize, level: impl Fn(i64) -> f32) -> Vec<Vec<f32>> {
+        (0..frames).map(|t| vec![level(t); bins]).collect()
+    }
+
+    #[test]
+    fn noise_track_depends_only_on_the_frame_position() {
+        let power = ramp(2000, 4, |t| 1.0 + t as f32 / 100.0);
+        let ctx = NoiseContext::new(&power, 0);
+        let nr = NoiseReduction::default();
+        // Two overlapping requests, as two chunkings would make them.
+        let a = nr.noise_track(&ctx, 600, 300, 4);
+        let b = nr.noise_track(&ctx, 700, 150, 4);
+        for t in 0..150 {
+            assert_eq!(a[100 + t], b[t], "frame {}", 700 + t);
+        }
+        // A context that covers only what is needed gives the same.
+        let needed = NoiseContext::needed(700, 150);
+        let part = &power[needed.start as usize..needed.end as usize];
+        let c = nr.noise_track(&NoiseContext::new(part, needed.start), 700, 150, 4);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn noise_track_glides_between_grid_points() {
+        // A noise level that steps at frame 1000: each grid point sees the
+        // quietest 10 % of its ±NOISE_SPAN window.
+        let power = ramp(3000, 2, |t| if t < 1000 { 1.0 } else { 4.0 });
+        let nr = NoiseReduction::default();
+        let track = nr.noise_track(&NoiseContext::new(&power, 0), 0, 3000, 2);
+        let correction = -(0.9f32).ln();
+        let g = NOISE_GRID as usize;
+        // Grid points get their window's estimate ...
+        assert!((track[0][0] - 1.0 / correction).abs() < 1e-4);
+        assert!((track[2000][0] - 4.0 / correction).abs() < 1e-4);
+        // ... and frames in between lie on the straight line.
+        for t in [g + 5, 1000, 1000 + g / 2] {
+            let (l, r) = (t / g * g, t / g * g + g);
+            let w = (t - l) as f32 / g as f32;
+            let expected = track[l][0] + w * (track[r][0] - track[l][0]);
+            assert!((track[t][0] - expected).abs() < 1e-4, "frame {t}");
+        }
+        // No frame-to-frame step larger than one grid interval's share of
+        // the whole change.
+        let max_step = track.windows(2).map(|w| (w[1][0] - w[0][0]).abs()).fold(0.0, f32::max);
+        assert!(max_step <= 3.0 / correction / g as f32 + 1e-4, "step {max_step}");
+    }
+
+    #[test]
+    fn noise_track_of_a_profile_is_the_profile() {
+        let nr = NoiseReduction {
+            estimate: NoiseEstimate::Profile(vec![0.5, 2.0]),
+            ..Default::default()
+        };
+        let track = nr.noise_track(&NoiseContext::new(&[], 0), 10, 3, 2);
+        assert_eq!(track, vec![vec![0.5, 2.0]; 3]);
     }
 
     #[test]

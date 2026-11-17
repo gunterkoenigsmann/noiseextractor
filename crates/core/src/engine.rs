@@ -136,7 +136,9 @@ impl ChunkLayout {
 /// must already be analysed, see [`Project::prepare`]).
 ///
 /// Frame ranges used (C = chunk frames, P = overlap padding, W = warm-up,
-/// X = noise context of C/2 on each side):
+/// X = the noise context, from [`NOISE_SPAN`](crate::noise::NOISE_SPAN)
+/// frames before the grid point at or before cC-P-W to as far after the
+/// grid point after (c+1)C+P, see [`crate::noise::NoiseContext::needed`]):
 ///
 /// ```text
 ///   context  [cC-P-W-X ........................................ (c+1)C+P+X)
@@ -159,9 +161,16 @@ pub fn process_chunk(
     let first = index as i64 * c;
     let pad = cfg.overlap_frames() as i64;
     let warm = WARMUP_FRAMES as i64;
-    let ctx = c / 2;
-    let ctx_start = first - pad - warm - ctx;
-    let ctx_len = (c + 2 * (pad + ctx) + warm) as usize;
+    // The mono spectrum covers the frames the gains need (with warm-up)
+    // and the context the noise estimate of those frames looks at, which
+    // depends only on the frames' global positions (see
+    // `noise::NoiseContext::needed`).
+    let gains_first = first - pad - warm;
+    let gains_len = (c + 2 * pad + warm) as usize;
+    let needed = crate::noise::NoiseContext::needed(gains_first, gains_len);
+    let ctx_start = needed.start.min(gains_first);
+    let ctx_len = (needed.end.max(gains_first + gains_len as i64) - ctx_start) as usize;
+    let ctx = (gains_first - ctx_start) as usize; // offset of the gains' frames
 
     let mono_spec = stft.analyze(mono, ctx_start, ctx_len);
     let power = mono_spec.power();
@@ -170,10 +179,10 @@ pub fn process_chunk(
     let total_frames = cfg.frame_count(mono.len()) as i64;
     let valid_lo = (-ctx_start).clamp(0, ctx_len as i64) as usize;
     let valid_hi = (total_frames - ctx_start).clamp(valid_lo as i64, ctx_len as i64) as usize;
-    let context = &power[valid_lo..valid_hi];
+    let context = crate::noise::NoiseContext::new(&power[valid_lo..valid_hi], ctx_start + valid_lo as i64);
 
-    let g_start = ctx as usize; // offset of frame cC-P-W in `power`
-    let g_len = (c + 2 * pad + warm) as usize;
+    let g_start = ctx; // offset of frame cC-P-W in `power`
+    let g_len = gains_len;
     let occurrences = find_occurrences(project, mono, &audio.channels, stft, (first - pad)..(first + c + pad));
     let applied_first = first - pad;
     let applied_len = (c + 2 * pad) as usize;
@@ -192,7 +201,7 @@ pub fn process_chunk(
         project,
         &power[g_start..g_start + g_len],
         WARMUP_FRAMES,
-        context,
+        &context,
         first - pad,
         &occurrences,
         &channel_spectra,
@@ -210,7 +219,7 @@ pub fn process_chunk(
     };
     let audio_out: Vec<Vec<f32>> = if audio.channels.len() == 1 {
         // Mono: the mix *is* the channel, reuse its spectra.
-        let off = (pad + warm + ctx - pad) as usize; // == warm + ctx
+        let off = warm as usize + ctx; // frame cC-P
         let spectra = crate::stft::Spectra {
             first_frame: applied_first,
             frames: mono_spec.frames[off..off + applied_len].to_vec(),
@@ -227,7 +236,7 @@ pub fn process_chunk(
     let mut output_db = Vec::with_capacity(frames * bins);
     let mut selected = Vec::with_capacity(frames * bins);
     let mut inferred = Vec::with_capacity(frames * bins);
-    let p_off = (pad + warm + ctx) as usize;
+    let p_off = (pad + warm) as usize + ctx; // frame cC
     for t in 0..frames {
         let p = &power[p_off + t];
         let gi = pad as usize + t;
@@ -708,6 +717,46 @@ mod tests {
             "chunking changed the output by {} dB",
             10.0 * (err / sig).log10()
         );
+    }
+
+    /// Issue #3: with slowly changing noise, each chunk used to estimate its
+    /// own noise spectrum, so the gain stepped at chunk borders and the
+    /// output depended on the chunk size. Now a frame's noise estimate
+    /// depends only on its position, so two chunkings agree.
+    #[test]
+    fn slowly_changing_noise_gives_the_same_output_for_any_chunking() {
+        let sr = 8000;
+        let secs = 12.0;
+        let mut rng = 7u64;
+        let x: Vec<f32> = (0..(sr as f32 * secs) as usize)
+            .map(|i| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let t = i as f32 / sr as f32;
+                // The noise grows eightfold over the recording.
+                let level = 0.01 * 8f32.powf(t / secs);
+                let n = ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * level;
+                let burst = if (t * 2.0).fract() < 0.25 { 0.3 } else { 0.0 };
+                burst * (2.0 * std::f32::consts::PI * 440.0 * t).sin() + n
+            })
+            .collect();
+        let audio = AudioData::new(sr, vec![x]);
+        let p = small_project();
+        let run = |frames| {
+            let mut out = Vec::new();
+            process_all(&audio, &p, frames, 2, |r| {
+                out.extend_from_slice(&r.audio[0]);
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        let (a, b) = (run(32), run(100));
+        let err: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32;
+        let sig: f32 = a.iter().map(|x| x * x).sum::<f32>() / a.len() as f32;
+        let db = 10.0 * (err / sig).log10();
+        // Per-chunk estimates gave about -44 dB here; now only the
+        // estimator's warm-up could differ, and it settles completely.
+        assert!(db < -80.0, "chunking changed the output by {db} dB");
     }
 
     #[test]

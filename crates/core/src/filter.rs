@@ -29,7 +29,7 @@
 
 use crate::analysis::{analyze_selection, AnalysisParams, RegionAnalysis, Selection};
 use crate::discover::{Decomposition, Discovery, FrameFit};
-use crate::noise::{NoiseEstimate, NoiseReduction};
+use crate::noise::{NoiseContext, NoiseEstimate, NoiseReduction};
 use crate::similar::{add_occurrence_mask, Occurrence, SimilarParams};
 use crate::spatial::Signature;
 use crate::stft::{Stft, StftConfig};
@@ -570,8 +570,10 @@ pub struct Gains {
 /// Combines all filters of `project` into a gain per bin for frames
 /// `first_frame .. first_frame + n`, given the mono power of frames
 /// `first_frame - warmup .. first_frame + n` (the warm-up frames only prime
-/// the recursive noise-reduction estimator) and the extra `context` power
-/// frames used for adaptive noise estimation.
+/// the recursive noise-reduction estimator) and the `context` power frames
+/// the adaptive noise estimate is taken from (it should cover
+/// [`NoiseContext::needed`] for the frames `first_frame - warmup ..
+/// first_frame + n`).
 ///
 /// `occurrences[i]` lists where the sound of filter `i` was found again
 /// (index `filters.len()` is the preview); missing entries mean none.
@@ -586,7 +588,7 @@ pub fn compute_gains(
     project: &Project,
     power_with_warmup: &[Vec<f32>],
     warmup: usize,
-    context: &[Vec<f32>],
+    context: &NoiseContext,
     first_frame: i64,
     occurrences: &[Vec<Occurrence>],
     channels: &[crate::stft::Spectra],
@@ -607,13 +609,19 @@ pub fn compute_gains(
     // both an extract and a suppress filter can be shared out before the
     // masks are applied.
     let mut events: EventMasks = Vec::new();
-    let mut share_noise: Option<Vec<f32>> = None;
+    // Noise per frame (without the warm-up) of the first enabled noise
+    // reduction, for sharing bins.
+    let mut share_noise: Option<Vec<Vec<f32>>> = None;
+    // Noise per frame of `power_with_warmup` for a noise-reduction filter.
+    let track = |nr: &crate::noise::NoiseReduction| {
+        nr.noise_track(context, first_frame - warmup as i64, power_with_warmup.len(), bins)
+    };
     for (fi, f) in project.filters.iter().enumerate() {
         if !f.enabled {
             // A disabled noise reduction still shows what it would take away.
             if let FilterKind::NoiseReduction(nr) = &f.kind {
                 if project.shows(fi) {
-                    let g = nr.gains(power_with_warmup, &nr.noise_power(context, bins));
+                    let g = nr.gains_tracked(power_with_warmup, &track(nr));
                     add_removed(&g[warmup..], &mut inferred);
                 }
             }
@@ -621,8 +629,8 @@ pub fn compute_gains(
         }
         match &f.kind {
             FilterKind::NoiseReduction(nr) => {
-                let noise = nr.noise_power(context, bins);
-                let g = nr.gains(power_with_warmup, &noise);
+                let noise = track(nr);
+                let g = nr.gains_tracked(power_with_warmup, &noise);
                 if project.shows(fi) {
                     add_removed(&g[warmup..], &mut inferred);
                 }
@@ -636,7 +644,7 @@ pub fn compute_gains(
                         }
                     }
                 }
-                share_noise.get_or_insert(noise);
+                share_noise.get_or_insert_with(|| noise[warmup..].to_vec());
             }
             FilterKind::Event(e) => {
                 if f.action == FilterAction::Extract {
@@ -693,10 +701,10 @@ pub fn compute_gains(
             events
                 .iter()
                 .find_map(|(_, _, src, _)| match src {
-                    Source::Event(e) => e.analysis.as_ref()?.template.as_ref().map(|t| t.noise.clone()),
+                    Source::Event(e) => e.analysis.as_ref()?.template.as_ref().map(|t| vec![t.noise.clone(); n]),
                     Source::Discovered { .. } => None,
                 })
-                .unwrap_or_else(|| vec![0.0; bins])
+                .unwrap_or_else(|| vec![vec![0.0; bins]; n])
         });
         share_bins(
             &mut events,
@@ -845,7 +853,7 @@ type EventMasks<'a> = Vec<(usize, &'a Filter, Source<'a>, Vec<Option<Vec<f32>>>)
 fn share_bins(
     events: &mut EventMasks,
     power: &[Vec<f32>],
-    noise: &[f32],
+    noise: &[Vec<f32>],
     first_frame: i64,
     occurrences: &[Vec<Occurrence>],
     channels: &[crate::stft::Spectra],
@@ -853,7 +861,7 @@ fn share_bins(
 ) {
     use crate::share::{contested, fill_gaps, loudness, share_frame, Claimant};
     let n = power.len();
-    let bins = noise.len();
+    let bins = power.first().map_or(0, Vec::len);
     // Contested bins per frame (from the masks alone).
     let contested_bins: Vec<Option<Vec<bool>>> = (0..n)
         .map(|t| {
@@ -914,7 +922,7 @@ fn share_bins(
                 }
                 let free = vec![false; bins];
                 let c = contested_bins[t].as_deref().unwrap_or(&free);
-                lo[t] = loudness(&shape, &power[t], noise, c);
+                lo[t] = loudness(&shape, &power[t], &noise[t], c);
                 sh[t] = Some(shape);
             }
             fill_gaps(&mut lo);
@@ -945,7 +953,7 @@ fn share_bins(
                 direction,
             });
         }
-        share_frame(&mut claimants, c, &power[t], noise, channels, t, fft_size);
+        share_frame(&mut claimants, c, &power[t], &noise[t], channels, t, fft_size);
         // The extract shares hold what is kept; suppressing again would
         // remove the kept share a second time.
         for cl in claimants.iter_mut().filter(|cl| !cl.extract) {
@@ -1003,7 +1011,7 @@ mod tests {
             &project(vec![analysed_event(FilterAction::Suppress, 0.6)]),
             &power,
             0,
-            &power,
+            &NoiseContext::new(&power, 0),
             0,
             &[],
             &[],
@@ -1012,7 +1020,7 @@ mod tests {
             &project(vec![analysed_event(FilterAction::Extract, 0.6)]),
             &power,
             0,
-            &power,
+            &NoiseContext::new(&power, 0),
             0,
             &[],
             &[],
@@ -1029,10 +1037,18 @@ mod tests {
         let mut f = analysed_event(FilterAction::Suppress, 1.0);
         assert!(f.set_part_enabled(1, false));
         assert!(!f.set_part_enabled(1, false));
-        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0, &[], &[]);
+        let g = compute_gains(
+            &project(vec![f.clone()]),
+            &power,
+            0,
+            &NoiseContext::new(&power, 0),
+            0,
+            &[],
+            &[],
+        );
         assert_eq!(g.gain[0], vec![0.0, 1.0, 0.0]);
         f.enabled = false;
-        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0, &[], &[]);
+        let g = compute_gains(&project(vec![f]), &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
         assert_eq!(g.gain[0], vec![1.0, 1.0, 1.0]);
     }
 
@@ -1045,7 +1061,15 @@ mod tests {
         let mut b = analysed_event(FilterAction::Extract, 1.0);
         b.set_part_enabled(0, false);
         b.set_part_enabled(2, false);
-        let g = compute_gains(&project(vec![a, b]), &power, 0, &power, 0, &[], &[]);
+        let g = compute_gains(
+            &project(vec![a, b]),
+            &power,
+            0,
+            &NoiseContext::new(&power, 0),
+            0,
+            &[],
+            &[],
+        );
         assert_eq!(g.gain[0], vec![1.0, 1.0, 0.0]);
         // Frames 2 and 3 lie outside the analysed span: nothing to extract.
         assert_eq!(g.gain[3], vec![0.0, 0.0, 0.0]);
@@ -1056,11 +1080,19 @@ mod tests {
         let power = vec![vec![1.0; 3]; 2];
         let mut f = analysed_event(FilterAction::Suppress, 0.8);
         f.enabled = false;
-        let g = compute_gains(&project(vec![f.clone()]), &power, 0, &power, 0, &[], &[]);
+        let g = compute_gains(
+            &project(vec![f.clone()]),
+            &power,
+            0,
+            &NoiseContext::new(&power, 0),
+            0,
+            &[],
+            &[],
+        );
         assert_eq!(g.selected[0][0], 0.8);
         assert_eq!(g.inferred[0][1], 0.8);
         f.visible = false;
-        let g = compute_gains(&project(vec![f]), &power, 0, &power, 0, &[], &[]);
+        let g = compute_gains(&project(vec![f]), &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
         assert_eq!(g.selected[0][0], 0.0);
     }
 
@@ -1072,10 +1104,10 @@ mod tests {
         let mut hidden = analysed_event(FilterAction::Suppress, 0.8);
         hidden.visible = false;
         let mut p = project(vec![Filter::noise_reduction("noise"), hidden]);
-        let g = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        let g = compute_gains(&p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
         assert_eq!((g.selected[0][0], g.inferred[0][1]), (0.0, 0.0));
         p.highlight = Some(1);
-        let g = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        let g = compute_gains(&p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
         assert_eq!((g.selected[0][0], g.inferred[0][1]), (0.8, 0.8));
         assert!(p.shows(1) && !p.shows(0) && !p.shows(2), "no preview, nothing at 2");
     }
@@ -1088,7 +1120,7 @@ mod tests {
         let power = vec![vec![1.0; 3]; 40];
         let mut p = project(vec![Filter::noise_reduction("noise")]);
         let removed = |p: &Project| {
-            let g = compute_gains(p, &power, 0, &power, 0, &[], &[]);
+            let g = compute_gains(p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
             let expected = complement(g.gain[39][0]);
             (g.inferred[39][0], expected)
         };
@@ -1136,12 +1168,12 @@ mod tests {
         // Nothing changes the sound until a suggestion is switched on.
         let power = vec![vec![4.0, 4.0, 4.0]; 2];
         p.filters.remove(0);
-        let g = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        let g = compute_gains(&p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
         assert_eq!(g.gain[0], vec![1.0; 3]);
         assert_eq!(g.inferred[0], vec![0.0; 3]);
         // Picking it shows what it found, in red.
         p.highlight = Some(0);
-        let g = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        let g = compute_gains(&p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
         assert!(g.inferred[0][0] > 0.99 && g.inferred[0][1] > 0.99 && g.inferred[0][2] < 1e-3);
         assert_eq!(g.selected[0], vec![0.0; 3]);
     }
@@ -1152,9 +1184,9 @@ mod tests {
         p.add_discovery(discovery());
         let power = vec![vec![9.0, 1.0, 4.0]; 2];
         p.filters[0].enabled = true;
-        let s = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        let s = compute_gains(&p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
         p.filters[0].action = FilterAction::Extract;
-        let e = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        let e = compute_gains(&p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
         for k in 0..3 {
             assert!((s.gain[0][k].powi(2) + e.gain[0][k].powi(2) - 1.0).abs() < 1e-5);
         }
@@ -1166,7 +1198,7 @@ mod tests {
         );
         // Switching a part off gives its bins back.
         assert!(p.filters[0].set_part_enabled(1, false));
-        let e = compute_gains(&p, &power, 0, &power, 0, &[], &[]);
+        let e = compute_gains(&p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
         assert!(e.gain[0][1] < 1e-3, "{:?}", e.gain[0]);
     }
 

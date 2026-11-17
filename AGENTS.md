@@ -57,6 +57,9 @@ On Linux the GUI needs `libgtk-3-dev` and `libasound2-dev`.
 
 * The STFT frame grid is global (frame i is centred on sample i·hop). Chunked
   processing relies on this to be seamless; do not introduce per-chunk grids.
+  The same holds for the adaptive noise estimate: it is taken on a global
+  grid of frames (`noise::NoiseReduction::noise_track`) and interpolated,
+  so never estimate the noise from "the current chunk".
 * GUI state lives in an `Rc<RefCell<State>>`. GTK can deliver paint events
   synchronously while a handler holds the borrow, so the paint handler uses
   `try_borrow` and handlers request repaints via `request_repaint()` instead of
