@@ -1,7 +1,9 @@
 //! The waveform overview: the whole recording squeezed into one strip,
 //! with a frame showing which part the spectrogram shows. Dragging the
 //! frame (or clicking beside it) scrolls the spectrogram there. The same
-//! idea as losslessaudiocut's minimap.
+//! idea as losslessaudiocut's minimap. Dragging beside the frame by more
+//! than [`DRAG_THRESHOLD`] pixels instead selects a time span, which the
+//! spectrogram zooms to when the button is released.
 //!
 //! [`Peaks`] holds the minimum and maximum of every block of samples,
 //! computed once when the file is loaded, so drawing the strip for an hour
@@ -14,6 +16,36 @@ pub const BLOCK: usize = 256;
 
 /// Narrowest frame drawn, in pixels, so that a deep zoom stays visible.
 pub const MIN_FRAME_WIDTH: f64 = 3.0;
+
+/// How far (pixels) the pointer must move after pressing beside the frame
+/// before the press counts as selecting a span to zoom to rather than as a
+/// click that only recentres. A few pixels, so a hand that twitches while
+/// clicking still just recentres.
+pub const DRAG_THRESHOLD: f64 = 4.0;
+
+/// What a held button in the overview is doing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Gesture {
+    /// Moving the frame: how far after the spectrogram's start the pointer
+    /// grabbed it (samples), so the frame does not jump under the pointer.
+    Move {
+        /// Offset of the pointer from the spectrogram's start, in samples.
+        grab: usize,
+    },
+    /// Pressed beside the frame. Until the pointer has moved
+    /// [`DRAG_THRESHOLD`] pixels this behaves like [`Gesture::Move`] (the
+    /// spectrogram was centred on the press); after that it selects the span
+    /// from `anchor` to `to`, both pixel columns.
+    Beside {
+        /// Offset of the pointer from the spectrogram's start, in samples,
+        /// for as long as the press still counts as a click.
+        grab: usize,
+        /// Pixel column the button was pressed at.
+        anchor: f64,
+        /// Pixel column the pointer is at once the span selection started.
+        to: Option<f64>,
+    },
+}
 
 /// Minimum and maximum per block of [`BLOCK`] samples of a signal.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -62,10 +94,8 @@ pub struct Overview {
     total: usize,
     /// Width of the strip in pixels.
     width: u32,
-    /// While the button is held: how far after the spectrogram's start the
-    /// pointer grabbed it (samples), so the frame does not jump under the
-    /// pointer.
-    grab: Option<usize>,
+    /// What the held button is doing; `None` while it is up.
+    gesture: Option<Gesture>,
 }
 
 impl Overview {
@@ -74,7 +104,7 @@ impl Overview {
         Overview {
             total,
             width: width.max(1),
-            grab: None,
+            gesture: None,
         }
     }
 
@@ -107,25 +137,69 @@ impl Overview {
     pub fn press(&mut self, x: f64, visible: (usize, usize)) -> usize {
         let pos = self.x_to_sample(x);
         let (l, r) = self.frame(visible);
-        let grab = if (l..r).contains(&x) {
-            pos.saturating_sub(visible.0)
+        let (grab, gesture) = if (l..r).contains(&x) {
+            let grab = pos.saturating_sub(visible.0);
+            (grab, Gesture::Move { grab })
         } else {
-            (visible.1 - visible.0) / 2
+            let grab = (visible.1 - visible.0) / 2;
+            (
+                grab,
+                Gesture::Beside {
+                    grab,
+                    anchor: x,
+                    to: None,
+                },
+            )
         };
-        self.grab = Some(grab);
+        self.gesture = Some(gesture);
         pos.saturating_sub(grab)
     }
 
-    /// The pointer moved to pixel `x`. While the button is held, returns
-    /// where the spectrogram should start (the viewport clamps it).
+    /// The pointer moved to pixel `x`. While the button is held and moves
+    /// the frame, returns where the spectrogram should start (the viewport
+    /// clamps it). Returns `None` while the button is up or a span is being
+    /// selected (see [`Overview::span`]).
     pub fn drag(&mut self, x: f64) -> Option<usize> {
-        let grab = self.grab?;
-        Some(self.x_to_sample(x).saturating_sub(grab))
+        let pos = self.x_to_sample(x);
+        match self.gesture.as_mut()? {
+            Gesture::Move { grab } => Some(pos.saturating_sub(*grab)),
+            Gesture::Beside { grab, anchor, to } => {
+                // Once past the threshold the press stays a span selection,
+                // even if the pointer comes back: the user has shown intent.
+                if to.is_some() || (x - *anchor).abs() >= DRAG_THRESHOLD {
+                    *to = Some(x);
+                    None
+                } else {
+                    Some(pos.saturating_sub(*grab))
+                }
+            }
+        }
     }
 
-    /// Button released.
-    pub fn release(&mut self) {
-        self.grab = None;
+    /// The span being selected, as pixel columns `left..right` clamped to
+    /// the strip, for drawing; `None` unless a span selection is under way.
+    pub fn span(&self) -> Option<(f64, f64)> {
+        match self.gesture? {
+            Gesture::Beside {
+                anchor, to: Some(to), ..
+            } => {
+                let w = self.width as f64;
+                Some((anchor.min(to).clamp(0.0, w), anchor.max(to).clamp(0.0, w)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Button released. Returns the samples `start..end` the spectrogram
+    /// should zoom to if a span was selected, else `None`. A span that ended
+    /// up narrower than [`DRAG_THRESHOLD`] (the pointer came back) is
+    /// dropped: zooming to a sliver is never what was meant.
+    pub fn release(&mut self) -> Option<(usize, usize)> {
+        let span = self.span();
+        self.gesture = None;
+        let (l, r) = span?;
+        let (a, b) = (self.x_to_sample(l), self.x_to_sample(r));
+        (r - l >= DRAG_THRESHOLD && b > a).then_some((a, b))
     }
 }
 
@@ -180,7 +254,7 @@ mod tests {
         assert_eq!(o.press(30.0, (200, 500)), 200, "nothing moves yet");
         assert_eq!(o.drag(45.0), Some(350));
         assert_eq!(o.drag(0.0), Some(0), "not before the beginning");
-        o.release();
+        assert_eq!(o.release(), None);
         assert_eq!(o.drag(60.0), None);
     }
 
@@ -188,8 +262,53 @@ mod tests {
     fn clicking_beside_the_frame_centres_it_there() {
         let mut o = strip();
         assert_eq!(o.press(80.0, (200, 500)), 650);
-        assert_eq!(o.drag(90.0), Some(750));
+        // A twitch below the threshold still just recentres.
+        assert_eq!(o.drag(82.0), Some(670));
+        assert_eq!(o.release(), None);
         assert_eq!(o.press(5.0, (200, 500)), 0, "clamped at the start");
+    }
+
+    #[test]
+    fn dragging_beside_the_frame_selects_a_span_to_zoom_to() {
+        let mut o = strip();
+        assert_eq!(o.press(80.0, (200, 500)), 650, "the press recentres first");
+        assert_eq!(o.span(), None);
+        // Past the threshold: no more scrolling, a span instead.
+        assert_eq!(o.drag(90.0), None);
+        assert_eq!(o.span(), Some((80.0, 90.0)));
+        // Leftwards past the anchor works too, and stays a span.
+        assert_eq!(o.drag(60.0), None);
+        assert_eq!(o.span(), Some((60.0, 80.0)));
+        assert_eq!(o.release(), Some((600, 800)));
+        assert_eq!(o.drag(70.0), None, "button is up");
+        assert_eq!(o.span(), None);
+    }
+
+    #[test]
+    fn a_span_is_clamped_to_the_strip() {
+        let mut o = strip();
+        o.press(95.0, (200, 500));
+        o.drag(150.0);
+        assert_eq!(o.span(), Some((95.0, 100.0)));
+        assert_eq!(o.release(), Some((950, 1000)));
+    }
+
+    #[test]
+    fn a_span_dragged_back_to_a_sliver_is_dropped() {
+        let mut o = strip();
+        o.press(80.0, (200, 500));
+        assert_eq!(o.drag(90.0), None);
+        assert_eq!(o.drag(81.0), None, "still a span, no jump back to scrolling");
+        assert_eq!(o.release(), None);
+    }
+
+    #[test]
+    fn dragging_the_frame_never_selects_a_span() {
+        let mut o = strip();
+        o.press(30.0, (200, 500));
+        assert_eq!(o.drag(80.0), Some(700));
+        assert_eq!(o.span(), None);
+        assert_eq!(o.release(), None);
     }
 
     #[test]

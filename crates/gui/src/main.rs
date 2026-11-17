@@ -21,7 +21,8 @@
 //!   selection.
 //!
 //! In the overview, dragging the frame (or clicking beside it) scrolls the
-//! spectrogram.
+//! spectrogram; dragging beside the frame selects a time span and zooms the
+//! spectrogram to it.
 //!
 //! Picking a filter in the list draws its overlays even when "Show in
 //! spectrogram" is off: what an event filter targets in green / red /
@@ -924,8 +925,12 @@ fn bind_events(state: &Shared, ui: Ui) {
     ui.overview.on_mouse_motion(move |e| {
         let Some(p) = mouse_pos(&e) else { return };
         let Ok(mut s) = st.try_borrow_mut() else { return };
-        if let Some(start) = s.overview.as_mut().and_then(|o| o.drag(p.0 as f64)) {
+        let Some(o) = s.overview.as_mut() else { return };
+        if let Some(start) = o.drag(p.0 as f64) {
             scroll_to(&mut s, ui, start);
+        } else if o.span().is_some() {
+            // Only the rubber band changed.
+            request_repaint();
         }
     });
     let st = state.clone();
@@ -933,9 +938,17 @@ fn bind_events(state: &Shared, ui: Ui) {
         if ui.overview.has_capture() {
             ui.overview.release_mouse();
         }
-        if let Some(o) = st.try_borrow_mut().ok().as_mut().and_then(|s| s.overview.as_mut()) {
-            o.release();
+        let Ok(mut s) = st.try_borrow_mut() else { return };
+        let Some(span) = s.overview.as_mut().and_then(|o| o.release()) else {
+            // Also removes a dropped span's rubber band.
+            request_repaint();
+            return;
+        };
+        let (w, _) = canvas_size(ui);
+        if let Some(vp) = s.viewport.as_mut() {
+            vp.show_range(span.0, span.1, w);
         }
+        request_repaint();
     });
 
     // --- detection settings ---
@@ -2067,8 +2080,8 @@ fn scroll_to(s: &mut State, ui: Ui, start: usize) {
 }
 
 /// Draws the overview: the waveform of the whole recording, the selection's
-/// time span, the frame around the part shown in the spectrogram, and the
-/// play head.
+/// time span, the frame around the part shown in the spectrogram, a span
+/// being dragged out to zoom to, and the play head.
 fn paint_overview(s: &State, ui: Ui, dc: &AutoBufferedPaintDC) {
     let (w, h) = dc.get_size();
     dc.set_background(Colour::rgb(20, 20, 26));
@@ -2098,6 +2111,11 @@ fn paint_overview(s: &State, ui: Ui, dc: &AutoBufferedPaintDC) {
     let (l, r) = (l.max(0.0), r.min(w as f64 - 1.0));
     dc.set_pen(Colour::rgb(240, 240, 240), 1, PenStyle::Solid);
     dc.draw_rectangle(l as i32, 0, (r - l).max(1.0) as i32, h);
+    // The span being dragged out to zoom to.
+    if let Some((l, r)) = o.span() {
+        dc.set_pen(Colour::rgb(240, 240, 240), 1, PenStyle::ShortDash);
+        dc.draw_rectangle(l as i32, 1, (r - l).max(1.0) as i32, h - 2);
+    }
     let px = o.sample_to_x(s.playhead) as i32;
     dc.set_pen(Colour::rgb(255, 230, 80), 1, PenStyle::Solid);
     dc.draw_line(px, 0, px, h);
