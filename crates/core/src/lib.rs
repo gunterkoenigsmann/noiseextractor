@@ -39,6 +39,7 @@ pub mod filter;
 pub mod listen;
 pub mod noise;
 pub mod render;
+pub mod rhythm;
 pub mod share;
 pub mod similar;
 pub mod spatial;
