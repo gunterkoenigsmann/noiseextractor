@@ -278,9 +278,7 @@ pub fn event_masks(
             };
             // The original is already covered by the parts above; matching
             // it again would only turn the green marked area orange.
-            let relevant = occurrences
-                .iter()
-                .filter(|o| !o.is_original(tpl) && frame >= o.frame && frame < o.frame + tpl.frames as i64);
+            let relevant = occurrences.iter().filter(|o| o.applies_to(tpl, frame));
             for occ in relevant {
                 if !any {
                     selected.iter_mut().for_each(|v| *v = 0.0);
@@ -899,8 +897,8 @@ fn share_bins(
                 }
                 if let (true, Some(tpl)) = (e.use_similar, &a.template) {
                     for o in occurrences.get(*fi).map_or(&[][..], Vec::as_slice) {
-                        if !o.is_original(tpl) && frame >= o.frame && frame < o.frame + tpl.frames as i64 {
-                            let idx = tpl.first_frame - a.first_frame + (frame - o.frame);
+                        if o.applies_to(tpl, frame) {
+                            let idx = tpl.first_frame - a.first_frame + o.template_frame(tpl, frame) as i64;
                             placements.push((idx as usize, o.shift as f32));
                         }
                     }

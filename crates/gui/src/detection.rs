@@ -50,11 +50,13 @@ pub enum Param {
     RepetitionLevelTolerance,
     /// Delay tolerance between channels for repetitions.
     RepetitionDelayTolerance,
+    /// Loudness above the noise a repetition of a pulsed sound needs.
+    MinLevel,
 }
 
 impl Param {
     /// All parameters, in display order.
-    pub const ALL: [Param; 12] = [
+    pub const ALL: [Param; 13] = [
         Param::HarmonicTolerance,
         Param::HarmonicThreshold,
         Param::MaxHarmonic,
@@ -64,6 +66,7 @@ impl Param {
         Param::MaxDelay,
         Param::MatchThreshold,
         Param::MaxShift,
+        Param::MinLevel,
         Param::SpatialWeight,
         Param::RepetitionLevelTolerance,
         Param::RepetitionDelayTolerance,
@@ -74,6 +77,7 @@ impl Param {
         match self {
             Param::MatchThreshold
             | Param::MaxShift
+            | Param::MinLevel
             | Param::SpatialWeight
             | Param::RepetitionLevelTolerance
             | Param::RepetitionDelayTolerance => Group::Repetitions,
@@ -93,6 +97,7 @@ impl Param {
             Param::MaxDelay => "Largest channel delay (mic spacing)",
             Param::MatchThreshold => "Shape match needed",
             Param::MaxShift => "Frequency shift allowed",
+            Param::MinLevel => "Loudness needed (pulsed sounds)",
             Param::SpatialWeight => "Weight of the direction",
             Param::RepetitionLevelTolerance => "Channel level tolerance",
             Param::RepetitionDelayTolerance => "Channel delay tolerance",
@@ -119,6 +124,10 @@ impl Param {
             Param::MaxDelay => "Stereo: largest delay between the channels searched, in samples",
             Param::MatchThreshold => "How similar in shape another place must be to count as a repetition",
             Param::MaxShift => "How much higher or lower (in FFT bins) a repetition may be",
+            Param::MinLevel => {
+                "Pulsed sounds (insects, trills): how far (dB) a repetition must be above the noise; \
+                 lower finds more distant ones"
+            }
             Param::SpatialWeight => "Stereo: 0 ignores where a repetition comes from, 1 requires the same place",
             Param::RepetitionLevelTolerance => {
                 "Stereo: level ratio difference (dB) at which a repetition counts as coming from elsewhere"
@@ -141,6 +150,7 @@ impl Param {
             Param::MaxDelay => (1.0, 256.0),
             Param::MatchThreshold => (0.2, 0.95),
             Param::MaxShift => (0.0, 8.0),
+            Param::MinLevel => (0.0, 30.0),
             Param::SpatialWeight => (0.0, 1.0),
         }
     }
@@ -182,6 +192,7 @@ impl Param {
             Param::MaxDelay => a.max_delay_samples,
             Param::MatchThreshold => s.threshold,
             Param::MaxShift => s.max_shift_bins as f32,
+            Param::MinLevel => s.min_level_db,
             Param::SpatialWeight => s.spatial_weight,
             Param::RepetitionLevelTolerance => s.level_tolerance_db,
             Param::RepetitionDelayTolerance => s.delay_tolerance_samples,
@@ -203,6 +214,7 @@ impl Param {
             Param::MaxDelay => a.max_delay_samples = v,
             Param::MatchThreshold => s.threshold = v,
             Param::MaxShift => s.max_shift_bins = v.round() as usize,
+            Param::MinLevel => s.min_level_db = v,
             Param::SpatialWeight => s.spatial_weight = v,
             Param::RepetitionLevelTolerance => s.level_tolerance_db = v,
             Param::RepetitionDelayTolerance => s.delay_tolerance_samples = v,
@@ -243,7 +255,7 @@ impl Param {
             Param::HarmonicTolerance => format!("{:.1} %", v * 100.0),
             Param::MaxHarmonic => format!("{v:.0}"),
             Param::MaxShift => format!("± {v:.0} bins"),
-            Param::PartLevelTolerance | Param::RepetitionLevelTolerance => format!("{v:.1} dB"),
+            Param::PartLevelTolerance | Param::RepetitionLevelTolerance | Param::MinLevel => format!("{v:.1} dB"),
             Param::PartDelayTolerance | Param::RepetitionDelayTolerance | Param::MaxDelay => {
                 format!("{v:.2} samples")
             }
@@ -314,6 +326,8 @@ mod tests {
         assert!(Param::MaxDelay.reanalyse());
         assert!(!Param::SpatialWeight.reanalyse());
         assert!(Param::SpatialWeight.spatial() && !Param::MatchThreshold.spatial());
+        assert!(!Param::MinLevel.reanalyse() && !Param::MinLevel.spatial());
+        assert_eq!(Param::MinLevel.format(3.0), "3.0 dB");
         assert_eq!(Param::HarmonicTolerance.format(0.03), "3.0 %");
     }
 }

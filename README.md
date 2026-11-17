@@ -22,6 +22,14 @@ extract them, together with everything the program finds to belong to them.
   tolerating a small frequency shift), so marking one bird call also catches
   its repetitions. Each repetition gets the same soft mask, weighted by how
   well it matches and by how far it stands above the noise there.
+* **Pulsed sounds are found by their rhythm.** If the marked sound is a
+  pulse train (a cricket, a katydid, a trill, a machine), the search
+  compares the pulse rate (the spectrum of the band's loudness over time)
+  and which part of the band is busy, not the exact pattern. A burst that is
+  20 dB quieter, longer or shorter, or partly covered by another sound is
+  still recognised, and each found burst is masked over its whole length.
+  The *Loudness needed* slider sets how far above the noise a burst has to
+  be.
 * **Stereo and multi-channel recordings tell where a sound comes from.** For
   every channel, the level difference to the first channel (dB) and the
   arrival delay (in samples, by GCC-PHAT) of the marked part are measured.
