@@ -1,9 +1,11 @@
 //! Tests on short excerpts of real recordings (see `tests/fixtures/README.md`).
 
+use noiseextractor_core::analysis::{analyze_selection, AnalysisParams, Selection};
 use noiseextractor_core::discover::{discover, DiscoverParams};
 use noiseextractor_core::engine::process_all;
 use noiseextractor_core::filter::{FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::NoiseEstimate;
+use noiseextractor_core::stft::{Stft, StftConfig};
 use noiseextractor_core::AudioData;
 use std::path::Path;
 
@@ -70,4 +72,42 @@ fn the_cricket_recording_loads_whole() {
     assert!((seconds - 184.9).abs() < 0.2, "{seconds} s");
     // A loud burst (3 .. 5 s) stands far above the quiet stretch before it.
     assert!(power(&audio, 3.5, 5.0) > 100.0 * power(&audio, 0.5, 2.5));
+}
+
+#[test]
+fn the_cricket_pulses_are_a_broadband_sound_without_partials() {
+    // Issue #24: mark one burst (3.0 .. 5.2 s, 2 .. 20 kHz). The pulses are
+    // a noise band, so there is no pitch track and no partials, and the
+    // band is where the pulses are (about 7 .. 19.5 kHz; birds below).
+    let audio = fixture("cricket-bursts.ogg");
+    let stft = Stft::new(StftConfig::default());
+    let sel = Selection {
+        start_s: 3.0,
+        end_s: 5.2,
+        low_hz: 2000.0,
+        high_hz: 20000.0,
+    };
+    let a = analyze_selection(
+        &audio.mono(),
+        &audio.channels,
+        audio.sample_rate,
+        &stft,
+        &sel,
+        &NoiseEstimate::default(),
+        &AnalysisParams::default(),
+    );
+    let (lo, hi) = a.broadband.expect("cricket taken for a tone");
+    let hz = |k: usize| StftConfig::default().bin_to_hz(k as f32, audio.sample_rate);
+    assert!((5000.0..8500.0).contains(&hz(lo)), "band starts at {} Hz", hz(lo));
+    assert!(hz(hi) > 18000.0, "band ends at {} Hz", hz(hi));
+    assert!(a.partials.is_empty(), "{:?}", a.partials);
+    assert!(a.pitch_track.iter().all(Option::is_none));
+    // The rhythm matcher still sees the pulse rate (~5.9 Hz).
+    let r = a
+        .template
+        .as_ref()
+        .and_then(|t| t.rhythm.as_ref())
+        .expect("no pulse rate");
+    let rate = audio.sample_rate as f32 / (StftConfig::default().hop as f32 * r.period);
+    assert!((5.0..7.0).contains(&rate), "pulsed at {rate} Hz");
 }

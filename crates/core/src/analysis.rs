@@ -146,6 +146,13 @@ pub struct RegionAnalysis {
     pub pitch_track: Vec<Option<f32>>,
     /// Partials accepted by the harmonic search.
     pub partials: Vec<FoundPartial>,
+    /// Set when the marked sound is not tonal but a band of noise (insect
+    /// pulses, rustling, a hiss): the lowest and highest bin of the band,
+    /// i.e. of the marked bins that are mostly above the noise while the
+    /// sound is active. The pitch track, partials and source model are
+    /// then empty, because a "pitch" would only be the loudest bin of the
+    /// noise band, jumping around from frame to frame.
+    pub broadband: Option<(usize, usize)>,
     /// Spectro-temporal pattern of the whole sound, for finding it
     /// elsewhere (`None` if nothing above the noise was marked).
     pub template: Option<crate::similar::Template>,
@@ -386,6 +393,17 @@ pub fn analyze_power(
         pitch_track[t] = Some(pos);
     }
 
+    // A noise band has no pitch: its loudest bin is random. Following it
+    // would report "partials" that are just other parts of the band
+    // (issue #24), so such a selection is treated as the band itself.
+    let kk1 = k1.min(bins - 1);
+    let broadband = is_broadband(&pitch_track, &active, &weighted, (k0, kk1), params.harmonic_tolerance)
+        .then(|| noise_band(&weighted, &active, (k0, kk1)))
+        .flatten();
+    if broadband.is_some() {
+        pitch_track.iter_mut().for_each(|p| *p = None);
+    }
+
     // If the tracked peak is mostly not above the noise, the selection holds
     // no tonal sound and every "partial" found would be a noise artefact.
     let tracked: Vec<f32> = (0..frames)
@@ -498,6 +516,7 @@ pub fn analyze_power(
         comodulated,
         pitch_track,
         partials,
+        broadband,
         template: None,
         model: None,
     };
@@ -505,6 +524,93 @@ pub fn analyze_power(
     analysis.template = crate::similar::Template::build(power, first_frame, noise, &analysis.members());
     analysis.model = crate::share::SourceModel::build(power, noise, &analysis, params.harmonic_tolerance);
     analysis
+}
+
+/// Share of the marked band's energy (above the noise) that the tracked
+/// peak must stay below for a sound to count as a noise band: a tone, even
+/// a weak one with overtones in the selection, puts far more of the band's
+/// energy into its peak (the owl calls: ~0.7, cricket pulses: ~0.15).
+const BROADBAND_MAX_PEAK_SHARE: f32 = 0.3;
+/// Pitch change (as |ln ratio|) between consecutive frames that counts as
+/// a jump: 0.1 is about 1.7 semitones within one hop, far faster than a
+/// voice glides or a vibrato swings.
+const PITCH_JUMP: f32 = 0.1;
+/// Share of consecutive frame pairs with a [`PITCH_JUMP`] above which the
+/// "pitch track" is taken to be random (cricket pulses: ~0.3, tones: 0).
+const BROADBAND_MIN_JUMP_SHARE: f32 = 0.15;
+
+/// Whether the marked sound is a band of noise rather than a tone. Both
+/// signs must agree, so tonal sounds are never misjudged on one alone:
+/// - the tracked peak carries only a small share of the band's energy
+///   above the noise (`weighted` is the presence-weighted magnitude), and
+/// - the peak jumps around between consecutive frames.
+///
+/// A rich voice marked over many overtones fails the first test but not
+/// the second; a fast chirp may jump, but then it holds its band's energy.
+fn is_broadband(
+    pitch_track: &[Option<f32>],
+    active: &[usize],
+    weighted: &[Vec<f32>],
+    (k0, k1): (usize, usize),
+    tolerance: f32,
+) -> bool {
+    // Mean share of the energy near the peak over the active frames.
+    let mut share_sum = 0.0f32;
+    let mut frames = 0usize;
+    for &t in active {
+        let Some(p) = pitch_track[t] else { continue };
+        let row = &weighted[t];
+        let total: f32 = row[k0..=k1].iter().map(|v| v * v).sum();
+        if total <= 0.0 {
+            continue;
+        }
+        let (lo, hi) = band(p, (p * tolerance).max(2.0), row.len());
+        let near: f32 = row[lo.max(k0)..=hi.min(k1)].iter().map(|v| v * v).sum();
+        share_sum += near / total;
+        frames += 1;
+    }
+    if frames < 4 {
+        return false; // too little to judge; keep the tonal analysis
+    }
+    let peak_share = share_sum / frames as f32;
+    // Share of neighbouring active frames whose peaks jump.
+    let (mut pairs, mut jumps) = (0usize, 0usize);
+    for w in active.windows(2) {
+        if w[1] != w[0] + 1 {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (pitch_track[w[0]], pitch_track[w[1]]) {
+            pairs += 1;
+            if (b.max(0.5) / a.max(0.5)).ln().abs() > PITCH_JUMP {
+                jumps += 1;
+            }
+        }
+    }
+    let jump_share = jumps as f32 / pairs.max(1) as f32;
+    peak_share < BROADBAND_MAX_PEAK_SHARE && jump_share > BROADBAND_MIN_JUMP_SHARE
+}
+
+/// Extent of a noise band: the bins in `k0 ..= k1` between which lie 95 %
+/// of the band's energy above the noise over the active frames (2.5 % cut
+/// off at either end, so a weak neighbour overlapping the selection's edge
+/// does not stretch the band). `None` if there is no such energy.
+fn noise_band(weighted: &[Vec<f32>], active: &[usize], (k0, k1): (usize, usize)) -> Option<(usize, usize)> {
+    let energy: Vec<f32> = (k0..=k1)
+        .map(|k| active.iter().map(|&t| weighted[t][k] * weighted[t][k]).sum())
+        .collect();
+    let total: f32 = energy.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    // First bin at which the cumulative energy reaches `q` of the total.
+    let quantile = |q: f32| {
+        let mut acc = 0.0f32;
+        energy.iter().position(|&e| {
+            acc += e;
+            acc >= q * total
+        })
+    };
+    Some((k0 + quantile(0.025)?, k0 + quantile(0.975)?))
 }
 
 /// All reduced fractions m/n ≠ 1 with m ≤ `max_m` and n ≤ `max_n`, sorted.
@@ -848,6 +954,112 @@ mod tests {
         let (_, harm, _) = a.frame(mid).unwrap();
         let m = harm[k_oct - 1..=k_oct + 1].iter().cloned().fold(0.0f32, f32::max);
         assert!(m > 0.9, "octave mask only {m}");
+    }
+
+    /// Pseudo-random numbers in -0.5..0.5 (a fixed LCG, so tests repeat).
+    fn lcg(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    }
+
+    /// Insect-like pulses (issue #24): band-limited noise from 6 to 20 kHz,
+    /// switched on and off at 6 Hz, over faint white noise, 48 kHz.
+    fn noise_pulses(secs: f32) -> Vec<f32> {
+        let sr = 48000.0;
+        let n = (sr * secs) as usize;
+        let mut rng = 99u64;
+        // Band-limited noise as a sum of many sines with random frequencies
+        // and phases inside the band.
+        let partials: Vec<(f32, f32)> = (0..300)
+            .map(|_| (13000.0 + 14000.0 * lcg(&mut rng), std::f32::consts::TAU * lcg(&mut rng)))
+            .collect();
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr;
+                let on = (t * 6.0).fract() < 0.5;
+                let band = if on {
+                    partials
+                        .iter()
+                        .map(|&(f, ph)| (std::f32::consts::TAU * f * t + ph).sin())
+                        .sum::<f32>()
+                        * 0.01
+                } else {
+                    0.0
+                };
+                band + 0.002 * lcg(&mut rng)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn noise_pulses_are_broadband_without_pitch_or_partials() {
+        let x = noise_pulses(2.0);
+        let stft = Stft::new(StftConfig::default());
+        let sel = Selection {
+            start_s: 0.2,
+            end_s: 1.8,
+            low_hz: 2000.0,
+            high_hz: 22000.0,
+        };
+        let a = analyze_selection(
+            &x,
+            &[],
+            48000,
+            &stft,
+            &sel,
+            &NoiseEstimate::default(),
+            &AnalysisParams::default(),
+        );
+        let (lo, hi) = a.broadband.expect("noise band taken for a tone");
+        let hz = |k: usize| StftConfig::default().bin_to_hz(k as f32, 48000);
+        assert!((5000.0..8000.0).contains(&hz(lo)), "band starts at {} Hz", hz(lo));
+        assert!((18500.0..21000.0).contains(&hz(hi)), "band ends at {} Hz", hz(hi));
+        assert!(a.partials.is_empty(), "partials in noise: {:?}", a.partials);
+        assert!(a.pitch_track.iter().all(Option::is_none));
+        assert!(a.harmonics.iter().flatten().all(|&m| m == 0.0));
+        // The band itself is still the marked sound.
+        let k = (10000.0 * 2048.0 / 48000.0) as usize;
+        assert!(a.selected.iter().any(|f| f[k] > 0.9));
+        assert!(a.model.is_none());
+    }
+
+    #[test]
+    fn harmonic_tone_with_vibrato_stays_tonal() {
+        let sr = 48000;
+        let n = 2 * sr as usize;
+        let mut rng = 5u64;
+        let mut phase = 0.0f32;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                // 5.5 Hz vibrato of ±3 % around 800 Hz, three overtones.
+                let f0 = 800.0 * (1.0 + 0.03 * (std::f32::consts::TAU * 5.5 * t).sin());
+                phase += std::f32::consts::TAU * f0 / sr as f32;
+                0.4 * phase.sin() + 0.2 * (2.0 * phase).sin() + 0.1 * (3.0 * phase).sin() + 0.002 * lcg(&mut rng)
+            })
+            .collect();
+        let stft = Stft::new(StftConfig::default());
+        // A wide selection over the fundamental and its overtones.
+        let sel = Selection {
+            start_s: 0.2,
+            end_s: 1.8,
+            low_hz: 600.0,
+            high_hz: 2800.0,
+        };
+        let a = analyze_selection(
+            &x,
+            &[],
+            sr,
+            &stft,
+            &sel,
+            &NoiseEstimate::default(),
+            &AnalysisParams::default(),
+        );
+        assert!(a.broadband.is_none(), "tone taken for noise");
+        let ratios: Vec<f32> = a.partials.iter().map(|p| p.ratio).collect();
+        assert!(ratios.contains(&2.0) && ratios.contains(&3.0), "partials {ratios:?}");
     }
 
     #[test]
