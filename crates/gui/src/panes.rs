@@ -102,7 +102,7 @@ impl Pane {
 }
 
 /// The per-user config store.
-fn config() -> Config {
+pub(crate) fn config() -> Config {
     Config::new("noiseextractor", None, None, None, ConfigStyle::USE_LOCAL_FILE)
 }
 

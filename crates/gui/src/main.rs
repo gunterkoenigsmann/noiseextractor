@@ -52,6 +52,7 @@ mod log;
 mod overview;
 mod panes;
 mod player;
+mod recent;
 mod scrub;
 mod toolbar;
 mod view;
@@ -71,6 +72,7 @@ use noiseextractor_core::{AudioData, Engine, EngineConfig, Focus, Listen, Pick};
 use overview::{Overview, Peaks};
 use panes::{Contents, Pane, Panes};
 use player::Player;
+use recent::{Command as RecentCommand, Kind as RecentKind, RecentFiles};
 use scrub::Scrubber;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -207,6 +209,10 @@ struct State {
     /// What is heard (and drawn in blue): everything, only the picked
     /// sound, or everything but it (see [`listen_picks`]).
     listen: Listen,
+    /// File > Recent recordings, remembered between runs.
+    recent_audio: RecentFiles,
+    /// File > Recent projects, remembered between runs.
+    recent_projects: RecentFiles,
 }
 
 impl State {
@@ -223,6 +229,22 @@ impl State {
             &filter_list::effective_picks(&self.picked, self.current_filter),
             self.project.preview.is_some(),
         )
+    }
+
+    /// The recent-files list of `kind`.
+    fn recent_mut(&mut self, kind: RecentKind) -> &mut RecentFiles {
+        match kind {
+            RecentKind::Audio => &mut self.recent_audio,
+            RecentKind::Project => &mut self.recent_projects,
+        }
+    }
+
+    /// Puts `path` at the top of the list of `kind`, stores the list and
+    /// updates its menu.
+    fn remember(&mut self, ui: Ui, kind: RecentKind, path: &Path) {
+        let list = self.recent_mut(kind);
+        list.add(path.to_path_buf());
+        show_recent(ui, kind, list);
     }
 }
 
@@ -341,8 +363,15 @@ fn main() {
             filter_counter: 1,
             busy: None,
             listen: Listen::All,
+            recent_audio: recent::load(RecentKind::Audio),
+            recent_projects: recent::load(RecentKind::Project),
         }));
         let ui = build_ui();
+        {
+            let s = state.borrow();
+            show_recent(ui, RecentKind::Audio, &s.recent_audio);
+            show_recent(ui, RecentKind::Project, &s.recent_projects);
+        }
         bind_events(&state, ui);
         refresh_filter_list(&state.borrow(), ui);
         if let Some(path) = std::env::args().nth(1) {
@@ -374,6 +403,21 @@ fn build_ui() -> Ui {
         .append_separator()
         .append_item(ID_QUIT, "&Quit\tCtrl+Q", "Leave noiseextractor")
         .build();
+    // The builder cannot add submenus: each list goes right below the
+    // command that opens that kind of file (positions count the items
+    // inserted before).
+    file_menu.insert_submenu(
+        1,
+        recent::submenu(RecentKind::Audio),
+        RecentKind::Audio.menu_label(),
+        RecentKind::Audio.menu_help(),
+    );
+    file_menu.insert_submenu(
+        3,
+        recent::submenu(RecentKind::Project),
+        RecentKind::Project.menu_label(),
+        RecentKind::Project.menu_help(),
+    );
     let mut view_menu = Menu::builder()
         .append_item(
             ID_PLAY,
@@ -675,6 +719,7 @@ fn bind_events(state: &Shared, ui: Ui) {
                 match s.project.save(&path) {
                     Ok(()) => {
                         report(ui, &format!("Saved {}", path.display()));
+                        s.remember(ui, RecentKind::Project, &path);
                         s.project_path = Some(path);
                     }
                     Err(err) => error_box(ui, &format!("{err:#}")),
@@ -720,10 +765,15 @@ fn bind_events(state: &Shared, ui: Ui) {
         ID_LEARN_NOISE => learn_noise(&st, ui),
         ID_FIND_SOUNDS => start_discovery(&mut st.borrow_mut(), ui),
         ID_QUIT => ui.frame.close(true),
-        id => match Pane::for_menu_id(id) {
-            Some(pane) => ui.panes.toggle(pane),
-            None => e.skip(true),
-        },
+        id => {
+            if let Some(cmd) = RecentCommand::for_menu_id(id) {
+                run_recent(&st, ui, cmd);
+            } else if let Some(pane) = Pane::for_menu_id(id) {
+                ui.panes.toggle(pane);
+            } else {
+                e.skip(true);
+            }
+        }
     });
     // Remember the layout for the next start; detach the panes before the
     // frame goes away, as wxWidgets asks.
@@ -1201,6 +1251,7 @@ fn open_project(st: &Shared, ui: Ui, path: &Path) {
         Err(e) => return error_box(ui, &format!("{e:#}")),
     };
     let mut s = st.borrow_mut();
+    s.remember(ui, RecentKind::Project, path);
     s.project_path = Some(path.to_path_buf());
     s.focus_filter(if project.filters.is_empty() { None } else { Some(0) });
     if let Some(doc) = &s.doc {
@@ -1220,6 +1271,47 @@ fn open_project(st: &Shared, ui: Ui, path: &Path) {
         s.project = project;
     }
     refresh_filter_list(&s, ui);
+}
+
+/// Shows the recent-files list of `kind` in its submenu and stores it.
+fn show_recent(ui: Ui, kind: RecentKind, list: &RecentFiles) {
+    recent::save(kind, list);
+    if let Some(bar) = ui.frame.get_menu_bar() {
+        recent::refresh(&bar, kind, list);
+    }
+}
+
+/// Runs a command of a recent-files submenu: opens the file, or takes it
+/// off the list if it is gone (moved, deleted, on an unplugged drive).
+fn run_recent(st: &Shared, ui: Ui, cmd: RecentCommand) {
+    let (kind, index) = match cmd {
+        RecentCommand::Clear(kind) => {
+            let mut s = st.borrow_mut();
+            let list = s.recent_mut(kind);
+            list.clear();
+            show_recent(ui, kind, list);
+            return;
+        }
+        RecentCommand::Open(kind, index) => (kind, index),
+    };
+    let Some(path) = st.borrow_mut().recent_mut(kind).get(index).map(Path::to_path_buf) else {
+        return;
+    };
+    if !path.is_file() {
+        let mut s = st.borrow_mut();
+        let list = s.recent_mut(kind);
+        list.remove(&path);
+        show_recent(ui, kind, list);
+        report(
+            ui,
+            &format!("{} no longer exists; removed it from the list", path.display()),
+        );
+        return;
+    }
+    match kind {
+        RecentKind::Audio => start_loading(&mut st.borrow_mut(), path),
+        RecentKind::Project => open_project(st, ui, &path),
+    }
 }
 
 /// Hands the current project to the engine, which recomputes in the
@@ -1672,6 +1764,7 @@ fn tick(s: &mut State, ui: Ui) {
         match msg {
             Background::Loaded(path, Ok((audio, peaks))) => {
                 s.busy = None;
+                s.remember(ui, RecentKind::Audio, &path);
                 install_audio(s, ui, &path, audio, peaks);
             }
             Background::Loaded(path, Err(e)) => {
