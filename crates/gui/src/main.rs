@@ -22,7 +22,10 @@
 //!
 //! In the overview, dragging the frame (or clicking beside it) scrolls the
 //! spectrogram; dragging beside the frame selects a time span and zooms the
-//! spectrogram to it.
+//! spectrogram to it. An orange envelope there shows how loud what the
+//! selection being edited (else the filter picked in the list) finds is at
+//! each time, so repetitions of a marked sound can be spotted in the whole
+//! recording.
 //!
 //! Picking a filter in the list draws its overlays even when "Show in
 //! spectrogram" is off: what an event filter targets in green / red /
@@ -66,11 +69,11 @@ use noiseextractor_core::discover::{discover, DiscoverParams, Discovery};
 use noiseextractor_core::engine::process_all;
 use noiseextractor_core::filter::{EventFilter, Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::{mean_power, NoiseEstimate};
-use noiseextractor_core::render::render_rgb;
+use noiseextractor_core::render::{render_rgb, ORANGE};
 use noiseextractor_core::similar::SimilarParams;
 use noiseextractor_core::stft::{Stft, StftConfig};
 use noiseextractor_core::{AudioData, Engine, EngineConfig, Focus, Listen, Pick};
-use overview::{Overview, Peaks};
+use overview::{found_columns, Overview, Peaks};
 use panes::{Contents, Pane, Panes};
 use player::Player;
 use recent::{Command as RecentCommand, Kind as RecentKind, RecentFiles};
@@ -1338,7 +1341,12 @@ fn run_recent(st: &Shared, ui: Ui, cmd: RecentCommand) {
 fn push_project(s: &State) {
     if let Some(doc) = &s.doc {
         let mut project = s.project.for_listening(s.listen, &s.listen_picks());
-        project.highlight = highlighted_filter(s.current_filter, s.project.preview.is_some());
+        // A selection that for_listening turned into a filter stays
+        // highlighted, so the overview keeps showing what it finds.
+        let moved_selection = s.project.preview.is_some() && project.preview.is_none();
+        if !moved_selection {
+            project.highlight = highlighted_filter(s.current_filter, s.project.preview.is_some());
+        }
         doc.engine.set_project(project);
     }
 }
@@ -2092,7 +2100,8 @@ fn scroll_to(s: &mut State, ui: Ui, start: usize) {
     request_repaint();
 }
 
-/// Draws the overview: the waveform of the whole recording, the selection's
+/// Draws the overview: the waveform of the whole recording, how much the
+/// filter being worked on found where (orange), the selection's
 /// time span, the frame around the part shown in the spectrogram, a span
 /// being dragged out to zoom to, and the play head.
 fn paint_overview(s: &State, ui: Ui, dc: &AutoBufferedPaintDC) {
@@ -2110,6 +2119,21 @@ fn paint_overview(s: &State, ui: Ui, dc: &AutoBufferedPaintDC) {
     for (x, (lo, hi)) in doc.peaks.columns(w.max(1) as u32).into_iter().enumerate() {
         let (y0, y1) = ((mid - hi * scale) as i32, (mid - lo * scale) as i32);
         dc.draw_line(x as i32, y0, x as i32, y1.max(y0 + 1));
+    }
+    // How much the filter being worked on found where: an orange envelope
+    // on the waveform's scale, so its share of the recording shows.
+    let [r, g, b] = ORANGE.map(|v| v as u8);
+    dc.set_pen(Colour::rgb(r, g, b), 1, PenStyle::Solid);
+    let engine = &doc.engine;
+    for (x, a) in found_columns(w.max(1) as u32, engine.layout(), &|c| engine.chunk(c))
+        .into_iter()
+        .enumerate()
+    {
+        let Some(a) = a else { continue };
+        let a = (a * scale).min(mid);
+        if a >= 0.5 {
+            dc.draw_line(x as i32, (mid - a) as i32, x as i32, (mid + a) as i32);
+        }
     }
     let sr = doc.audio.sample_rate as f64;
     dc.set_brush(Colour::rgb(0, 0, 0), BrushStyle::Transparent);

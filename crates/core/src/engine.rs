@@ -93,6 +93,24 @@ pub struct ChunkResult {
     pub selected: Vec<u8>,
     /// Red overlay mask (0..255).
     pub inferred: Vec<u8>,
+    /// Amplitude of what the analysis found of the picked filter
+    /// ([`Project::found_target`](crate::Project::found_target)) in each
+    /// frame, on the scale of the samples (see [`power_to_amplitude`]),
+    /// for the overview's orange curve. Empty when nothing is picked.
+    pub found: Vec<f32>,
+}
+
+/// Turns the power `energy` of one frame, summed over the bins
+/// `0..=fft_size/2` of our unscaled, Hann-windowed STFT, into the peak
+/// amplitude of a sine with that energy: a 0.5-amplitude sine gives 0.5,
+/// so the result can be drawn on the same scale as the waveform.
+///
+/// Parseval: Σ over all N bins |X|² = N · Σ (x·w)², and the one-sided half
+/// holds half of it. With Σ w² = 3N/8 for a Hann window, the windowed
+/// mean square is 16·E / (3N²); a sine's peak is √2 times its RMS.
+pub fn power_to_amplitude(energy: f32, fft_size: usize) -> f32 {
+    let n = fft_size as f32;
+    (32.0 * energy.max(0.0) / (3.0 * n * n)).sqrt()
 }
 
 /// Static description of how a recording is cut into chunks.
@@ -237,6 +255,15 @@ pub fn process_chunk(
     let mut selected = Vec::with_capacity(frames * bins);
     let mut inferred = Vec::with_capacity(frames * bins);
     let p_off = (pad + warm) as usize + ctx; // frame cC
+    let found = if gains.found.is_empty() {
+        Vec::new()
+    } else {
+        let gi = pad as usize;
+        gains.found[gi..gi + frames]
+            .iter()
+            .map(|&e| power_to_amplitude(e, cfg.fft_size))
+            .collect()
+    };
     for t in 0..frames {
         let p = &power[p_off + t];
         let gi = pad as usize + t;
@@ -262,6 +289,7 @@ pub fn process_chunk(
         output_db,
         selected,
         inferred,
+        found,
     }
 }
 
@@ -719,6 +747,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn found_power_is_converted_to_a_sines_peak_amplitude() {
+        // Mid-recording frame of a 0.5-amplitude sine, between bins on
+        // purpose so the energy is spread over several bins.
+        let cfg = StftConfig {
+            fft_size: 512,
+            hop: 128,
+        };
+        let x: Vec<f32> = (0..8000)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 1234.5 * i as f32 / 8000.0).sin())
+            .collect();
+        let power = Stft::new(cfg).analyze(&x, 30, 1).power();
+        let a = power_to_amplitude(power[0].iter().sum(), cfg.fft_size);
+        assert!((a - 0.5).abs() < 0.01, "amplitude {a}");
+        assert_eq!(power_to_amplitude(0.0, 512), 0.0);
+    }
+
+    #[test]
+    fn the_picked_noise_reduction_finds_the_noise_not_the_tone() {
+        let audio = noisy_tone(8000, 3.0);
+        let found = |p: &Project| {
+            let mut found = Vec::new();
+            process_all(&audio, p, 32, 2, |r| {
+                found.extend_from_slice(&r.found);
+                Ok(())
+            })
+            .unwrap();
+            found
+        };
+        let mut p = small_project();
+        assert!(found(&p).is_empty(), "nothing picked, nothing measured");
+        p.highlight = Some(0);
+        let f = found(&p);
+        assert_eq!(
+            f.len(),
+            32 * ChunkLayout {
+                hop: 128,
+                chunk_frames: 32,
+                total_samples: audio.len()
+            }
+            .chunk_count()
+        );
+        // Frame i is centred on sample 128·i. Noise only at 0.30–0.45 s;
+        // a 0.5 tone burst plus the same noise at 0.02–0.10 s. The noise
+        // is uniform ±0.025: RMS 0.0144, i.e. a "sine peak" of 0.02.
+        let mean = |r: std::ops::Range<usize>| f[r.clone()].iter().sum::<f32>() / r.len() as f32;
+        let quiet = mean(2400 / 128..3600 / 128);
+        let burst = mean(160 / 128 + 1..800 / 128);
+        assert!((0.008..0.03).contains(&quiet), "noise found between bursts: {quiet}");
+        assert!(burst < 0.05, "the tone is not noise: {burst}");
+    }
+
     /// Issue #3: with slowly changing noise, each chunk used to estimate its
     /// own noise spectrum, so the gain stepped at chunk borders and the
     /// output depended on the chunk size. Now a frame's noise estimate
@@ -1017,6 +1097,7 @@ mod tests {
                 output_db: vec![],
                 selected: vec![],
                 inferred: vec![],
+                found: vec![],
             }))
         };
         st.slots[0] = dummy(0);
