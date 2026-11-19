@@ -162,8 +162,10 @@ struct Doc {
     engine: Arc<Engine>,
     /// `None` when no output device is available.
     player: Option<Player>,
-    /// File name for the title bar.
+    /// File name for the title bar and the export dialog.
     name: String,
+    /// Where the recording was loaded from; saved projects refer to it.
+    path: PathBuf,
     /// Block peaks of the mono mix, for the overview.
     peaks: Peaks,
 }
@@ -1286,6 +1288,9 @@ fn install_audio(s: &mut State, ui: Ui, path: &Path, audio: AudioData, peaks: Pe
         }
     }
     s.project.prepare(&audio);
+    // Saving the project from now on names this recording, so reopening
+    // the project (File > Recent projects) brings it back.
+    s.project.audio = Some(std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
     let engine = Arc::new(Engine::new(audio.clone(), s.project.clone(), EngineConfig::default()));
     let player = match Player::new(engine.clone()) {
         Ok(p) => Some(p),
@@ -1321,6 +1326,7 @@ fn install_audio(s: &mut State, ui: Ui, path: &Path, audio: AudioData, peaks: Pe
         engine,
         player,
         name,
+        path: path.to_path_buf(),
         peaks,
     });
     s.last_revision = u64::MAX;
@@ -1328,9 +1334,12 @@ fn install_audio(s: &mut State, ui: Ui, path: &Path, audio: AudioData, peaks: Pe
     ui.overview.refresh(false, None);
 }
 
-/// Loads a project file, keeping the current recording.
+/// Loads a project file together with the recording it names. A project
+/// that names no recording (saved by older versions), or names the one
+/// already open, or whose recording is gone, is applied to the current
+/// recording instead.
 fn open_project(st: &Shared, ui: Ui, path: &Path) {
-    let mut project = match Project::load(path) {
+    let project = match Project::load(path) {
         Ok(p) => p,
         Err(e) => return error_box(ui, &format!("{e:#}")),
     };
@@ -1338,23 +1347,55 @@ fn open_project(st: &Shared, ui: Ui, path: &Path) {
     s.remember(ui, RecentKind::Project, path);
     s.project_path = Some(path.to_path_buf());
     s.focus_filter(if project.filters.is_empty() { None } else { Some(0) });
-    if let Some(doc) = &s.doc {
-        project.prepare(&doc.audio);
-        if project.stft != doc.engine.project().stft {
-            // A different STFT needs a new engine; reinstalling is simplest.
-            let audio = (*doc.audio).clone();
-            let name = doc.name.clone();
-            let peaks = doc.peaks.clone();
-            s.project = project;
-            install_audio(&mut s, ui, Path::new(&name), audio, peaks);
-        } else {
-            s.project = project;
-            push_project(&s);
+    let current = s.doc.as_ref().map(|d| d.path.clone());
+    let wanted = project.recording_to_open(current.as_deref()).map(Path::to_path_buf);
+    s.project = project;
+    match wanted {
+        Some(audio) if audio.is_file() => {
+            // `install_audio` prepares the project for the new recording
+            // once it is decoded; until then the old one stays on screen.
+            refresh_filter_list(&s, ui);
+            start_loading(&mut s, audio);
+            return;
         }
-    } else {
-        s.project = project;
+        Some(audio) => {
+            report(
+                ui,
+                &format!(
+                    "The project's recording {} is missing; its filters now apply to the open recording",
+                    audio.display()
+                ),
+            );
+            // Saving again should not re-point the project to nowhere.
+            s.project.audio = current;
+        }
+        None => {
+            if current.is_some() {
+                s.project.audio = current;
+            }
+        }
     }
+    apply_project(&mut s, ui);
     refresh_filter_list(&s, ui);
+}
+
+/// Hands a newly loaded project to the open recording, if any: analyses
+/// its marked sounds there, and rebuilds the engine when the project uses
+/// another STFT.
+fn apply_project(s: &mut State, ui: Ui) {
+    let Some(doc) = &s.doc else {
+        return;
+    };
+    s.project.prepare(&doc.audio);
+    if s.project.stft != doc.engine.project().stft {
+        // A different STFT needs a new engine; reinstalling is simplest.
+        let audio = (*doc.audio).clone();
+        let path = doc.path.clone();
+        let peaks = doc.peaks.clone();
+        install_audio(s, ui, &path, audio, peaks);
+    } else {
+        push_project(s);
+    }
 }
 
 /// Shows the recent-files list of `kind` in its submenu and stores it.
@@ -1914,6 +1955,15 @@ fn tick(s: &mut State, ui: Ui) {
             Background::Loaded(path, Err(e)) => {
                 s.busy = None;
                 report(ui, &format!("Cannot open {}: {e:#}", path.display()));
+                // A project opened together with this recording applies
+                // to the recording that stays open instead. (Opening a
+                // recording by itself leaves the project naming the open
+                // one, so nothing changes then.)
+                let open = s.doc.as_ref().map(|d| d.path.clone());
+                if open.is_some() && s.project.recording_to_open(open.as_deref()).is_some() {
+                    s.project.audio = open;
+                    apply_project(s, ui);
+                }
             }
             Background::Analysed(sel, params, a) => {
                 // Every object that still has this selection and these

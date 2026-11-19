@@ -527,6 +527,29 @@ fn mark_reports_insect_pulses_as_broadband_without_partials() {
     assert!(!report.contains("related partial"), "{report}");
 }
 
+/// A saved project names its recording, so opening the project (File >
+/// Recent projects in the GUI) can open the recording too.
+#[test]
+fn saved_project_names_its_recording_relative_to_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("rec")).unwrap();
+    let input = dir.path().join("rec").join("in.wav");
+    write_test_audio(&input);
+    let proj = dir.path().join("p.json");
+    let st = bin()
+        .arg("denoise")
+        .arg(&input)
+        .arg("--save-project")
+        .arg(&proj)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&proj).unwrap()).unwrap();
+    assert_eq!(json["recording"], "rec/in.wav");
+    let loaded = Project::load(&proj).unwrap().audio.unwrap();
+    assert_eq!(loaded.canonicalize().unwrap(), input.canonicalize().unwrap());
+}
+
 #[test]
 fn normalize_scales_the_whole_output_by_one_gain() {
     let dir = tempfile::tempdir().unwrap();

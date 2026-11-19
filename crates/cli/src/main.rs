@@ -293,6 +293,8 @@ fn run(cli: Cli) -> Result<()> {
                 nr.estimate = NoiseEstimate::Profile(learn_noise(&audio, &project.stft, a, b)?);
             }
             if let Some(p) = save_project {
+                // Lets the GUI open the recording along with the project.
+                project.audio = Some(input.clone());
                 project.save(&p)?;
             }
             match (output, options) {
@@ -333,6 +335,8 @@ fn run(cli: Cli) -> Result<()> {
             project.prepare(&audio);
             print_report(&project, &audio);
             if let Some(p) = save_project {
+                // Lets the GUI open the recording along with the project.
+                project.audio = Some(input.clone());
                 project.save(&p)?;
             }
             Ok(())
@@ -372,6 +376,8 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             if let Some(p) = save_project {
+                // Lets the GUI open the recording along with the project.
+                project.audio = Some(input.clone());
                 project.save(&p)?;
             }
             Ok(())

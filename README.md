@@ -128,7 +128,7 @@ libraries.
 | Show / hide panes (filters, detection settings, overview, log) | View menu, or the pane's close button; panes can be dragged to other edges or floated, and the layout is remembered |
 | Find the sounds a recording is made of | *Find sounds* (Ctrl+F); how many patterns to look for and whether they are grouped is set in File > Settings > Find sounds (only the selected stretch is used to learn, if there is a selection); *Keep*, *Merge with...*, *Split* and *Discard suggestions* edit the result |
 | Learn the background noise | Mark a noise-only stretch, *Learn noise from selection* |
-| Save the filter list | File > Save project (Ctrl+S) |
+| Save the filter list | File > Save project (Ctrl+S). The project remembers its recording (relative to the project file when both live in one folder tree, so the folder can be moved), and opening the project opens that recording again; if it is gone, the filters apply to the recording that is open |
 | Reopen a recent recording or project | File > Recent recordings / Recent projects (nine of each are remembered; a file that is gone is dropped from the list) |
 | Write the result | File > Export processed audio (Ctrl+E); the file type list (or the extension you type) picks WAV, FLAC, Ogg Vorbis, MP3, Opus or Apple Lossless, see [Export formats](#export-formats) |
 | Make a quiet extracted sound louder in the export | File > Settings > Export > *Normalize the exported audio*: the whole file is scaled by one gain so its loudest sample reaches the chosen level (default -1 dBFS); the levels inside it keep their ratios |
