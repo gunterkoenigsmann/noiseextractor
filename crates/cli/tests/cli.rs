@@ -526,3 +526,93 @@ fn mark_reports_insect_pulses_as_broadband_without_partials() {
     assert!(!report.contains("dominant frequency"), "{report}");
     assert!(!report.contains("related partial"), "{report}");
 }
+
+/// The output of `completions ARGS`.
+fn completion_script(args: &[&str]) -> String {
+    let out = bin().arg("completions").args(args).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Runs `script` in a non-interactive bash inside `dir` and returns its
+/// output; `None` without bash.
+#[cfg(unix)]
+fn run_bash(dir: &Path, script: &str) -> Option<String> {
+    let out = Command::new("bash")
+        .arg("--norc")
+        .arg("-c")
+        .arg(script)
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    Some(String::from_utf8(out.stdout).unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_completion_of_the_gui_offers_recordings_projects_and_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    for f in ["birds.nxp", "rec.WAV", "song.flac", "notes.txt"] {
+        std::fs::write(dir.path().join(f), b"").unwrap();
+    }
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let script = dir.path().join("noiseextractor.bash");
+    std::fs::write(&script, completion_script(&["bash", "noiseextractor"])).unwrap();
+    // Without bash-completion's _filedir: the script's own fallback.
+    let words = format!(
+        ". '{}'; COMP_WORDS=(noiseextractor ''); COMP_CWORD=1; _noiseextractor; \
+         printf '%s\\n' \"${{COMPREPLY[@]}}\" | sort",
+        script.display()
+    );
+    let Some(out) = run_bash(dir.path(), &words) else {
+        return;
+    };
+    assert_eq!(out, "birds.nxp\nrec.WAV\nsong.flac\nsub\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_completion_of_the_cli_offers_subcommands() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("cli.bash");
+    std::fs::write(&script, completion_script(&["bash"])).unwrap();
+    let words = format!(
+        ". '{}'; COMP_WORDS=(noiseextractor-cli comp); COMP_CWORD=1; \
+         _noiseextractor__cli noiseextractor-cli comp noiseextractor-cli; \
+         printf '%s\\n' \"${{COMPREPLY[@]}}\"",
+        script.display()
+    );
+    let Some(out) = run_bash(dir.path(), &words) else {
+        return;
+    };
+    assert_eq!(out.trim(), "completions");
+}
+
+#[test]
+fn completion_scripts_exist_for_every_shell() {
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        assert!(completion_script(&[shell]).contains("noiseextractor-cli"), "{shell}");
+    }
+    for shell in ["bash", "zsh", "fish"] {
+        assert!(completion_script(&[shell, "noiseextractor"]).contains("nxp"), "{shell}");
+    }
+    // The GUI has no PowerShell script, and says so.
+    let out = bin()
+        .args(["completions", "powershell", "noiseextractor"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn projects_saved_as_nxp_and_old_json_both_load() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["new.nxp", "old.json"] {
+        let path = dir.path().join(name);
+        let out = bin().arg("new-project").arg(&path).output().unwrap();
+        assert!(out.status.success());
+        Project::load(&path).unwrap();
+        assert!(noiseextractor_core::project_file::is_project_file(&path));
+    }
+}

@@ -44,6 +44,27 @@ install -Dm644 "$root/packaging/icons/noiseextractor.svg" \
 mkdir -p "$pkg/usr/share/icons/hicolor/256x256/apps"
 rsvg-convert -w 256 -h 256 "$root/packaging/icons/noiseextractor.svg" \
     -o "$pkg/usr/share/icons/hicolor/256x256/apps/noiseextractor.png"
+# The project file type (*.nxp): its shared-mime-info declaration and an
+# icon under the type's name, the app icon. The triggers of
+# shared-mime-info, desktop-file-utils and hicolor-icon-theme update their
+# caches when dpkg installs files there, so no maintainer scripts are needed.
+install -Dm644 "$root/packaging/linux/noiseextractor.xml" \
+    "$pkg/usr/share/mime/packages/noiseextractor.xml"
+install -Dm644 "$root/packaging/icons/noiseextractor.svg" \
+    "$pkg/usr/share/icons/hicolor/scalable/mimetypes/application-x-noiseextractor-project.svg"
+# Shell completion for both programs, written by the CLI itself (see
+# crates/cli/src/completions.rs), in the directories the shells' Debian
+# packages read.
+cli="$target_dir/release/noiseextractor-cli"
+for prog in noiseextractor noiseextractor-cli; do
+    mkdir -p "$pkg/usr/share/bash-completion/completions" \
+        "$pkg/usr/share/zsh/vendor-completions" "$pkg/usr/share/fish/vendor_completions.d"
+    "$cli" completions bash "$prog" > "$pkg/usr/share/bash-completion/completions/$prog"
+    "$cli" completions zsh "$prog" > "$pkg/usr/share/zsh/vendor-completions/_$prog"
+    "$cli" completions fish "$prog" > "$pkg/usr/share/fish/vendor_completions.d/$prog.fish"
+done
+chmod 644 "$pkg/usr/share/bash-completion/completions/"* \
+    "$pkg/usr/share/zsh/vendor-completions/"* "$pkg/usr/share/fish/vendor_completions.d/"*
 # Debian Policy 12.5: the copyright file, with the full license or a
 # pointer to /usr/share/common-licenses.
 doc="$pkg/usr/share/doc/noiseextractor"

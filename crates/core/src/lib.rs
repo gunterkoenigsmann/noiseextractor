@@ -38,6 +38,7 @@ pub mod engine;
 pub mod filter;
 pub mod listen;
 pub mod noise;
+pub mod project_file;
 pub mod render;
 pub mod rhythm;
 pub mod share;

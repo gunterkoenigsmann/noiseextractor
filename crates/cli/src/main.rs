@@ -6,21 +6,24 @@
 //! `denoise` below).
 //!
 //! ```text
-//! noiseextractor-cli denoise in.flac -o clean.wav --save-project p.json
+//! noiseextractor-cli denoise in.flac -o clean.wav --save-project birds.nxp
 //! noiseextractor-cli mark in.flac --time 12.3:13.1 --freq 2000:4500 \
-//!     --name "blackbird" --extract --project p.json --save-project p.json
+//!     --name "blackbird" --extract --project birds.nxp --save-project birds.nxp
 //! noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract \
-//!     --save-project p.json
-//! noiseextractor-cli process in.flac --project p.json -o out.wav
-//! noiseextractor-cli process in.flac --project p.json --solo 2,3 -o birds.wav
-//! noiseextractor-cli spectrogram in.flac --project p.json -o view.png
+//!     --save-project birds.nxp
+//! noiseextractor-cli process in.flac --project birds.nxp -o out.wav
+//! noiseextractor-cli process in.flac --project birds.nxp --solo 2,3 -o birds.wav
+//! noiseextractor-cli spectrogram in.flac --project birds.nxp -o view.png
 //! ```
 
 // Every item, public or private, carries a doc comment (project rule).
 #![warn(missing_docs, clippy::missing_docs_in_private_items)]
 
+mod completions;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use completions::{CompletionShell, Program};
 use noiseextractor_core::analysis::Selection;
 use noiseextractor_core::audio::WavStreamWriter;
 use noiseextractor_core::discover::{discover, DiscoverParams, Discovery};
@@ -175,8 +178,20 @@ enum Command {
     },
     /// Write a project with the default filters, as a starting point.
     NewProject {
-        /// Output project file.
+        /// Output project file (by convention NAME.nxp).
         output: PathBuf,
+    },
+    /// Print a shell completion script, for this tool or for the GUI.
+    ///
+    /// For example `noiseextractor-cli completions bash >
+    /// ~/.local/share/bash-completion/completions/noiseextractor-cli`.
+    Completions {
+        /// The shell to complete in.
+        #[arg(value_enum)]
+        shell: CompletionShell,
+        /// The program to complete.
+        #[arg(value_enum, default_value = "noiseextractor-cli")]
+        program: Program,
     },
 }
 
@@ -372,6 +387,7 @@ fn run(cli: Cli) -> Result<()> {
             )
         }
         Command::NewProject { output } => Project::default().save(&output),
+        Command::Completions { shell, program } => completions::write(shell, program, &mut std::io::stdout().lock()),
     }
 }
 

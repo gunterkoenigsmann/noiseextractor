@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The MIME type of noiseextractor projects for freedesktop.org's
+     shared-mime-info: installed to /usr/share/mime/packages by the .deb (its
+     dpkg trigger then runs update-mime-database) and shipped in the
+     AppImage for desktop integration tools such as appimaged. Type,
+     extension and icon must equal
+     noiseextractor_core::project_file::PROJECT_FILE_TYPE;
+     crates/core/tests/packaging.rs checks it. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-noiseextractor-project">
+    <comment>noiseextractor project</comment>
+    <!-- A project is a JSON document, so text editors still open it. -->
+    <sub-class-of type="application/json"/>
+    <!-- The icon theme name of the type (packaged as
+         icons/hicolor/*/mimetypes/application-x-noiseextractor-project). -->
+    <icon name="application-x-noiseextractor-project"/>
+    <glob pattern="*.nxp"/>
+  </mime-type>
+</mime-info>

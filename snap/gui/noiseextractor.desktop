@@ -3,7 +3,7 @@ Type=Application
 Name=noiseextractor
 GenericName=Spectral noise editor
 Comment=Mark noises in the spectrogram and suppress or extract them
-Exec=noiseextractor %f
+Exec=noiseextractor %F
 # Inside the snap the icon is not installed into the host's icon theme, so
 # point at the copy in the snap's meta/gui (snap/gui/noiseextractor.svg).
 Icon=${SNAP}/meta/gui/noiseextractor.svg
@@ -12,4 +12,4 @@ Categories=AudioVideo;Audio;AudioVideoEditing;
 Keywords=audio;noise;denoise;spectrogram;filter;extract;bird;wav;flac;ogg;mp3;m4a;aac;
 # Must equal packaging/linux/noiseextractor.desktop apart from Icon;
 # crates/core/tests/packaging.rs checks it.
-MimeType=audio/x-wav;audio/wav;audio/vnd.wave;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/x-aac;
+MimeType=audio/x-wav;audio/wav;audio/vnd.wave;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/x-aac;application/x-noiseextractor-project;

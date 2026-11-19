@@ -44,7 +44,11 @@ and uploaded to edge (main) and stable (latest release) every Monday by
 `snap-publish.yml`. Adding an input format means adding it to `FILE_TYPES`
 in `crates/core/src/audio.rs` and to the packages' file associations (the
 snap's desktop file in `snap/gui` too); `crates/core/tests/packaging.rs`
-fails until they agree.
+fails until they agree. Projects are `*.nxp` files (JSON), a file type of
+our own (`PROJECT_FILE_TYPE` in `crates/core/src/project_file.rs`,
+`packaging/linux/noiseextractor.xml`); keep loading older `*.json`
+projects. Shell completion comes from `noiseextractor-cli completions`
+(`crates/cli/src/completions.rs`); see `docs/files.md`.
 
 ## Commands
 

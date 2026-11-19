@@ -65,6 +65,13 @@ cp "$root/packaging/icons/noiseextractor.svg" "$icons/scalable/apps/"
 # A PNG as well: some desktops and AppImage integrators only use bitmaps.
 rsvg-convert -w 256 -h 256 "$root/packaging/icons/noiseextractor.svg" \
     -o "$icons/256x256/apps/noiseextractor.png"
+# The project file type (*.nxp) and its icon. An AppImage cannot register
+# them itself; desktop integration tools (appimaged, AppImageLauncher)
+# install them from here, like the desktop file.
+install -Dm644 "$root/packaging/linux/noiseextractor.xml" \
+    "$appdir/usr/share/mime/packages/noiseextractor.xml"
+install -Dm644 "$root/packaging/icons/noiseextractor.svg" \
+    "$icons/scalable/mimetypes/application-x-noiseextractor-project.svg"
 
 # The binaries' rpath is set by linuxdeploy so that they find usr/lib.
 # DEPLOY_GTK_VERSION: the GTK plugin cannot tell GTK 3 from GTK 4 by itself.
