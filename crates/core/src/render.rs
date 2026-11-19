@@ -327,6 +327,7 @@ mod tests {
                 output_db: layer(3),
                 selected: layer(7),
                 inferred: layer(9),
+                found: Vec::new(),
             })
         };
         let v = View {
