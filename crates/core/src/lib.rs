@@ -35,6 +35,7 @@ pub mod analysis;
 pub mod audio;
 pub mod discover;
 pub mod engine;
+pub mod export;
 pub mod filter;
 pub mod listen;
 pub mod noise;

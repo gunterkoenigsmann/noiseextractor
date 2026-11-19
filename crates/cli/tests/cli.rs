@@ -549,3 +549,70 @@ fn saved_project_names_its_recording_relative_to_itself() {
     let loaded = Project::load(&proj).unwrap().audio.unwrap();
     assert_eq!(loaded.canonicalize().unwrap(), input.canonicalize().unwrap());
 }
+
+#[test]
+fn process_writes_every_export_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    let audio = write_test_audio(&input);
+    // Opus is checked in the core crate's tests: Symphonia cannot decode it.
+    for ext in ["flac", "ogg", "mp3", "m4a"] {
+        let output = dir.path().join(format!("out.{ext}"));
+        let st = bin()
+            .arg("process")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert!(st.success(), "{ext}");
+        let out = AudioData::load(&output).unwrap();
+        assert_eq!(out.sample_rate, 16000, "{ext}");
+        // Lossy codecs may add encoder delay or padding at the end.
+        assert!(
+            out.len() >= audio.len() && out.len() < audio.len() + 4000,
+            "{ext}: {}",
+            out.len()
+        );
+        // The tone survives the denoising and the encoding.
+        let tone = rms(&out.channels[0][20000..28000]);
+        assert!(tone > 0.25, "{ext}: tone rms {tone}");
+    }
+    let opus = dir.path().join("out.opus");
+    let st = bin()
+        .arg("process")
+        .arg(&input)
+        .args(["--bitrate", "48", "-o"])
+        .arg(&opus)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert!(std::fs::read(&opus).unwrap().starts_with(b"OggS"));
+}
+
+#[test]
+fn explicit_format_and_unknown_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    write_test_audio(&input);
+    let output = dir.path().join("out.bin");
+    let out = bin()
+        .arg("process")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--format"));
+    assert!(!output.exists(), "nothing is written before the format is known");
+    let st = bin()
+        .arg("process")
+        .arg(&input)
+        .args(["--format", "flac", "-o"])
+        .arg(&output)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert!(std::fs::read(&output).unwrap().starts_with(b"fLaC"));
+}
