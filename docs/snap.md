@@ -12,8 +12,22 @@ on purpose; keep the two alike.
 
 | Workflow | When | What |
 |---|---|---|
-| [`snap.yml`](../.github/workflows/snap.yml) | every push to `main` (a newer push cancels the running build); PRs that touch `snap/` or the workflow; by hand | builds the snap, installs it, denoises `packaging/smoke-test.wav` with the CLI and starts the GUI with it under Xvfb. The `.snap` is kept as the run's `snap` artifact. Never uploads. |
-| [`snap-publish.yml`](../.github/workflows/snap-publish.yml) | Mondays 04:17 UTC; by hand | builds the newest `main` and uploads it to **edge**, builds the newest GitHub release and uploads it to **stable** (skipped while there is no release). |
+| [`snap.yml`](../.github/workflows/snap.yml) | every push to `main` (a newer push cancels the running build); PRs that touch `snap/`, the snap workflows or the build action; by hand | builds the snap, installs it, denoises `packaging/smoke-test.wav` with the CLI and starts the GUI with it under Xvfb. Artifacts `snap-amd64` and `snap-arm64`. Never uploads. |
+| [`snap-publish.yml`](../.github/workflows/snap-publish.yml) | Mondays 04:17 UTC; by hand | builds the newest `main` and uploads it to **edge**, builds the newest GitHub release and uploads it to **stable** (skipped while there is no release, or when the release has no snap recipe). Artifacts `snap-edge-amd64`, `snap-edge-arm64` and, with a release, `snap-stable-…`. |
+
+Both build with [`.github/actions/snapcraft-pack`](../.github/actions/snapcraft-pack/action.yml),
+a shell port of `snapcore/action-build`: that action (v1.3.0, its newest)
+still runs on Node.js 20, which GitHub has deprecated. The upload is a plain
+`snapcraft upload` for the same reason (instead of `snapcore/action-publish`).
+
+### Where the `.snap` files are
+
+Every run keeps what it built for 90 days: open the run (Actions → *Snap*
+or *Snap publish* → the run), scroll to the **Artifacts** section at the
+bottom of its summary page and download the zip, which contains the
+`.snap`. A run that is still going, or one whose build step failed, has
+none yet. The weekly job's first scheduled run is the first Monday after
+it was added; until then only runs started by hand or by a push exist.
 
 The weekly rebuild is what brings security fixes to users: the snap bundles
 ALSA and its PulseAudio plugin from the Ubuntu 24.04 archive, and those only

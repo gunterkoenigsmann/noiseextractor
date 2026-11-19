@@ -1,0 +1,64 @@
+# Builds snap/snapcraft.yaml in an LXD container and outputs the .snap's
+# path. A plain shell port of snapcore/action-build@v1 (v1.3.0), which still
+# runs on Node.js 20 and makes GitHub print a deprecation warning: this one
+# is a composite action, so it needs no Node.js at all. Same steps as the
+# original (src/tools.ts and src/build.ts there).
+name: snapcraft pack
+description: Build the snap with snapcraft in LXD
+inputs:
+  project-dir:
+    description: Directory with snap/snapcraft.yaml, relative to the workspace
+    default: .
+outputs:
+  snap:
+    description: Absolute path of the built .snap
+    value: ${{ steps.pack.outputs.snap }}
+runs:
+  using: composite
+  steps:
+    - name: Install LXD and snapcraft
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The runner's / is not owned by root, which trips up snap-confine.
+        if [ "$(stat -c %u:%g /)" != "0:0" ]; then sudo chown root:root /; fi
+        # The runner user must be in the lxd group to talk to LXD; `sudo -u`
+        # below picks up the new membership without a new login.
+        sudo groupadd --force --system lxd
+        sudo usermod --append --groups lxd "$USER"
+        if [ -x /snap/bin/lxd ]; then
+          sudo snap refresh lxd || echo "LXD could not be refreshed; using the installed one."
+        else
+          sudo snap install lxd
+        fi
+        sudo lxd init --auto
+        # Docker's firewall rules drop the traffic of LXD's bridge, so the
+        # build container would have no network. Same fix as action-build:
+        # https://documentation.ubuntu.com/lxd/en/latest/howto/network_bridge_firewalld/#prevent-connectivity-issues-with-lxd-and-docker
+        sudo iptables -P FORWARD ACCEPT
+        if [ -x /snap/bin/snapcraft ]; then
+          sudo snap refresh --channel stable --classic snapcraft
+        else
+          sudo snap install --channel stable --classic snapcraft
+        fi
+    - name: snapcraft pack
+      id: pack
+      shell: bash
+      env:
+        PROJECT_DIR: ${{ inputs.project-dir }}
+      run: |
+        set -euo pipefail
+        # Build info (the run's URL, the recipe) goes into the snap's
+        # metadata, as with action-build.
+        export SNAPCRAFT_BUILD_ENVIRONMENT=lxd
+        export SNAPCRAFT_BUILD_INFO=1
+        export SNAPCRAFT_IMAGE_INFO="{\"build_url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}"
+        cd "$PROJECT_DIR"
+        sudo -u "$USER" -E snapcraft pack
+        shopt -s nullglob
+        snaps=(*.snap)
+        if [ "${#snaps[@]}" -ne 1 ]; then
+          echo "::error::expected one .snap, found ${#snaps[@]}: ${snaps[*]}"
+          exit 1
+        fi
+        echo "snap=$PWD/${snaps[0]}" >> "$GITHUB_OUTPUT"

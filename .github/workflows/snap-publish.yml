@@ -66,24 +66,33 @@ jobs:
       # Secrets cannot be used in `if:` directly; an env var can.
       SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
     steps:
+      # Two checkouts: this workflow's own commit at the top (for the local
+      # snapcraft-pack action, which an older release tag may not have) and
+      # the commit to package in src/.
+      - uses: actions/checkout@v7
       - uses: actions/checkout@v7
         with:
           ref: ${{ matrix.ref }}
+          path: src
       # A release made before the snap recipe existed (v0.1.0) has none, so
       # stable stays empty until the next release. grep then fails on the
       # missing file, which also means "skip".
       - name: Check the platform
         id: check
         run: |
-          if grep -qE '^  ${{ matrix.arch }}:' snap/snapcraft.yaml 2>/dev/null; then
+          if grep -qE '^  ${{ matrix.arch }}:' src/snap/snapcraft.yaml 2>/dev/null; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::${{ matrix.ref }} has no snap recipe for ${{ matrix.arch }}; skipped."
             echo "build=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: snapcore/action-build@v1
+      # Our shell port of snapcore/action-build, which still runs on the
+      # deprecated Node.js 20 (see the action's header).
+      - uses: ./.github/actions/snapcraft-pack
         if: steps.check.outputs.build == 'true'
         id: build
+        with:
+          project-dir: src
       - name: Upload snap as artifact
         if: steps.check.outputs.build == 'true'
         uses: actions/upload-artifact@v7
@@ -93,10 +102,10 @@ jobs:
           if-no-files-found: error
       - name: Publish to ${{ matrix.channel }}
         if: steps.check.outputs.build == 'true' && env.SNAPCRAFT_STORE_CREDENTIALS != ''
-        uses: snapcore/action-publish@v1
-        with:
-          snap: ${{ steps.build.outputs.snap }}
-          release: ${{ matrix.channel }}
+        # What snapcore/action-publish@v1 does, without its Node.js 20:
+        # snapcraft (installed by snapcraft-pack) logs in with
+        # SNAPCRAFT_STORE_CREDENTIALS from the job's environment.
+        run: snapcraft upload --release="${{ matrix.channel }}" "${{ steps.build.outputs.snap }}"
       - name: No store credentials
         if: steps.check.outputs.build == 'true' && env.SNAPCRAFT_STORE_CREDENTIALS == ''
         run: echo "::warning::SNAPCRAFT_STORE_CREDENTIALS is not set; built the snap but did not upload it (see docs/snap.md)."

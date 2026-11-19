@@ -15,7 +15,9 @@ on:
   pull_request:
     paths:
       - snap/**
+      - .github/actions/snapcraft-pack/**
       - .github/workflows/snap.yml
+      - .github/workflows/snap-publish.yml
   workflow_dispatch:
 
 permissions:
@@ -48,7 +50,9 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
-      - uses: snapcore/action-build@v1
+      # Our shell port of snapcore/action-build, which still runs on the
+      # deprecated Node.js 20 (see the action's header).
+      - uses: ./.github/actions/snapcraft-pack
         id: build
       # Snapcraft's own log has the details its console output leaves out.
       - name: Upload snapcraft log
