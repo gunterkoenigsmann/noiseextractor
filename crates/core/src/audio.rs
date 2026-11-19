@@ -1,8 +1,9 @@
 //! Loading and saving audio files.
 //!
 //! Decoding goes through Symphonia (WAV, FLAC, Ogg/Vorbis, MP3, AAC/M4A,
-//! ALAC); writing produces 32-bit float WAV via `hound`, so no precision is
-//! lost between processing and export.
+//! ALAC); writing here produces 32-bit float WAV via `hound`, so no
+//! precision is lost between processing and export. The other export
+//! formats live in [`crate::export`].
 
 use crate::samples::{self, Samples, SamplesWriter, StorageOptions};
 use anyhow::{bail, Context, Result};

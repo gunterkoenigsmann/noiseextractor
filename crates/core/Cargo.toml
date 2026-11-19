@@ -17,5 +17,15 @@ symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac"] }
 memmap2 = "0.9"
 tempfile = "3"
 bytemuck = "1"
+# Export encoders (see src/export.rs). The C libraries (libvorbis, LAME,
+# libopus) are compiled from bundled sources, so no system packages are
+# needed on any platform.
+flacenc = { version = "0.5", default-features = false }
+vorbis_rs = { version = "0.5", default-features = false }
+mp3lame-encoder = "0.3"
+opus = "0.4"
+ogg = "0.9"
+rubato = "0.16"
+alac-encoder = "0.3"
 
 [dev-dependencies]

@@ -18,6 +18,13 @@
   combine), `engine.rs` (chunked background processing), `discover.rs`
   (finding a recording's sounds by NMF; found sounds are fitted frame by
   frame, so chunks stay seamless).
+* Export formats (WAV, FLAC, Ogg Vorbis, MP3, Opus, ALAC in .m4a) live in
+  `crates/core/src/export.rs`, each as a streaming `AudioWriter`. The C
+  encoders (libvorbis, LAME, libopus) are built from vendored sources by
+  their `-sys` crates; do not switch to system libraries, the Windows and
+  macOS builds have none. No AAC encoder (patent pool, FDK licence not
+  GPL-compatible). Tests decode every format again (Symphonia, or libopus
+  and libvorbis where Symphonia trims wrongly or cannot decode).
 * Real recordings for tests live in `crates/core/tests/fixtures` (excerpts
   of the maintainer's own recordings, GPL; keep them to a few hundred kB
   and list them in the README there).

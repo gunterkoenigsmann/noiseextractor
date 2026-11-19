@@ -64,9 +64,11 @@ mod view;
 use detection::{Group, Param};
 use filter_list::FilterList;
 use noiseextractor_core::analysis::{analyze_selection, AnalysisParams, RegionAnalysis, Selection};
-use noiseextractor_core::audio::WavStreamWriter;
 use noiseextractor_core::discover::{discover, DiscoverParams, Discovery};
 use noiseextractor_core::engine::process_all;
+use noiseextractor_core::export::{
+    create_writer, resolve_export_path, save_dialog_wildcard, ExportFormat, ExportOptions,
+};
 use noiseextractor_core::filter::{EventFilter, Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::{mean_power, NoiseEstimate};
 use noiseextractor_core::render::{render_rgb, ORANGE};
@@ -217,6 +219,8 @@ struct State {
     recent_audio: RecentFiles,
     /// File > Recent projects, remembered between runs.
     recent_projects: RecentFiles,
+    /// Format of the last export; the export dialog preselects it.
+    export_format: ExportFormat,
 }
 
 impl State {
@@ -369,6 +373,7 @@ fn main() {
             listen: Listen::All,
             recent_audio: recent::load(RecentKind::Audio),
             recent_projects: recent::load(RecentKind::Project),
+            export_format: ExportFormat::Wav,
         }));
         let ui = build_ui();
         {
@@ -402,7 +407,7 @@ fn build_ui() -> Ui {
         .append_item(
             ID_EXPORT,
             "&Export processed audio...\tCtrl+E",
-            "Write the filtered recording as WAV",
+            "Write the filtered recording as WAV, FLAC, Ogg Vorbis, MP3, Opus or Apple Lossless",
         )
         .append_separator()
         .append_item(ID_QUIT, "&Quit\tCtrl+Q", "Leave noiseextractor")
@@ -734,8 +739,17 @@ fn bind_events(state: &Shared, ui: Ui) {
             if st.borrow().doc.is_none() {
                 return;
             }
-            if let Some(path) = file_dialog(ui, "Export processed audio", "WAV files|*.wav", true) {
-                start_export(&mut st.borrow_mut(), path);
+            let (name, format) = {
+                let s = st.borrow();
+                (
+                    s.doc.as_ref().map(|d| d.name.clone()).unwrap_or_default(),
+                    s.export_format,
+                )
+            };
+            if let Some((path, format)) = export_dialog(ui, &name, format) {
+                let mut s = st.borrow_mut();
+                s.export_format = format;
+                start_export(&mut s, path, format);
             }
         }
         ID_PLAY => toggle_play(&mut st.borrow_mut()),
@@ -1182,6 +1196,46 @@ fn file_dialog(ui: Ui, title: &str, wildcard: &str, save: bool) -> Option<PathBu
     } else {
         None
     }
+}
+
+/// Asks where and in which format to export. `source_name` (the
+/// recording's file name) suggests the new name; `format` is preselected.
+/// Returns the final path, which gets the format's extension if the user
+/// typed none.
+fn export_dialog(ui: Ui, source_name: &str, format: ExportFormat) -> Option<(PathBuf, ExportFormat)> {
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("export");
+    let dlg = FileDialog::builder(&ui.frame)
+        .with_message("Export processed audio")
+        .with_wildcard(&save_dialog_wildcard())
+        .with_default_file(&format!("{stem}-processed.{}", format.extension()))
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    let index = ExportFormat::ALL.iter().position(|&f| f == format).unwrap_or(0);
+    dlg.set_filter_index(index as i32);
+    if dlg.show_modal() != ID_OK {
+        return None;
+    }
+    let path = PathBuf::from(dlg.get_path()?);
+    // The wildcard lists the formats in the order of `ExportFormat::ALL`.
+    let filter = usize::try_from(dlg.get_filter_index())
+        .ok()
+        .and_then(|i| ExportFormat::ALL.get(i).copied());
+    let (resolved, format) = resolve_export_path(&path, filter);
+    // The dialog's overwrite prompt only saw the name as typed.
+    if resolved != path && resolved.exists() {
+        let question = format!("{} already exists. Replace it?", resolved.display());
+        let answer = MessageDialog::builder(&ui.frame, &question, "noiseextractor")
+            .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+            .build()
+            .show_modal();
+        if answer != ID_YES {
+            return None;
+        }
+    }
+    Some((resolved, format))
 }
 
 /// Shows an error message.
@@ -1774,7 +1828,7 @@ fn toggle_play(s: &mut State) {
 }
 
 /// Exports the processed recording on a background thread.
-fn start_export(s: &mut State, path: PathBuf) {
+fn start_export(s: &mut State, path: PathBuf, format: ExportFormat) {
     let Some(doc) = &s.doc else { return };
     let audio = doc.audio.clone();
     let project = s.project.clone();
@@ -1782,7 +1836,12 @@ fn start_export(s: &mut State, path: PathBuf) {
     s.busy = Some("Exporting ...".into());
     std::thread::spawn(move || {
         let run = || -> anyhow::Result<PathBuf> {
-            let mut w = WavStreamWriter::create(&path, audio.sample_rate, audio.channels.len() as u16)?;
+            let mut w = create_writer(
+                &path,
+                ExportOptions::new(format),
+                audio.sample_rate,
+                audio.channels.len(),
+            )?;
             let total = audio.len().max(1);
             let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
             process_all(&audio, &project, EngineConfig::default().chunk_frames, threads, |r| {
