@@ -147,8 +147,6 @@ struct Doc {
     engine: Arc<Engine>,
     /// `None` when no output device is available.
     player: Option<Player>,
-    /// File name for the title bar.
-    name: String,
     /// Where the recording was loaded from; saved projects refer to it.
     path: PathBuf,
     /// Block peaks of the mono mix, for the overview.
@@ -1257,7 +1255,6 @@ fn install_audio(s: &mut State, ui: Ui, path: &Path, audio: AudioData, peaks: Pe
         audio,
         engine,
         player,
-        name,
         path: path.to_path_buf(),
         peaks,
     });
