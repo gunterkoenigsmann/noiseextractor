@@ -69,3 +69,8 @@ On Linux the GUI needs `libgtk-3-dev` and `libasound2-dev`.
   `try_borrow` and handlers request repaints via `request_repaint()` instead of
   calling `refresh` directly. Never hold a borrow across a modal dialog.
 * The audio callback must never block: it uses `Engine::try_chunk`.
+* A project file names its recording (`Project::audio`, saved as
+  `"recording"`, relative to the project file where possible, see
+  `stored_recording` in `crates/core/src/filter.rs`). Anything that saves
+  a project for a recording must set it; the GUI does so in
+  `install_audio`, the CLI before `--save-project`.
