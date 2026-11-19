@@ -29,6 +29,7 @@ use noiseextractor_core::export::{create_writer, format_for_output, ExportOption
 use noiseextractor_core::filter::{Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::listen::{Listen, Pick};
 use noiseextractor_core::noise::{mean_power, GainRule, NoiseEstimate};
+use noiseextractor_core::normalize::{process_all_normalized, PEAK_DBFS_RANGE};
 use noiseextractor_core::render::{column_chunks, render_columns, Target, View};
 use noiseextractor_core::similar::find_in_range;
 use noiseextractor_core::stft::Stft;
@@ -86,6 +87,11 @@ enum Command {
         /// as the GUI's "Hear everything but the picked sound" plays it.
         #[arg(long, value_name = "N,...", value_delimiter = ',')]
         without: Vec<usize>,
+        /// Scale the output so its loudest sample reaches DBFS (default
+        /// -1 when given without a value). One gain for the whole file, so
+        /// the levels inside the recording keep their ratios.
+        #[arg(long, value_name = "DBFS", num_args = 0..=1, default_missing_value = "-1", allow_hyphen_values = true)]
+        normalize: Option<f32>,
     },
     /// Background noise reduction with explicit parameters.
     Denoise {
@@ -107,6 +113,11 @@ enum Command {
         /// Also save the resulting project.
         #[arg(long)]
         save_project: Option<PathBuf>,
+        /// Scale the output so its loudest sample reaches DBFS (default
+        /// -1 when given without a value). One gain for the whole file, so
+        /// the levels inside the recording keep their ratios.
+        #[arg(long, value_name = "DBFS", num_args = 0..=1, default_missing_value = "-1", allow_hyphen_values = true)]
+        normalize: Option<f32>,
     },
     /// Mark a region, report what belongs to it, and add it as a filter.
     Mark {
@@ -229,6 +240,7 @@ fn run(cli: Cli) -> Result<()> {
             output,
             solo,
             without,
+            normalize,
         } => {
             let options = export(&output)?;
             let audio = load(&input)?;
@@ -254,7 +266,7 @@ fn run(cli: Cli) -> Result<()> {
                 project = project.for_listening(mode, &picks);
             }
             project.prepare(&audio);
-            write_processed(&audio, &project, cli.chunk_frames, threads, &output, options)
+            write_processed(&audio, &project, cli.chunk_frames, threads, &output, options, normalize)
         }
         Command::Denoise {
             input,
@@ -263,6 +275,7 @@ fn run(cli: Cli) -> Result<()> {
             rule,
             noise_from,
             save_project,
+            normalize,
         } => {
             let options = output.as_deref().map(export).transpose()?;
             let audio = load(&input)?;
@@ -280,10 +293,14 @@ fn run(cli: Cli) -> Result<()> {
                 nr.estimate = NoiseEstimate::Profile(learn_noise(&audio, &project.stft, a, b)?);
             }
             if let Some(p) = save_project {
+                // Lets the GUI open the recording along with the project.
+                project.audio = Some(input.clone());
                 project.save(&p)?;
             }
             match (output, options) {
-                (Some(o), Some(options)) => write_processed(&audio, &project, cli.chunk_frames, threads, &o, options),
+                (Some(o), Some(options)) => {
+                    write_processed(&audio, &project, cli.chunk_frames, threads, &o, options, normalize)
+                }
                 _ => Ok(()),
             }
         }
@@ -318,6 +335,8 @@ fn run(cli: Cli) -> Result<()> {
             project.prepare(&audio);
             print_report(&project, &audio);
             if let Some(p) = save_project {
+                // Lets the GUI open the recording along with the project.
+                project.audio = Some(input.clone());
                 project.save(&p)?;
             }
             Ok(())
@@ -357,6 +376,8 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             if let Some(p) = save_project {
+                // Lets the GUI open the recording along with the project.
+                project.audio = Some(input.clone());
                 project.save(&p)?;
             }
             Ok(())
@@ -431,7 +452,8 @@ fn learn_noise(audio: &AudioData, cfg: &noiseextractor_core::StftConfig, start_s
     Ok(mean_power(&power, cfg.bins()))
 }
 
-/// Processes everything and streams the result into `output`.
+/// Processes everything and streams the result into `output`, scaled so
+/// its peak reaches `normalize` dBFS if that is given.
 fn write_processed(
     audio: &AudioData,
     project: &Project,
@@ -439,21 +461,48 @@ fn write_processed(
     threads: usize,
     output: &Path,
     options: ExportOptions,
+    normalize: Option<f32>,
 ) -> Result<()> {
+    if let Some(db) = normalize {
+        let (lo, hi) = PEAK_DBFS_RANGE;
+        anyhow::ensure!(
+            (lo..=hi).contains(&db),
+            "--normalize must be between {lo} and {hi} dBFS"
+        );
+    }
     let mut writer = create_writer(output, options, audio.sample_rate, audio.channels.len())?;
-    let total = audio.len().max(1);
     let mut last_percent = usize::MAX;
-    process_all(audio, project, chunk_frames, threads, |r| {
-        let percent = (r.start_sample + r.audio[0].len()) * 100 / total;
-        if percent / 10 != last_percent / 10 {
-            eprintln!("{percent:3}%");
-            last_percent = percent;
-        }
-        writer.write(&r.audio)
-    })?;
+    let done = process_all_normalized(
+        audio,
+        project,
+        chunk_frames,
+        threads,
+        normalize,
+        scratch_dir(output),
+        |fraction| {
+            let percent = (fraction * 100.0) as usize;
+            if percent / 10 != last_percent / 10 {
+                eprintln!("{percent:3}%");
+                last_percent = percent;
+            }
+        },
+        |block| writer.write(block),
+    )?;
     writer.finish()?;
+    if normalize.is_some() {
+        eprintln!("normalized: gain {:+.1} dB", done.gain_db());
+    }
     eprintln!("wrote {}", output.display());
     Ok(())
+}
+
+/// Directory for the scratch file of a normalized export: the output's,
+/// which has room for the result anyway.
+fn scratch_dir(output: &Path) -> &Path {
+    match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
 }
 
 /// Prints what the analysis found for each event filter.

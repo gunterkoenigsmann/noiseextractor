@@ -36,7 +36,7 @@ use crate::stft::{Stft, StftConfig};
 use crate::AudioData;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// What a filter does with its target.
@@ -318,6 +318,14 @@ pub struct Project {
     /// [`DiscoveredFilter::decomposition`].
     #[serde(default)]
     pub decompositions: Vec<Decomposition>,
+    /// The recording the filters were made for, as an absolute path in
+    /// memory. [`Project::save`] writes it relative to the project file
+    /// where the two share a folder tree (so a folder holding both can be
+    /// moved or copied to another computer), [`Project::load`] resolves it
+    /// again. `None` in projects saved before it existed, or before any
+    /// recording was opened.
+    #[serde(default, rename = "recording", skip_serializing_if = "Option::is_none")]
+    pub audio: Option<PathBuf>,
 }
 
 impl Default for Project {
@@ -330,6 +338,7 @@ impl Default for Project {
             preview: None,
             highlight: None,
             decompositions: Vec::new(),
+            audio: None,
         }
     }
 }
@@ -338,9 +347,10 @@ impl Project {
     /// Reads a project file.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-        let p: Project =
+        let mut p: Project =
             serde_json::from_str(&text).with_context(|| format!("invalid project file {}", path.display()))?;
         p.stft.validate()?;
+        p.audio = p.audio.map(|a| resolve_recording(path, &a));
         Ok(p)
     }
 
@@ -349,8 +359,20 @@ impl Project {
         // Patterns no filter uses any more are not worth saving.
         let mut tidy = self.clone();
         tidy.prune_decompositions();
+        tidy.audio = self.audio.as_deref().map(|a| stored_recording(path, a));
         std::fs::write(path, serde_json::to_string_pretty(&tidy)?)
             .with_context(|| format!("cannot write {}", path.display()))
+    }
+
+    /// The recording a front end has to open to show this project, if it
+    /// is not the one already open (`current`): `None` when the project
+    /// names no recording or names `current` itself.
+    pub fn recording_to_open(&self, current: Option<&Path>) -> Option<&Path> {
+        let wanted = self.audio.as_deref()?;
+        match current {
+            Some(c) if same_file(c, wanted) => None,
+            _ => Some(wanted),
+        }
     }
 
     /// Whether the overlays of filter `index` are drawn: when it is
@@ -1012,6 +1034,76 @@ fn share_bins(
     }
 }
 
+/// `path` made absolute (against the working directory) and with `.` and
+/// `..` removed lexically, so two spellings of one file compare equal
+/// without touching the disk (the file may be gone or on another computer).
+fn normalize(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            // `pop` keeps the root: "/.." is "/" as on every OS.
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Whether `a` and `b` name the same file: the same normalized path, or
+/// (for symbolic links and Windows' case-insensitive names) the same
+/// canonical path when both exist.
+fn same_file(a: &Path, b: &Path) -> bool {
+    normalize(a) == normalize(b) || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
+/// How the project file at `project` refers to `recording`: relative,
+/// with `/` separators on every OS, when the two share more than the
+/// filesystem root (the same folder, or one above it, like `projects/`
+/// next to `recordings/`); absolute otherwise, e.g. on another drive.
+fn stored_recording(project: &Path, recording: &Path) -> PathBuf {
+    let recording = normalize(recording);
+    let Some(dir) = normalize(project).parent().map(Path::to_path_buf) else {
+        return recording;
+    };
+    let base: Vec<Component> = dir.components().collect();
+    let target: Vec<Component> = recording.components().collect();
+    let common = base.iter().zip(&target).take_while(|(a, b)| a == b).count();
+    // Only the root (and on Windows the drive) in common: a relative
+    // path would just be a long detour through "../..".
+    let roots = target.iter().take_while(|c| !matches!(c, Component::Normal(_))).count();
+    if common <= roots {
+        return recording;
+    }
+    let mut parts: Vec<String> = vec!["..".into(); base.len() - common];
+    parts.extend(
+        target[common..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+    );
+    PathBuf::from(parts.join("/"))
+}
+
+/// The absolute path of a recording stored as `stored` in the project
+/// file at `project` (see [`stored_recording`]). A stored path that leads
+/// nowhere falls back to a file of the same name next to the project, as
+/// left behind when someone moves both into a new folder.
+fn resolve_recording(project: &Path, stored: &Path) -> PathBuf {
+    let dir = normalize(project).parent().map(Path::to_path_buf).unwrap_or_default();
+    let resolved = normalize(&dir.join(stored));
+    if !resolved.is_file() {
+        if let Some(beside) = stored.file_name().map(|n| dir.join(n)) {
+            if beside.is_file() {
+                return beside;
+            }
+        }
+    }
+    resolved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,6 +1141,7 @@ mod tests {
             preview: None,
             highlight: None,
             decompositions: Vec::new(),
+            audio: None,
         }
     }
 
@@ -1368,5 +1461,101 @@ mod tests {
         assert_eq!(q.decompositions[0], discovery().decomposition);
         assert_eq!(q.filters.len(), 4);
         assert!(q.filters[2].suggested);
+    }
+
+    /// A project saved with its recording, reloaded from disk.
+    fn round_trip(project_file: &Path, recording: &Path) -> (serde_json::Value, Project) {
+        let p = Project {
+            audio: Some(recording.to_path_buf()),
+            ..Project::default()
+        };
+        p.save(project_file).unwrap();
+        let json = serde_json::from_str(&std::fs::read_to_string(project_file).unwrap()).unwrap();
+        (json, Project::load(project_file).unwrap())
+    }
+
+    #[test]
+    fn recording_beside_the_project_is_stored_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("owl.flac");
+        std::fs::write(&rec, b"x").unwrap();
+        let (json, q) = round_trip(&dir.path().join("p.nxp.json"), &rec);
+        assert_eq!(json["recording"], "owl.flac");
+        assert_eq!(q.audio.as_deref(), Some(normalize(&rec).as_path()));
+    }
+
+    #[test]
+    fn recording_in_a_sibling_folder_is_stored_relative_with_slashes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        std::fs::create_dir_all(dir.path().join("rec/night")).unwrap();
+        let rec = dir.path().join("rec").join("night").join("owl.flac");
+        std::fs::write(&rec, b"x").unwrap();
+        let (json, q) = round_trip(&dir.path().join("projects").join("p.json"), &rec);
+        // Forward slashes even on Windows, so the file works on every OS.
+        assert_eq!(json["recording"], "../rec/night/owl.flac");
+        assert_eq!(q.audio.as_deref(), Some(normalize(&rec).as_path()));
+    }
+
+    #[test]
+    fn moving_the_folder_keeps_the_recording_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::create_dir_all(old.join("audio")).unwrap();
+        std::fs::write(old.join("audio").join("owl.flac"), b"x").unwrap();
+        round_trip(&old.join("p.json"), &old.join("audio").join("owl.flac"));
+        let new = dir.path().join("new");
+        std::fs::rename(&old, &new).unwrap();
+        let q = Project::load(&new.join("p.json")).unwrap();
+        assert_eq!(q.audio, Some(normalize(&new.join("audio").join("owl.flac"))));
+    }
+
+    #[test]
+    fn missing_recording_falls_back_to_one_of_that_name_beside_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p.json");
+        std::fs::write(
+            &p,
+            r#"{"version":1,"stft":{"fft_size":2048,"hop":512},"filters":[],"recording":"/nowhere/at/all/owl.flac"}"#,
+        )
+        .unwrap();
+        // Without a copy beside the project the stored path stays, so the
+        // front end can name what is missing.
+        let q = Project::load(&p).unwrap();
+        assert_eq!(q.audio.unwrap().file_name().unwrap(), "owl.flac");
+        std::fs::write(dir.path().join("owl.flac"), b"x").unwrap();
+        let q = Project::load(&p).unwrap();
+        assert_eq!(q.audio, Some(dir.path().join("owl.flac")).map(|a| normalize(&a)));
+    }
+
+    #[test]
+    fn recording_far_away_is_stored_absolute() {
+        let base = normalize(Path::new("/a/projects/p.json"));
+        let rec = normalize(Path::new("/b/owl.flac"));
+        assert_eq!(stored_recording(&base, &rec), rec);
+        assert_eq!(
+            stored_recording(&base, Path::new("/a/x/owl.flac")),
+            PathBuf::from("../x/owl.flac")
+        );
+    }
+
+    #[test]
+    fn projects_without_a_recording_still_load_and_save_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p.json");
+        Project::default().save(&p).unwrap();
+        assert!(!std::fs::read_to_string(&p).unwrap().contains("recording"));
+        assert_eq!(Project::load(&p).unwrap().audio, None);
+    }
+
+    #[test]
+    fn recording_to_open_skips_the_recording_already_open() {
+        let mut p = Project::default();
+        assert_eq!(p.recording_to_open(None), None);
+        assert_eq!(p.recording_to_open(Some(Path::new("/r/a.flac"))), None);
+        p.audio = Some(normalize(Path::new("/r/a.flac")));
+        assert_eq!(p.recording_to_open(None), p.audio.as_deref());
+        assert_eq!(p.recording_to_open(Some(Path::new("/r/./sub/../a.flac"))), None);
+        assert_eq!(p.recording_to_open(Some(Path::new("/r/b.flac"))), p.audio.as_deref());
     }
 }

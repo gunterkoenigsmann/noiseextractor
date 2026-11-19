@@ -32,13 +32,15 @@
 * `crates/gui`: wxDragon front end with AUI panes (`panes.rs`). The view
   models are pure and unit-tested (`view.rs`, `overview.rs`, `scrub.rs`,
   `detection.rs`, the `Log` in `log.rs`, `Declick` in `player.rs`,
-  `RecentFiles` in `recent.rs`); keep
+  `RecentFiles` in `recent.rs`, `Options` in `options.rs`); keep
   logic out of event handlers where possible. The toolbar (`toolbar.rs`) only re-sends
   menu command ids, so give a new toolbar button a menu item first; its
   icons are inline SVGs with a light and a dark palette. Status messages go through
   `report()` so they also reach the log pane. Scrubbing and overview follow
   losslessaudiocut (gunterkoenigsmann/losslessaudiocut) on purpose; keep
-  them alike.
+  them alike. Settings that are set once and rarely changed go into
+  File > Settings (`settings.rs`, one page per topic, stored by
+  `options.rs`) rather than into the panes, which are crowded enough.
 
 ## Releases
 
@@ -84,3 +86,8 @@ On Linux the GUI needs `libgtk-3-dev` and `libasound2-dev`.
   `AudioData::mono()` (computed once) instead of mixing again. Functions
   that read the channels take `&[impl AsRef<[f32]>]`, so tests can still
   pass plain `Vec<f32>`s.
+* A project file names its recording (`Project::audio`, saved as
+  `"recording"`, relative to the project file where possible, see
+  `stored_recording` in `crates/core/src/filter.rs`). Anything that saves
+  a project for a recording must set it; the GUI does so in
+  `install_audio`, the CLI before `--save-project`.
