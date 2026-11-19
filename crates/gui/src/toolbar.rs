@@ -166,7 +166,7 @@ impl Palette {
     };
 
     /// The palette that matches the system's light or dark appearance.
-    fn current() -> Palette {
+    pub fn current() -> Palette {
         let dark = wxdragon::appearance::get_system_appearance().is_some_and(|a| a.is_using_dark_background());
         if dark {
             Palette::DARK

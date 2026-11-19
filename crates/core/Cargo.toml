@@ -13,6 +13,16 @@ serde_json.workspace = true
 realfft = "3.5"
 hound = "3.5"
 symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac"] }
-
-[dev-dependencies]
+# Export encoders (see src/export.rs). The C libraries (libvorbis, LAME,
+# libopus) are compiled from bundled sources, so no system packages are
+# needed on any platform.
+flacenc = { version = "0.5", default-features = false }
+vorbis_rs = { version = "0.5", default-features = false }
+mp3lame-encoder = "0.3"
+opus = "0.4"
+ogg = "0.9"
+rubato = "0.16"
+alac-encoder = "0.3"
+# Scratch file of normalized exports (see normalize.rs).
 tempfile = "3"
+

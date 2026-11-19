@@ -18,6 +18,13 @@
   combine), `engine.rs` (chunked background processing), `discover.rs`
   (finding a recording's sounds by NMF; found sounds are fitted frame by
   frame, so chunks stay seamless).
+* Export formats (WAV, FLAC, Ogg Vorbis, MP3, Opus, ALAC in .m4a) live in
+  `crates/core/src/export.rs`, each as a streaming `AudioWriter`. The C
+  encoders (libvorbis, LAME, libopus) are built from vendored sources by
+  their `-sys` crates; do not switch to system libraries, the Windows and
+  macOS builds have none. No AAC encoder (patent pool, FDK licence not
+  GPL-compatible). Tests decode every format again (Symphonia, or libopus
+  and libvorbis where Symphonia trims wrongly or cannot decode).
 * Real recordings for tests live in `crates/core/tests/fixtures` (excerpts
   of the maintainer's own recordings, GPL; keep them to a few hundred kB
   and list them in the README there).
@@ -25,13 +32,15 @@
 * `crates/gui`: wxDragon front end with AUI panes (`panes.rs`). The view
   models are pure and unit-tested (`view.rs`, `overview.rs`, `scrub.rs`,
   `detection.rs`, the `Log` in `log.rs`, `Declick` in `player.rs`,
-  `RecentFiles` in `recent.rs`); keep
+  `RecentFiles` in `recent.rs`, `Options` in `options.rs`); keep
   logic out of event handlers where possible. The toolbar (`toolbar.rs`) only re-sends
   menu command ids, so give a new toolbar button a menu item first; its
   icons are inline SVGs with a light and a dark palette. Status messages go through
   `report()` so they also reach the log pane. Scrubbing and overview follow
   losslessaudiocut (gunterkoenigsmann/losslessaudiocut) on purpose; keep
-  them alike.
+  them alike. Settings that are set once and rarely changed go into
+  File > Settings (`settings.rs`, one page per topic, stored by
+  `options.rs`) rather than into the panes, which are crowded enough.
 
 ## Releases
 
@@ -73,3 +82,8 @@ On Linux the GUI needs `libgtk-3-dev` and `libasound2-dev`.
   `try_borrow` and handlers request repaints via `request_repaint()` instead of
   calling `refresh` directly. Never hold a borrow across a modal dialog.
 * The audio callback must never block: it uses `Engine::try_chunk`.
+* A project file names its recording (`Project::audio`, saved as
+  `"recording"`, relative to the project file where possible, see
+  `stored_recording` in `crates/core/src/filter.rs`). Anything that saves
+  a project for a recording must set it; the GUI does so in
+  `install_audio`, the CLI before `--save-project`.
