@@ -10,6 +10,15 @@
 //! of audio only touches a few hundred thousand numbers. [`Overview`] is the
 //! strip's view model (pixel ↔ sample, frame, dragging). Both are free of
 //! GUI types so they can be tested.
+//!
+//! On top of the waveform, an orange envelope shows how much the filter
+//! the user is working on (the selection being edited, else the filter
+//! picked in the list) found at each time: [`found_columns`] reads it from
+//! the engine's chunk results ([`ChunkResult::found`]), so it fills in as
+//! the background processing gets there.
+
+use noiseextractor_core::engine::{ChunkLayout, ChunkResult};
+use std::sync::Arc;
 
 /// Samples per block of [`Peaks`].
 pub const BLOCK: usize = 256;
@@ -84,6 +93,50 @@ impl Peaks {
             })
             .collect()
     }
+}
+
+/// For each of `width` pixel columns spanning the recording that `layout`
+/// describes, the largest amplitude of what the picked filter found in the
+/// frames centred in that column ([`ChunkResult::found`], on the scale of
+/// the samples, like [`Peaks`]). A column narrower than a frame shows the
+/// first frame centred at or after its start.
+///
+/// `None` where nothing is known: the chunk has not been processed yet, or
+/// was processed while no filter was picked. `chunk` returns the latest
+/// result for a chunk index, like the spectrogram's renderer gets it.
+pub fn found_columns(
+    width: u32,
+    layout: ChunkLayout,
+    chunk: &dyn Fn(usize) -> Option<Arc<ChunkResult>>,
+) -> Vec<Option<f32>> {
+    let total = layout.total_samples;
+    let (hop, cf) = (layout.hop.max(1), layout.chunk_frames.max(1));
+    // Frame i is centred on sample i·hop, so the last frame that still
+    // shows recorded audio is the one at or before the last sample.
+    let last_frame = total.saturating_sub(1) / hop;
+    // Most columns span many frames of the same chunk: look each chunk up
+    // once (every lookup takes the engine's lock).
+    let mut cached: Option<(usize, Option<Arc<ChunkResult>>)> = None;
+    (0..width as usize)
+        .map(|c| {
+            let s0 = c * total / width as usize;
+            let s1 = (c + 1) * total / width as usize;
+            let f0 = s0.div_ceil(hop).min(last_frame);
+            let f1 = s1.div_ceil(hop).clamp(f0 + 1, last_frame + 1);
+            let mut best: Option<f32> = None;
+            for f in f0..f1 {
+                let ci = f / cf;
+                if cached.as_ref().is_none_or(|(i, _)| *i != ci) {
+                    cached = Some((ci, chunk(ci)));
+                }
+                let Some((_, Some(r))) = &cached else { continue };
+                if let Some(&a) = r.found.get(f - ci * cf) {
+                    best = Some(best.map_or(a, |b| b.max(a)));
+                }
+            }
+            best
+        })
+        .collect()
 }
 
 /// The overview strip of a recording of `total` samples, `width` pixels
@@ -230,6 +283,65 @@ mod tests {
         assert_eq!(wide.len(), 20);
         assert_eq!((wide[0], wide[19]), ((0.0, 0.0), (-9.0, 9.0)));
         assert_eq!(Peaks::new(&[]).columns(3), vec![(0.0, 0.0); 3]);
+    }
+
+    /// A chunk result whose frames found `found` (only the fields
+    /// [`found_columns`] reads matter).
+    fn found_chunk(index: usize, found: Vec<f32>) -> Option<Arc<ChunkResult>> {
+        Some(Arc::new(ChunkResult {
+            index,
+            generation: 1,
+            first_frame: 0,
+            frames: found.len(),
+            bins: 0,
+            start_sample: 0,
+            audio: Vec::new(),
+            original_db: Vec::new(),
+            output_db: Vec::new(),
+            selected: Vec::new(),
+            inferred: Vec::new(),
+            found,
+        }))
+    }
+
+    #[test]
+    fn found_amounts_are_the_loudest_frame_of_each_column() {
+        // 40 samples, hop 2: frames 0..20 in chunks of 4 frames (8 samples).
+        let layout = ChunkLayout {
+            hop: 2,
+            chunk_frames: 4,
+            total_samples: 40,
+        };
+        // Frame f found f/100, except chunk 2 (frames 8..12), which is not
+        // processed yet, and chunk 3, processed without a picked filter.
+        let chunk = |c: usize| match c {
+            2 => None,
+            3 => found_chunk(c, Vec::new()),
+            _ => found_chunk(c, (0..4).map(|i| (c * 4 + i) as f32 / 100.0).collect()),
+        };
+        // 5 columns of 8 samples = 4 frames each.
+        let cols = found_columns(5, layout, &chunk);
+        assert_eq!(cols, vec![Some(0.03), Some(0.07), None, None, Some(0.19)]);
+        // 80 columns of a quarter frame: each shows the next frame.
+        let fine = found_columns(80, layout, &chunk);
+        assert_eq!(fine.len(), 80);
+        assert_eq!(
+            (fine[0], fine[1], fine[2], fine[79]),
+            (Some(0.0), Some(0.0), Some(0.01), Some(0.19))
+        );
+        assert!(found_columns(3, layout, &|_| None).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn found_amounts_ignore_frames_past_the_end() {
+        // 10 samples, hop 4: frames 0, 1, 2 are inside, the chunk holds 8.
+        let layout = ChunkLayout {
+            hop: 4,
+            chunk_frames: 8,
+            total_samples: 10,
+        };
+        let chunk = |c| found_chunk(c, vec![0.1, 0.2, 0.3, 9.0, 9.0, 9.0, 9.0, 9.0]);
+        assert_eq!(found_columns(1, layout, &chunk), vec![Some(0.3)]);
     }
 
     /// 1000 samples over 100 pixels: 10 samples per pixel.

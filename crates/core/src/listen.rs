@@ -62,8 +62,9 @@ impl Project {
     /// ignored; without any, the project is returned as it is.
     ///
     /// A picked preview becomes the last filter of the result (visible, so
-    /// it is still drawn) and the result has no preview, so the selection
-    /// is neither analysed nor searched for twice.
+    /// it is still drawn, and highlighted, so it stays the
+    /// [`Project::found_target`]) and the result has no preview, so the
+    /// selection is neither analysed nor searched for twice.
     pub fn for_listening(&self, mode: Listen, picks: &[Pick]) -> Project {
         let mut p = self.clone();
         if mode == Listen::All {
@@ -78,6 +79,9 @@ impl Project {
                         f.visible = true;
                         p.filters.push(f);
                         picked.push(true);
+                        // Still the sound the user works on: keep it the
+                        // one whose findings are measured (`found_target`).
+                        p.highlight = Some(p.filters.len() - 1);
                     }
                 }
                 Pick::Filter(_) => {}
@@ -269,6 +273,16 @@ mod tests {
         assert_eq!((f.name.as_str(), f.enabled, f.visible), ("Selection", true, true));
         assert_eq!(f.action, FilterAction::Extract);
         assert!(q.shows(q.filters.len() - 1), "still drawn");
+        assert_eq!(
+            p.found_target(),
+            Some(p.filters.len()),
+            "the preview, after the filters"
+        );
+        assert_eq!(
+            q.found_target(),
+            Some(q.filters.len() - 1),
+            "its findings are still the ones measured"
+        );
     }
 
     #[test]

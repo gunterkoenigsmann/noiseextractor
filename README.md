@@ -124,6 +124,7 @@ libraries.
 | Scrub (hear the audio under the pointer) | Drag with the right mouse button |
 | Zoom time / scroll / zoom frequency | Wheel / Shift+wheel / Ctrl+wheel |
 | Jump elsewhere in a long recording | Drag the frame in the waveform overview, or click beside it |
+| See where else in the recording a sound was found | Mark it (or pick its filter): the waveform overview draws in orange how loud what the filter finds is at each time; it fills in as the recording is processed |
 | Show / hide panes (filters, detection settings, overview, log) | View menu, or the pane's close button; panes can be dragged to other edges or floated, and the layout is remembered |
 | Find the sounds a recording is made of | Set *Patterns to look for*, then *Find sounds* (only the selected stretch is used to learn, if there is a selection); *Keep*, *Merge with...*, *Split* and *Discard suggestions* edit the result |
 | Learn the background noise | Mark a noise-only stretch, *Learn noise from selection* |
