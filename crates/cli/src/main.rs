@@ -632,6 +632,7 @@ fn clone_layers(r: &ChunkResult) -> ChunkResult {
         output_db: r.output_db.clone(),
         selected: r.selected.clone(),
         inferred: r.inferred.clone(),
+        found: r.found.clone(),
     }
 }
 

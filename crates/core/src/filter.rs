@@ -363,6 +363,19 @@ impl Project {
         }
     }
 
+    /// The filter whose found sound [`Gains::found`] measures: the
+    /// selection being edited (index `filters.len()`) if there is one,
+    /// else the highlighted filter. That is the sound the user is working
+    /// on, so the GUI's overview can show where in the recording, and how
+    /// loud, the program found it.
+    pub fn found_target(&self) -> Option<usize> {
+        if self.preview.is_some() {
+            Some(self.filters.len())
+        } else {
+            self.highlight.filter(|&i| i < self.filters.len())
+        }
+    }
+
     /// Noise estimate the analysis should use: that of the first enabled
     /// noise-reduction filter, so a learned profile also helps the search.
     pub fn analysis_noise(&self) -> NoiseEstimate {
@@ -565,6 +578,10 @@ pub struct Gains {
     pub selected: Vec<Vec<f32>>,
     /// Union of the inferred masks of visible filters (red).
     pub inferred: Vec<Vec<f32>>,
+    /// Power (Σ over bins of `P · m²`) of what the analysis found of the
+    /// [`Project::found_target`] alone, per frame: the energy under that
+    /// filter's red and orange overlay. Empty when there is no target.
+    pub found: Vec<f32>,
 }
 
 /// Combines all filters of `project` into a gain per bin for frames
@@ -604,6 +621,24 @@ pub fn compute_gains(
     let no_occurrences: Vec<Occurrence> = Vec::new();
     let occ_of = |i: usize| occurrences.get(i).unwrap_or(&no_occurrences);
     let fits = fit_decompositions(project, &power_with_warmup[warmup..]);
+    let target = project.found_target();
+    let mut found = if target.is_some() { vec![0.0f32; n] } else { Vec::new() };
+    // Adds the energy of `power` under the mask `m` to `found[t]` (`m` is
+    // an amplitude gain, so the energy it selects is P·m²).
+    let add_found = |found: &mut [f32], t: usize, power: &[f32], m: &[f32]| {
+        found[t] += power.iter().zip(m).map(|(p, m)| p * m * m).sum::<f32>();
+    };
+    // The same for what a noise-reduction filter with gains `g` (rows
+    // with warm-up) removes: its power complement, 1 − g².
+    let add_found_removed = |found: &mut [f32], g: &[Vec<f32>]| {
+        for (t, (row, power)) in g[warmup..].iter().zip(&power_with_warmup[warmup..]).enumerate() {
+            found[t] += power
+                .iter()
+                .zip(row)
+                .map(|(p, g)| p * (1.0 - g * g).max(0.0))
+                .sum::<f32>();
+        }
+    };
 
     // Event filters' masks first (frame by frame), so that bins claimed by
     // both an extract and a suppress filter can be shared out before the
@@ -623,6 +658,9 @@ pub fn compute_gains(
                 if project.shows(fi) {
                     let g = nr.gains_tracked(power_with_warmup, &track(nr));
                     add_removed(&g[warmup..], &mut inferred);
+                    if target == Some(fi) {
+                        add_found_removed(&mut found, &g);
+                    }
                 }
             }
             continue;
@@ -633,6 +671,9 @@ pub fn compute_gains(
                 let g = nr.gains_tracked(power_with_warmup, &noise);
                 if project.shows(fi) {
                     add_removed(&g[warmup..], &mut inferred);
+                }
+                if target == Some(fi) {
+                    add_found_removed(&mut found, &g);
                 }
                 for (t, row) in g[warmup..].iter().enumerate() {
                     match f.action {
@@ -741,9 +782,12 @@ pub fn compute_gains(
             FilterKind::Discovered(d) => {
                 if let Some((dec, fits)) = discovered(project, &fits, d) {
                     let parts = d.enabled_components();
-                    for (fit, inf) in fits.iter().zip(inferred.iter_mut()) {
+                    for (t, (fit, inf)) in fits.iter().zip(inferred.iter_mut()).enumerate() {
                         dec.mask(fit, &parts, &mut scratch_inf);
                         inf.iter_mut().zip(&scratch_inf).for_each(|(i, m)| *i = i.max(*m));
+                        if target == Some(fi) {
+                            add_found(&mut found, t, &power_with_warmup[warmup + t], &scratch_inf);
+                        }
                     }
                 }
                 continue;
@@ -766,6 +810,9 @@ pub fn compute_gains(
                 selected[t][k] = selected[t][k].max(scratch_sel[k]);
                 inferred[t][k] = inferred[t][k].max(scratch_inf[k]);
             }
+            if target == Some(fi) {
+                add_found(&mut found, t, power, &scratch_inf);
+            }
         }
     }
 
@@ -781,6 +828,7 @@ pub fn compute_gains(
         gain,
         selected,
         inferred,
+        found,
     }
 }
 
@@ -1134,6 +1182,51 @@ mod tests {
         p.highlight = None;
         p.filters[0].visible = true;
         assert!(removed(&p).0 > 0.5);
+    }
+
+    #[test]
+    fn found_measures_the_picked_filter_alone() {
+        // Bins with power 1, 2 and 4: filter 1 infers bins 1 and 2 with
+        // 0.5, filter 2 with 0.8, so only the target's findings count.
+        let power = vec![vec![1.0, 2.0, 4.0]; 2];
+        let mut p = project(vec![
+            Filter::noise_reduction("noise"),
+            analysed_event(FilterAction::Suppress, 0.5),
+            analysed_event(FilterAction::Suppress, 0.8),
+        ]);
+        let found = |p: &Project| compute_gains(p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]).found;
+        assert!(found(&p).is_empty(), "nothing picked");
+        p.highlight = Some(1);
+        assert_eq!(found(&p), vec![0.25 * (2.0 + 4.0); 2]);
+        p.highlight = Some(2);
+        let f = found(&p);
+        assert!((f[0] - 0.64 * 6.0).abs() < 1e-5, "{f:?}");
+        // The selection being edited wins over the picked filter.
+        p.preview = Some(analysed_event(FilterAction::Suppress, 1.0));
+        assert_eq!(p.found_target(), Some(3));
+        assert_eq!(found(&p), vec![6.0; 2]);
+    }
+
+    #[test]
+    fn found_of_a_noise_reduction_is_what_it_removes() {
+        let power = vec![vec![1.0, 2.0, 4.0]; 40];
+        let mut p = project(vec![Filter::noise_reduction("noise")]);
+        p.highlight = Some(0);
+        for enabled in [true, false] {
+            p.filters[0].enabled = enabled;
+            let g = compute_gains(&p, &power, 0, &NoiseContext::new(&power, 0), 0, &[], &[]);
+            // Removed power: P·(1 − g²) per bin.
+            let removed: f32 = (0..3).map(|k| power[39][k] * (1.0 - g.gain[39][k].powi(2))).sum();
+            let removed = if enabled {
+                removed
+            } else {
+                // Switched off it removes nothing, but still shows what it
+                // would: its overlay.
+                (0..3).map(|k| power[39][k] * g.inferred[39][k].powi(2)).sum()
+            };
+            assert!(removed > 3.0, "test premise: most noise removed ({removed})");
+            assert!((g.found[39] - removed).abs() < 1e-4, "{} vs {removed}", g.found[39]);
+        }
     }
 
     /// A search result over 3 bins: pattern 0 lives in bin 0, pattern 1
