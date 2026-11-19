@@ -89,7 +89,7 @@ fn the_cricket_pulses_are_a_broadband_sound_without_partials() {
         high_hz: 20000.0,
     };
     let a = analyze_selection(
-        &audio.mono(),
+        audio.mono(),
         &audio.channels,
         audio.sample_rate,
         &stft,
@@ -131,7 +131,7 @@ fn the_loud_cricket_bursts_come_from_the_marked_place() {
         high_hz: 20000.0,
     };
     let a = analyze_selection(
-        &mono,
+        mono,
         &audio.channels,
         audio.sample_rate,
         &stft,
@@ -141,7 +141,7 @@ fn the_loud_cricket_bursts_come_from_the_marked_place() {
     );
     let tpl = a.template.expect("template");
     let total = cfg.frame_count(mono.len()) as i64;
-    let found = find_in_range(&tpl, &mono, &audio.channels, &stft, 0..total, &SimilarParams::default());
+    let found = find_in_range(&tpl, mono, &audio.channels, &stft, 0..total, &SimilarParams::default());
     let at = |t: f64| {
         found.iter().find(|o| {
             let start = o.frame as f64 * cfg.hop as f64 / audio.sample_rate as f64;
@@ -177,7 +177,7 @@ fn cricket_bursts_are_found_whole_and_without_blips() {
         high_hz: 20000.0,
     };
     let a = analyze_selection(
-        &mono,
+        mono,
         &audio.channels,
         audio.sample_rate,
         &stft,
@@ -192,7 +192,7 @@ fn cricket_bursts_are_found_whole_and_without_blips() {
     };
     let total = cfg.frame_count(mono.len()) as i64;
     let seconds = |f: i64| f as f64 * cfg.hop as f64 / audio.sample_rate as f64;
-    let spans: Vec<(f64, f64)> = find_in_range(&tpl, &mono, &audio.channels, &stft, 0..total, &params)
+    let spans: Vec<(f64, f64)> = find_in_range(&tpl, mono, &audio.channels, &stft, 0..total, &params)
         .iter()
         .map(|o| (seconds(o.frame), seconds(o.end())))
         .collect();

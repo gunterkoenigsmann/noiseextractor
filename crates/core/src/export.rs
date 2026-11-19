@@ -1232,9 +1232,10 @@ mod tests {
 
     /// Checks that a decoded lossy file still has both tones on the right
     /// channels (away from the edges, where encoders fade in).
-    fn assert_tones(decoded: &[Vec<f32>], rate: u32) {
-        let mid = &decoded[0][rate as usize / 4..decoded[0].len() - rate as usize / 4];
-        let right = &decoded[1][rate as usize / 4..decoded[1].len() - rate as usize / 4];
+    fn assert_tones(decoded: &[impl AsRef<[f32]>], rate: u32) {
+        let (left, right) = (decoded[0].as_ref(), decoded[1].as_ref());
+        let mid = &left[rate as usize / 4..left.len() - rate as usize / 4];
+        let right = &right[rate as usize / 4..right.len() - rate as usize / 4];
         let (l1, l2) = (amplitude(mid, 1000.0, rate), amplitude(mid, 1500.0, rate));
         let (r1, r2) = (amplitude(right, 1000.0, rate), amplitude(right, 1500.0, rate));
         assert!((l1 - 0.5).abs() < 0.05, "left 1 kHz amplitude {l1}");

@@ -5,6 +5,7 @@
 //! precision is lost between processing and export. The other export
 //! formats live in [`crate::export`].
 
+use crate::samples::{self, Samples, SamplesWriter, StorageOptions};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
@@ -72,13 +73,21 @@ pub fn file_dialog_patterns() -> String {
         .join(";")
 }
 
-/// A decoded recording: one sample vector per channel, all equally long.
+/// A decoded recording: one sample vector per channel, all equally long,
+/// plus their mono mix.
+///
+/// Long recordings keep their samples in mapped scratch files rather than
+/// on the heap (see [`crate::samples`]), so their length is not limited by
+/// the RAM. Cloning is cheap: the samples are shared.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioData {
     /// Samples per second.
     pub sample_rate: u32,
-    /// Channel-major samples in the range -1..1.
-    pub channels: Vec<Vec<f32>>,
+    /// Channel-major samples in the range -1..1. Treat them as read-only:
+    /// the mono mix is computed once, when the recording is made.
+    pub channels: Vec<Samples>,
+    /// Average of all channels (the first channel itself for mono files).
+    mono: Samples,
 }
 
 impl AudioData {
@@ -89,12 +98,19 @@ impl AudioData {
         for c in &mut channels {
             c.resize(len, 0.0);
         }
-        Self { sample_rate, channels }
+        let channels: Vec<Samples> = channels.into_iter().map(Samples::from).collect();
+        // Heap channels are mixed on the heap, which cannot fail.
+        let mono = samples::mix(&channels, &StorageOptions::default()).unwrap_or_else(|_| Vec::new().into());
+        Self {
+            sample_rate,
+            channels,
+            mono,
+        }
     }
 
     /// Number of samples per channel.
     pub fn len(&self) -> usize {
-        self.channels.first().map_or(0, Vec::len)
+        self.channels.first().map_or(0, |c| c.len())
     }
 
     /// True if the recording contains no samples.
@@ -109,20 +125,25 @@ impl AudioData {
 
     /// Average of all channels; the analysis (and the masks) work on this
     /// mix, and the resulting masks are then applied to every channel so the
-    /// stereo image survives.
-    pub fn mono(&self) -> Vec<f32> {
-        let n = self.channels.len().max(1) as f32;
-        let mut out = vec![0.0; self.len()];
-        for c in &self.channels {
-            for (o, &s) in out.iter_mut().zip(c) {
-                *o += s / n;
-            }
-        }
-        out
+    /// stereo image survives. Computed once, so this is free.
+    pub fn mono(&self) -> &[f32] {
+        &self.mono
     }
 
-    /// Decodes any audio file Symphonia understands.
+    /// Whether the samples live in mapped scratch files instead of the heap.
+    pub fn is_mapped(&self) -> bool {
+        self.channels.iter().any(Samples::is_mapped)
+    }
+
+    /// Decodes any audio file Symphonia understands, keeping long
+    /// recordings in scratch files ([`StorageOptions::default`]).
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_with(path, &StorageOptions::default())
+    }
+
+    /// Decodes any audio file Symphonia understands; `storage` tells when
+    /// and where the samples go to scratch files instead of the heap.
+    pub fn load_with(path: &Path, storage: &StorageOptions) -> Result<Self> {
         use symphonia::core::audio::SampleBuffer;
         use symphonia::core::codecs::DecoderOptions;
         use symphonia::core::errors::Error as SymError;
@@ -144,7 +165,10 @@ impl AudioData {
         let track = format.default_track().context("file contains no audio track")?.clone();
         let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
         let mut sample_rate = track.codec_params.sample_rate.unwrap_or(0);
-        let mut channels: Vec<Vec<f32>> = Vec::new();
+        // Known length (not every format says): reserve exactly, so the
+        // vectors do not grow by doubling and leave capacity unused.
+        let expected = track.codec_params.n_frames.unwrap_or(0) as usize;
+        let mut channels: Vec<SamplesWriter> = Vec::new();
         loop {
             let packet = match format.next_packet() {
                 Ok(p) => p,
@@ -166,20 +190,48 @@ impl AudioData {
             sample_rate = spec.rate;
             let nch = spec.channels.count();
             if channels.is_empty() {
-                channels = vec![Vec::new(); nch];
+                // Plus one vector for the mono mix of several channels.
+                let vectors = nch + usize::from(nch > 1);
+                let fits = expected.saturating_mul(vectors * 4) <= storage.spill_above_bytes;
+                channels = (0..nch)
+                    .map(|_| SamplesWriter::new(if fits { expected } else { 0 }))
+                    .collect();
             }
             let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
             buf.copy_interleaved_ref(decoded);
             for frame in buf.samples().chunks(nch) {
                 for (c, &s) in channels.iter_mut().zip(frame) {
-                    c.push(s);
+                    c.push(s)?;
+                }
+            }
+            let vectors = channels.len() + usize::from(channels.len() > 1);
+            let bytes = channels[0].len().saturating_mul(vectors * 4);
+            if bytes > storage.spill_above_bytes && !channels[0].is_spilled() {
+                for c in &mut channels {
+                    c.spill(&storage.dir)?;
                 }
             }
         }
         if channels.is_empty() || sample_rate == 0 {
             bail!("no audio could be decoded from {}", path.display());
         }
-        Ok(Self::new(sample_rate, channels))
+        // A channel cut short by a damaged packet is padded with silence.
+        let len = channels.iter().map(SamplesWriter::len).max().unwrap_or(0);
+        for c in &mut channels {
+            while c.len() < len {
+                c.push(0.0)?;
+            }
+        }
+        let channels = channels
+            .into_iter()
+            .map(SamplesWriter::finish)
+            .collect::<Result<Vec<_>>>()?;
+        let mono = samples::mix(&channels, storage)?;
+        Ok(Self {
+            sample_rate,
+            channels,
+            mono,
+        })
     }
 
     /// Writes the recording as a 32-bit float WAV file.
@@ -282,5 +334,39 @@ mod tests {
         let path = dir.path().join("x.wav");
         std::fs::write(&path, b"definitely not audio").unwrap();
         assert!(AudioData::load(&path).is_err());
+    }
+
+    #[test]
+    fn long_recordings_are_loaded_into_scratch_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.wav");
+        let n = 50_000;
+        let left: Vec<f32> = (0..n).map(|i| ((i * 7919) % 2001) as f32 / 1000.0 - 1.0).collect();
+        let right: Vec<f32> = left.iter().rev().copied().collect();
+        AudioData::new(44100, vec![left, right]).save_wav(&path).unwrap();
+        let heap = AudioData::load(&path).unwrap();
+        assert!(!heap.is_mapped(), "a short file stays on the heap");
+        // Spill after a bit more than one channel's worth: the samples
+        // decoded before the spill must end up in the file as well.
+        let storage = StorageOptions {
+            spill_above_bytes: n * 4,
+            dir: dir.path().join("scratch"),
+        };
+        std::fs::create_dir(&storage.dir).unwrap();
+        let mapped = AudioData::load_with(&path, &storage).unwrap();
+        assert!(mapped.is_mapped());
+        assert!(mapped.channels.iter().all(Samples::is_mapped));
+        assert_eq!(mapped, heap);
+        assert_eq!(mapped.mono(), heap.mono());
+        // The scratch files vanish with the recording (on Windows they are
+        // visible until closed, on Unix they never are).
+        drop(mapped);
+        assert_eq!(std::fs::read_dir(&storage.dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn mono_of_a_mono_file_is_its_channel() {
+        let a = AudioData::new(8000, vec![vec![0.25, -0.5]]);
+        assert_eq!(a.mono().as_ptr(), a.channels[0].as_ptr(), "no copy");
     }
 }

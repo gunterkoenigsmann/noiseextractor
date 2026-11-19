@@ -206,7 +206,7 @@ const NOISE_CONTEXT_S: f64 = 2.0;
 /// checked for it, too.
 pub fn analyze_selection(
     mono: &[f32],
-    channels: &[Vec<f32>],
+    channels: &[impl AsRef<[f32]>],
     sample_rate: u32,
     stft: &Stft,
     selection: &Selection,
@@ -251,7 +251,7 @@ pub fn analyze_selection(
 /// each channel gets its own adaptive estimate (with the profile's
 /// estimator's quantile when `noise` is adaptive, else the default one).
 fn channel_noise(
-    channels: &[Vec<f32>],
+    channels: &[impl AsRef<[f32]>],
     stft: &Stft,
     first: i64,
     frames: usize,
@@ -267,7 +267,7 @@ fn channel_noise(
     let bins = stft.config().bins();
     channels
         .iter()
-        .map(|ch| crate::noise::estimate_noise(&stft.analyze(ch, first, frames).power(), bins, quantile))
+        .map(|ch| crate::noise::estimate_noise(&stft.analyze(ch.as_ref(), first, frames).power(), bins, quantile))
         .collect()
 }
 
@@ -295,7 +295,7 @@ pub const SPREAD_FACTOR: f32 = 2.0;
 /// measured.
 pub fn apply_direction(
     analysis: &mut RegionAnalysis,
-    channels: &[Vec<f32>],
+    channels: &[impl AsRef<[f32]>],
     stft: &Stft,
     (k0, k1): (usize, usize),
     params: &AnalysisParams,
@@ -689,6 +689,9 @@ mod tests {
     use super::*;
     use crate::stft::Stft;
 
+    /// No individual channels: the analysis of a mono recording.
+    const NO_CHANNELS: &[Vec<f32>] = &[];
+
     /// Synthesises a "voice": a pitch gliding from 300 to 450 Hz with
     /// harmonics 2 and 3, an unrelated steady tone at 1700 Hz, and noise.
     fn gliding_voice(sr: u32, secs: f32) -> Vec<f32> {
@@ -729,7 +732,7 @@ mod tests {
         };
         let a = analyze_selection(
             &x,
-            &[],
+            NO_CHANNELS,
             sr,
             &stft,
             &sel,
@@ -969,7 +972,7 @@ mod tests {
         };
         let a = analyze_selection(
             &x,
-            &[],
+            NO_CHANNELS,
             sr,
             &stft,
             &sel,
@@ -1037,7 +1040,7 @@ mod tests {
         };
         let a = analyze_selection(
             &x,
-            &[],
+            NO_CHANNELS,
             48000,
             &stft,
             &sel,
@@ -1082,7 +1085,7 @@ mod tests {
         };
         let a = analyze_selection(
             &x,
-            &[],
+            NO_CHANNELS,
             sr,
             &stft,
             &sel,
@@ -1111,7 +1114,7 @@ mod tests {
         };
         let a = analyze_selection(
             &x,
-            &[],
+            NO_CHANNELS,
             sr,
             &stft,
             &sel,
@@ -1137,7 +1140,7 @@ mod tests {
         };
         let a = analyze_selection(
             &x,
-            &[],
+            NO_CHANNELS,
             sr,
             &stft,
             &sel,

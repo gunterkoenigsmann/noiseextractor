@@ -43,6 +43,7 @@ pub mod normalize;
 pub mod project_file;
 pub mod render;
 pub mod rhythm;
+pub mod samples;
 pub mod share;
 pub mod similar;
 pub mod spatial;

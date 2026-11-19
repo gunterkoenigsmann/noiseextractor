@@ -118,6 +118,60 @@ pub fn render_rgb(
     chunk: &dyn Fn(usize) -> Option<Arc<ChunkResult>>,
 ) -> Vec<u8> {
     let mut img = vec![0u8; width as usize * height as usize * 3];
+    let target = Target {
+        img: &mut img,
+        width,
+        height,
+    };
+    render_columns(view, target, 0..width, layout, sample_rate, fft_size, chunk);
+    img
+}
+
+/// The image [`render_columns`] draws into.
+pub struct Target<'a> {
+    /// RGB bytes, `width × height × 3`, rows top to bottom.
+    pub img: &'a mut [u8],
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+/// The chunks pixel column `x` of `view` reads (see [`render_columns`]), or
+/// `None` if the column lies outside the recording.
+pub fn column_chunks(view: &View, layout: ChunkLayout, x: u32) -> Option<std::ops::RangeInclusive<usize>> {
+    let (f0, f1) = column_frames(view, layout, x)?;
+    let chunk = |f: i64| (f as usize / layout.chunk_frames).min(layout.chunk_count() - 1);
+    Some(chunk(f0)..=chunk(f1 - 1))
+}
+
+/// Frames `f0 .. f1` whose centres fall into pixel column `x`, or `None`
+/// outside the recording.
+fn column_frames(view: &View, layout: ChunkLayout, x: u32) -> Option<(i64, i64)> {
+    let s0 = view.x_to_sample(x as f32);
+    let s1 = view.x_to_sample(x as f32 + 1.0);
+    if s1 <= 0.0 || s0 >= layout.total_samples as f64 {
+        return None;
+    }
+    let f0 = (s0.max(0.0) / layout.hop as f64).round() as i64;
+    let f1 = ((s1 / layout.hop as f64).round() as i64).max(f0 + 1);
+    Some((f0, f1))
+}
+
+/// Draws the pixel columns `columns` of [`render_rgb`]'s image into
+/// `target`. Drawing a long recording a few columns at a time lets the
+/// caller drop chunks it no longer needs ([`column_chunks`] says which a
+/// column reads), so memory does not grow with the recording.
+pub fn render_columns(
+    view: &View,
+    target: Target,
+    columns: std::ops::Range<u32>,
+    layout: ChunkLayout,
+    sample_rate: u32,
+    fft_size: usize,
+    chunk: &dyn Fn(usize) -> Option<Arc<ChunkResult>>,
+) {
+    let Target { img, width, height } = target;
     let bins = fft_size / 2 + 1;
     // Bin for every row, computed once.
     let row_bins: Vec<usize> = (0..height)
@@ -127,15 +181,12 @@ pub fn render_rgb(
         })
         .collect();
     let mut cached: Option<Arc<ChunkResult>> = None;
-    for x in 0..width {
-        let s0 = view.x_to_sample(x as f32);
-        let s1 = view.x_to_sample(x as f32 + 1.0);
-        if s1 <= 0.0 || s0 >= layout.total_samples as f64 {
-            continue; // outside the recording: leave black
-        }
-        // Frames whose centres fall into this column.
-        let f0 = (s0.max(0.0) / layout.hop as f64).round() as i64;
-        let f1 = ((s1 / layout.hop as f64).round() as i64).max(f0 + 1);
+    for x in columns {
+        // Frames whose centres fall into this column; outside the
+        // recording the column stays black.
+        let Some((f0, f1)) = column_frames(view, layout, x) else {
+            continue;
+        };
         let step = ((f1 - f0) / 8).max(1);
         let mut frames = Vec::new();
         let mut f = f0;
@@ -174,7 +225,6 @@ pub fn render_rgb(
             img[at..at + 3].copy_from_slice(&px);
         }
     }
-    img
 }
 
 #[cfg(test)]
@@ -249,5 +299,63 @@ mod tests {
             &|_| None,
         );
         assert_eq!(&img[0..3], &PENDING);
+    }
+
+    #[test]
+    fn drawing_in_pieces_with_only_the_needed_chunks_gives_the_same_image() {
+        // What the command-line tool does to keep memory flat: draw a few
+        // columns at a time, holding only the chunks they read.
+        let layout = ChunkLayout {
+            hop: 4,
+            chunk_frames: 4,
+            total_samples: 1000,
+        };
+        let bins = 5;
+        let make = |c: usize| {
+            let n = layout.chunk_frames * bins;
+            // Distinct levels per chunk, frame and bin.
+            let layer = |o: usize| (0..n).map(|i| ((c * 37 + i * 11 + o) % 251) as u8).collect::<Vec<u8>>();
+            Arc::new(ChunkResult {
+                index: c,
+                generation: 0,
+                first_frame: (c * layout.chunk_frames) as i64,
+                frames: layout.chunk_frames,
+                bins,
+                start_sample: c * layout.chunk_samples(),
+                audio: Vec::new(),
+                original_db: layer(0),
+                output_db: layer(3),
+                selected: layer(7),
+                inferred: layer(9),
+                found: Vec::new(),
+            })
+        };
+        let v = View {
+            samples_per_px: 1000.0 / 37.0,
+            high_hz: 1000.0,
+            ..view()
+        };
+        let (w, h) = (37, 6);
+        let whole = render_rgb(&v, w, h, layout, 2000, 8, &|c| Some(make(c)));
+        let mut img = vec![0u8; whole.len()];
+        let mut x = 0;
+        while x < w {
+            let end = (x + 5).min(w);
+            let needed: Vec<usize> = (x..end)
+                .filter_map(|c| column_chunks(&v, layout, c))
+                .flatten()
+                .collect();
+            let target = Target {
+                img: &mut img,
+                width: w,
+                height: h,
+            };
+            render_columns(&v, target, x..end, layout, 2000, 8, &|c| {
+                assert!(needed.contains(&c), "column_chunks did not name chunk {c}");
+                Some(make(c))
+            });
+            x = end;
+        }
+        assert_eq!(img, whole);
     }
 }

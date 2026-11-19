@@ -82,6 +82,14 @@ On Linux the GUI needs `libgtk-3-dev` and `libasound2-dev`.
   `try_borrow` and handlers request repaints via `request_repaint()` instead of
   calling `refresh` directly. Never hold a borrow across a modal dialog.
 * The audio callback must never block: it uses `Engine::try_chunk`.
+* Memory must not grow with the recording's length beyond the samples
+  themselves, and those live in `samples::Samples`, which long recordings
+  keep in mapped scratch files (`samples.rs`). So never collect a
+  per-frame result for the whole recording (spectra, display layers,
+  copies of the audio); work chunk by chunk like `process_all`, and use
+  `AudioData::mono()` (computed once) instead of mixing again. Functions
+  that read the channels take `&[impl AsRef<[f32]>]`, so tests can still
+  pass plain `Vec<f32>`s.
 * A project file names its recording (`Project::audio`, saved as
   `"recording"`, relative to the project file where possible, see
   `stored_recording` in `crates/core/src/filter.rs`). Anything that saves

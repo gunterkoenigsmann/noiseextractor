@@ -207,6 +207,25 @@ in as well. Automatically found sounds take part in this too: their patterns
 predict their power in every bin directly. In a test where a whistle crosses a kept call's overtone, the
 overtone now keeps its level (−0.3 dB) instead of losing 28 dB.
 
+## Long recordings and memory
+
+Recordings of any length can be opened: the memory the program needs does not
+grow with the length of the file. Files longer than about 20 minutes (stereo,
+48 kHz; more than 256 MB of decoded samples) are decoded into scratch files
+in your cache directory (`~/.cache/noiseextractor` on Linux,
+`~/Library/Caches/noiseextractor` on macOS, `%LOCALAPPDATA%\noiseextractor`
+on Windows) and mapped into memory, so the operating system reads them in as
+needed and can drop them again when memory gets tight. The scratch files are
+deleted when the recording is closed or the program ends, even after a
+crash. They need 4 bytes per sample and channel, plus as much again for the
+mono mix of multi-channel files: about 35 MB per minute of stereo at 48 kHz,
+or 17 GB for eight hours. The spectrogram keeps at most 320 MB of processed
+chunks around the play head and the view.
+
+In a measurement with a 30-minute stereo file, the memory the program held
+for itself went from 1.1 GB (noise reduction) and 1.7 GB (spectrogram export)
+down to 0.17 GB for either, and it no longer grows with the length.
+
 ## Project layout
 
 | Crate | Purpose |

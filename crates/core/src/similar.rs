@@ -232,7 +232,7 @@ impl Template {
     /// if unknown); it is kept for measuring repetitions the same way.
     pub fn attach_spatial(
         &mut self,
-        channels: &[Vec<f32>],
+        channels: &[impl AsRef<[f32]>],
         stft: &Stft,
         max_delay_samples: f32,
         channel_noise: Vec<Vec<f32>>,
@@ -295,7 +295,7 @@ impl Template {
 pub fn find_in_range(
     template: &Template,
     mono: &[f32],
-    channels: &[Vec<f32>],
+    channels: &[impl AsRef<[f32]>],
     stft: &Stft,
     range: Range<i64>,
     params: &SimilarParams,
@@ -421,7 +421,7 @@ fn find_rhythmic(
     template: &Template,
     rhythm: &Rhythm,
     mono: &[f32],
-    channels: &[Vec<f32>],
+    channels: &[impl AsRef<[f32]>],
     stft: &Stft,
     range: Range<i64>,
     params: &SimilarParams,
@@ -629,6 +629,9 @@ mod tests {
     use super::*;
     use crate::stft::StftConfig;
 
+    /// No individual channels: the search in a mono recording.
+    const NO_CHANNELS: &[Vec<f32>] = &[];
+
     /// A rising chirp from `f0` to `f1` Hz lasting `len` seconds.
     fn chirp(out: &mut [f32], sr: u32, start_s: f32, len: f32, f0: f32, f1: f32, amp: f32) {
         let start = (start_s * sr as f32) as usize;
@@ -696,7 +699,7 @@ mod tests {
         let all = find_in_range(
             &tpl,
             &x,
-            &[],
+            NO_CHANNELS,
             &stft,
             0..stft.config().frame_count(x.len()) as i64,
             &SimilarParams::default(),
@@ -722,12 +725,12 @@ mod tests {
         let tpl = template(&x, &stft, sr);
         let total = stft.config().frame_count(x.len()) as i64;
         let p = SimilarParams::default();
-        let whole = find_in_range(&tpl, &x, &[], &stft, 0..total, &p);
+        let whole = find_in_range(&tpl, &x, NO_CHANNELS, &stft, 0..total, &p);
         let mut pieces = Vec::new();
         let mut a = 0;
         while a < total {
             let b = (a + 37).min(total);
-            pieces.extend(find_in_range(&tpl, &x, &[], &stft, a..b, &p));
+            pieces.extend(find_in_range(&tpl, &x, NO_CHANNELS, &stft, a..b, &p));
             a = b;
         }
         pieces.sort_by_key(|o| o.frame);
@@ -746,7 +749,7 @@ mod tests {
             hop: 128,
         });
         let tpl = template(&x, &stft, sr);
-        let found = find_in_range(&tpl, &x, &[], &stft, 0..20, &SimilarParams::default());
+        let found = find_in_range(&tpl, &x, NO_CHANNELS, &stft, 0..20, &SimilarParams::default());
         assert_eq!(found.len(), 1, "{found:?}");
         // For a gliding chirp a shift in frequency and a shift in time look
         // alike, so the match may trade one for the other; it must however
@@ -766,7 +769,7 @@ mod tests {
         let all = find_in_range(
             &tpl,
             &x,
-            &[],
+            NO_CHANNELS,
             &stft,
             0..stft.config().frame_count(x.len()) as i64,
             &SimilarParams::default(),
@@ -905,7 +908,7 @@ mod tests {
             ..params.clone()
         };
         assert_eq!(find_in_range(&tpl, &mono, &ch, &stft, range.clone(), &blind).len(), 3);
-        assert_eq!(find_in_range(&tpl, &mono, &[], &stft, range, &params).len(), 3);
+        assert_eq!(find_in_range(&tpl, &mono, NO_CHANNELS, &stft, range, &params).len(), 3);
     }
 
     /// Adds band-limited noise (40 partials between 3 and 6 kHz) gated into
@@ -1006,7 +1009,7 @@ mod tests {
         let rate = sr as f32 / hop / rhythm.period;
         assert!((rate - 6.0).abs() < 0.8, "pulse rate {rate}");
         let total = stft.config().frame_count(x.len()) as i64;
-        let found = find_in_range(&tpl, &x, &[], &stft, 0..total, &SimilarParams::default());
+        let found = find_in_range(&tpl, &x, NO_CHANNELS, &stft, 0..total, &SimilarParams::default());
         let spans: Vec<(f32, f32)> = found
             .iter()
             .map(|o| {
@@ -1047,7 +1050,7 @@ mod tests {
         let hop = stft.config().hop as f32;
         let tpl = insect_template(&x, &stft, sr);
         let total = stft.config().frame_count(x.len()) as i64;
-        let found = find_in_range(&tpl, &x, &[], &stft, 0..total, &SimilarParams::default());
+        let found = find_in_range(&tpl, &x, NO_CHANNELS, &stft, 0..total, &SimilarParams::default());
         let starts: Vec<f32> = found.iter().map(|o| o.frame as f32 * hop / sr as f32).collect();
         assert_eq!(found.len(), 3, "starts {starts:?}");
         assert!(starts.iter().all(|&s| s < 16.0), "starts {starts:?}");
@@ -1061,10 +1064,10 @@ mod tests {
         let tpl = insect_template(&x, &stft, sr);
         let total = stft.config().frame_count(x.len()) as i64;
         let params = SimilarParams::default();
-        let whole = find_in_range(&tpl, &x, &[], &stft, 0..total, &params);
+        let whole = find_in_range(&tpl, &x, NO_CHANNELS, &stft, 0..total, &params);
         let mut pieced: Vec<Occurrence> = Vec::new();
         for start in (0..total).step_by(16) {
-            for o in find_in_range(&tpl, &x, &[], &stft, start..(start + 16).min(total), &params) {
+            for o in find_in_range(&tpl, &x, NO_CHANNELS, &stft, start..(start + 16).min(total), &params) {
                 if !pieced.contains(&o) {
                     pieced.push(o);
                 }

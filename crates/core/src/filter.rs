@@ -420,7 +420,7 @@ impl Project {
             if let FilterKind::Event(e) = &mut f.kind {
                 if e.analysis.is_none() {
                     e.analysis = Some(Arc::new(analyze_selection(
-                        &mono,
+                        mono,
                         &audio.channels,
                         audio.sample_rate,
                         &stft,

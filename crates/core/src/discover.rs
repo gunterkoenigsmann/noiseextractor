@@ -446,7 +446,7 @@ pub fn discover(
     let mono = audio.mono();
     let mut power: Vec<Vec<f32>> = Vec::new();
     for &(start, count) in &blocks {
-        power.extend(stft.analyze(&mono, start, count).power());
+        power.extend(stft.analyze(mono, start, count).power());
     }
     let frames = power.len();
     // The DC bin is left out: a microphone's DC offset or handling rumble
