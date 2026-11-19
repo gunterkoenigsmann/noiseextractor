@@ -126,11 +126,18 @@ libraries.
 | Jump elsewhere in a long recording | Drag the frame in the waveform overview, or click beside it |
 | See where else in the recording a sound was found | Mark it (or pick its filter): the waveform overview draws in orange how loud what the filter finds is at each time; it fills in as the recording is processed |
 | Show / hide panes (filters, detection settings, overview, log) | View menu, or the pane's close button; panes can be dragged to other edges or floated, and the layout is remembered |
-| Find the sounds a recording is made of | Set *Patterns to look for*, then *Find sounds* (only the selected stretch is used to learn, if there is a selection); *Keep*, *Merge with...*, *Split* and *Discard suggestions* edit the result |
+| Find the sounds a recording is made of | *Find sounds* (Ctrl+F); how many patterns to look for and whether they are grouped is set in File > Settings > Find sounds (only the selected stretch is used to learn, if there is a selection); *Keep*, *Merge with...*, *Split* and *Discard suggestions* edit the result |
 | Learn the background noise | Mark a noise-only stretch, *Learn noise from selection* |
 | Save the filter list | File > Save project (Ctrl+S) |
 | Reopen a recent recording or project | File > Recent recordings / Recent projects (nine of each are remembered; a file that is gone is dropped from the list) |
 | Write the result | File > Export processed audio (Ctrl+E) |
+| Make a quiet extracted sound louder in the export | File > Settings > Export > *Normalize the exported audio*: the whole file is scaled by one gain so its loudest sample reaches the chosen level (default -1 dBFS); the levels inside it keep their ratios |
+| Make the spectrogram brighter / show quieter detail | File > Settings > Spectrogram (the levels drawn black and at full colour; changes show at once) |
+| Look up what the colours mean | Help > Colours and mouse |
+
+File > Settings (Ctrl+,) holds what is set once and rarely changed, on
+pages listed down its left side like losslessaudiocut's; it is remembered
+between runs.
 
 ## Command-line tool
 
@@ -144,6 +151,7 @@ noiseextractor-cli mark in.flac --time 12.3:13.1 --freq 2000:4500 --name blackbi
 noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract --save-project p.json
 noiseextractor-cli process in.flac --project p.json -o out.wav
 noiseextractor-cli process in.flac --project p.json --solo 2,3 -o two-sounds.wav   # or --without 2,3
+noiseextractor-cli process in.flac --project p.json --solo 2 --normalize -o loud.wav  # peak at -1 dBFS (or --normalize=-3)
 noiseextractor-cli spectrogram in.flac --project p.json -o view.png --max-hz 10000
 ```
 

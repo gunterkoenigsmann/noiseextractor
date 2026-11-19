@@ -13,6 +13,6 @@ serde_json.workspace = true
 realfft = "3.5"
 hound = "3.5"
 symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac"] }
-
-[dev-dependencies]
+# Scratch file of normalized exports (see normalize.rs).
 tempfile = "3"
+

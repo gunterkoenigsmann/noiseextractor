@@ -526,3 +526,48 @@ fn mark_reports_insect_pulses_as_broadband_without_partials() {
     assert!(!report.contains("dominant frequency"), "{report}");
     assert!(!report.contains("related partial"), "{report}");
 }
+
+#[test]
+fn normalize_scales_the_whole_output_by_one_gain() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    write_test_audio(&input);
+    let project = dir.path().join("p.json");
+    Project::default().save(&project).unwrap();
+    let plain = process_with(&input, &project, &dir.path().join("plain.wav"), &[]);
+    let norm = process_with(&input, &project, &dir.path().join("n.wav"), &["--normalize=-6"]);
+    let default = process_with(&input, &project, &dir.path().join("d.wav"), &["--normalize"]);
+    let peak = |x: &[f32]| x.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+    let db = |x: &[f32]| 20.0 * peak(x).log10();
+    assert!((db(&norm) + 6.0).abs() < 0.01, "{}", db(&norm));
+    assert!((db(&default) + 1.0).abs() < 0.01, "{}", db(&default));
+    // One gain: every sample keeps its ratio to the plain output.
+    let gain = peak(&norm) / peak(&plain);
+    for (&a, &b) in plain.iter().zip(&norm) {
+        assert!((a * gain - b).abs() < 1e-5, "{a} {b}");
+    }
+    // No scratch file is left next to the outputs.
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["d.wav", "in.wav", "n.wav", "p.json", "plain.wav"]);
+}
+
+#[test]
+fn normalize_rejects_a_target_above_full_scale() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    write_test_audio(&input);
+    let out = bin()
+        .args(["denoise"])
+        .arg(&input)
+        .arg("-o")
+        .arg(dir.path().join("o.wav"))
+        .arg("--normalize=3")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--normalize"));
+}
