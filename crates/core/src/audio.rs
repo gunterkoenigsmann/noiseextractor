@@ -357,7 +357,9 @@ mod tests {
         assert!(mapped.channels.iter().all(Samples::is_mapped));
         assert_eq!(mapped, heap);
         assert_eq!(mapped.mono(), heap.mono());
-        // The scratch files are anonymous and vanish with the recording.
+        // The scratch files vanish with the recording (on Windows they are
+        // visible until closed, on Unix they never are).
+        drop(mapped);
         assert_eq!(std::fs::read_dir(&storage.dir).unwrap().count(), 0);
     }
 

@@ -309,7 +309,9 @@ mod tests {
         let s = w.finish().unwrap();
         assert!(s.is_mapped());
         assert_eq!(s, data);
-        // The scratch file is anonymous: nothing is left in the directory.
+        // Nothing is left behind once the samples are gone (on Windows the
+        // file is visible until it is closed, on Unix it never is).
+        drop(s);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
