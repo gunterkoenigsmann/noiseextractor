@@ -23,6 +23,6 @@ opus = "0.4"
 ogg = "0.9"
 rubato = "0.16"
 alac-encoder = "0.3"
-
-[dev-dependencies]
+# Scratch file of normalized exports (see normalize.rs).
 tempfile = "3"
+

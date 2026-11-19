@@ -38,6 +38,11 @@
 //! changed and follows the pick; see `noiseextractor_core::listen`. Export
 //! always writes the project as set up, whatever is being heard.
 //!
+//! File > Settings (Ctrl+,) holds what is set once and rarely touched:
+//! spectrogram levels, the "Find sounds" settings and peak normalization
+//! of the export (see `settings.rs`, stored by `options.rs`). Help >
+//! Colours and mouse explains the spectrogram's colours.
+//!
 //! "Find sounds" looks for the recurring sounds the recording (or the
 //! selected stretch) is made of (see `noiseextractor_core::discover`) and
 //! adds them to the list as suggestions: switched off and hidden until
@@ -53,28 +58,31 @@
 mod detection;
 mod filter_list;
 mod log;
+mod options;
 mod overview;
 mod panes;
 mod player;
 mod recent;
 mod scrub;
+mod settings;
 mod toolbar;
 mod view;
 
 use detection::{Group, Param};
 use filter_list::FilterList;
 use noiseextractor_core::analysis::{analyze_selection, AnalysisParams, RegionAnalysis, Selection};
-use noiseextractor_core::discover::{discover, DiscoverParams, Discovery};
-use noiseextractor_core::engine::process_all;
+use noiseextractor_core::discover::{discover, Discovery};
 use noiseextractor_core::export::{
     create_writer, resolve_export_path, save_dialog_wildcard, ExportFormat, ExportOptions,
 };
 use noiseextractor_core::filter::{EventFilter, Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::{mean_power, NoiseEstimate};
+use noiseextractor_core::normalize::process_all_normalized;
 use noiseextractor_core::render::{render_rgb, ORANGE};
 use noiseextractor_core::similar::SimilarParams;
 use noiseextractor_core::stft::{Stft, StftConfig};
 use noiseextractor_core::{AudioData, Engine, EngineConfig, Focus, Listen, Pick};
+use options::Options;
 use overview::{found_columns, Overview, Peaks};
 use panes::{Contents, Pane, Panes};
 use player::Player;
@@ -112,6 +120,11 @@ const ID_HEAR_ALL: i32 = ID_HIGHEST + 9;
 const ID_HEAR_SOLO: i32 = ID_HIGHEST + 10;
 /// View > Hear everything but the picked sound ([`Listen::Without`]).
 const ID_HEAR_WITHOUT: i32 = ID_HIGHEST + 11;
+/// File > Settings (the tabbed dialog of `settings.rs`).
+const ID_SETTINGS: i32 = ID_HIGHEST + 12;
+/// Help > Colours and mouse: what the spectrogram's colours mean and what
+/// the mouse does.
+const ID_LEGEND: i32 = ID_HIGHEST + 13;
 
 /// Filter > Suppress selection (also a button in the filter pane).
 const ID_ADD_SUPPRESS: i32 = ID_HIGHEST + 20;
@@ -165,9 +178,17 @@ enum Background {
     /// Export progress in percent, or the final result.
     ExportProgress(usize),
     /// Export finished.
-    Exported(anyhow::Result<PathBuf>),
+    Exported(anyhow::Result<Exported>),
     /// The search for the recording's sounds finished.
     Discovered(anyhow::Result<Discovery>),
+}
+
+/// A finished export.
+struct Exported {
+    /// The file written.
+    path: PathBuf,
+    /// Gain applied by normalization in dB, `None` when it was off.
+    gain_db: Option<f32>,
 }
 
 /// All mutable application state, owned by the GUI thread.
@@ -219,6 +240,8 @@ struct State {
     recent_audio: RecentFiles,
     /// File > Recent projects, remembered between runs.
     recent_projects: RecentFiles,
+    /// File > Settings, remembered between runs.
+    options: Options,
     /// Format of the last export; the export dialog preselects it.
     export_format: ExportFormat,
 }
@@ -315,12 +338,6 @@ struct Ui {
     adaptive: Button,
     /// Starts the search for the recording's sounds.
     find_sounds: Button,
-    /// How many spectral patterns to look for.
-    sounds: Slider,
-    /// Shows the slider value.
-    sounds_label: StaticText,
-    /// Whether patterns that belong together are suggested as one sound.
-    group: CheckBox,
     /// Keeps the current suggestion (the next search will not replace it).
     keep: Button,
     /// Merges another found sound into the current one.
@@ -373,6 +390,7 @@ fn main() {
             listen: Listen::All,
             recent_audio: recent::load(RecentKind::Audio),
             recent_projects: recent::load(RecentKind::Project),
+            options: Options::load(),
             export_format: ExportFormat::Wav,
         }));
         let ui = build_ui();
@@ -408,6 +426,12 @@ fn build_ui() -> Ui {
             ID_EXPORT,
             "&Export processed audio...\tCtrl+E",
             "Write the filtered recording as WAV, FLAC, Ogg Vorbis, MP3, Opus or Apple Lossless",
+        )
+        .append_separator()
+        .append_item(
+            ID_SETTINGS,
+            "Se&ttings...\tCtrl+,",
+            "Spectrogram levels, finding sounds, normalizing the export",
         )
         .append_separator()
         .append_item(ID_QUIT, "&Quit\tCtrl+Q", "Leave noiseextractor")
@@ -489,6 +513,16 @@ fn build_ui() -> Ui {
             .append(file_menu, "&File")
             .append(view_menu.build(), "&View")
             .append(filter_menu, "Fi&lter")
+            .append(
+                Menu::builder()
+                    .append_item(
+                        ID_LEGEND,
+                        "&Colours and mouse",
+                        "What the spectrogram's colours mean and what the mouse does",
+                    )
+                    .build(),
+                "&Help",
+            )
             .build(),
     );
     let toolbar = toolbar::create(&frame);
@@ -528,18 +562,6 @@ fn build_ui() -> Ui {
         .build();
     let learn = Button::builder(&side).with_label("Learn noise from selection").build();
     let adaptive = Button::builder(&side).with_label("Adaptive noise estimate").build();
-    let sounds_label = StaticText::builder(&side)
-        .with_label(&sounds_text(DiscoverParams::default().components))
-        .build();
-    let sounds = Slider::builder(&side)
-        .with_value(DiscoverParams::default().components as i32)
-        .with_min_value(1)
-        .with_max_value(MAX_SOUNDS)
-        .build();
-    let group = CheckBox::builder(&side)
-        .with_label("Group patterns by timing and direction")
-        .build();
-    group.set_value(DiscoverParams::default().group);
     let find_sounds = Button::builder(&side)
         .with_label("Find sounds (in the selection, if any)")
         .build();
@@ -547,10 +569,6 @@ fn build_ui() -> Ui {
     let merge = Button::builder(&side).with_label("Merge with...").build();
     let split = Button::builder(&side).with_label("Split").build();
     let discard = Button::builder(&side).with_label("Discard suggestions").build();
-    let legend = StaticText::builder(&side)
-        .with_label("Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere,\n  or a found sound you picked\nOrange: both\n\nDrag to select, click to set play head,\nright-drag to scrub, wheel zooms\n(Shift scrolls, Ctrl: frequency), Space plays,\nCtrl+2 / Ctrl+3: hear the picked sound\nalone / removed, Ctrl+1: everything.")
-        .build();
-
     let s = BoxSizer::builder(Orientation::Vertical).build();
     let label = |text: &str| StaticText::builder(&side).with_label(text).build();
     s.add(
@@ -595,9 +613,6 @@ fn build_ui() -> Ui {
         SizerFlag::Left | SizerFlag::Top,
         6,
     );
-    s.add(&sounds_label, 0, SizerFlag::Left | SizerFlag::Top, 4);
-    s.add(&sounds, 0, SizerFlag::Expand | SizerFlag::All, 4);
-    s.add(&group, 0, SizerFlag::All, 4);
     s.add(&find_sounds, 0, SizerFlag::Expand | SizerFlag::All, 2);
     let row3 = BoxSizer::builder(Orientation::Horizontal).build();
     row3.add(&keep, 1, SizerFlag::All, 2);
@@ -605,7 +620,6 @@ fn build_ui() -> Ui {
     row3.add(&split, 1, SizerFlag::All, 2);
     s.add_sizer(&row3, 0, SizerFlag::Expand, 2);
     s.add(&discard, 0, SizerFlag::Expand | SizerFlag::All, 2);
-    s.add(&legend, 0, SizerFlag::All, 6);
     side.set_sizer(s, true);
 
     let (detection_panel, detection_title, detection) = build_detection(&frame);
@@ -644,9 +658,6 @@ fn build_ui() -> Ui {
         learn,
         adaptive,
         find_sounds,
-        sounds,
-        sounds_label,
-        group,
         keep,
         merge,
         split,
@@ -654,13 +665,12 @@ fn build_ui() -> Ui {
     }
 }
 
-/// Most spectral patterns the slider offers.
-const MAX_SOUNDS: i32 = 16;
-
-/// Label of the pattern-count slider.
-fn sounds_text(n: usize) -> String {
-    format!("Patterns to look for: {n}")
-}
+/// What the spectrogram's colours mean and what the mouse does (Help >
+/// Colours and mouse).
+const LEGEND: &str = "Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere, \
+                      or a found sound you picked\nOrange: both\n\nDrag to select, click to set the play head, \
+                      right-drag to scrub, the wheel zooms (Shift scrolls, Ctrl: frequency), Space plays.\n\
+                      Ctrl+2 / Ctrl+3: hear the picked sound alone / removed, Ctrl+1: everything.";
 
 /// Builds the detection settings pane: a title naming the object being
 /// edited, then one labelled slider per [`Param`], grouped into "parts of
@@ -782,6 +792,13 @@ fn bind_events(state: &Shared, ui: Ui) {
         ID_ADD_EXTRACT => add_filter_from_selection(&st, ui, FilterAction::Extract),
         ID_LEARN_NOISE => learn_noise(&st, ui),
         ID_FIND_SOUNDS => start_discovery(&mut st.borrow_mut(), ui),
+        ID_SETTINGS => open_settings(&st, ui),
+        ID_LEGEND => {
+            MessageDialog::builder(&ui.frame, LEGEND, "Colours and mouse")
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build()
+                .show_modal();
+        }
         ID_QUIT => ui.frame.close(true),
         id => {
             if let Some(cmd) = RecentCommand::for_menu_id(id) {
@@ -1095,9 +1112,6 @@ fn bind_events(state: &Shared, ui: Ui) {
     ui.down.on_click(move |_| move_filter(&st, ui, 1));
     let st = state.clone();
     ui.learn.on_click(move |_| learn_noise(&st, ui));
-    ui.sounds.on_slider(move |e| {
-        ui.sounds_label.set_label(&sounds_text(e.get_value().max(1) as usize));
-    });
     let st = state.clone();
     ui.find_sounds
         .on_click(move |_| start_discovery(&mut st.borrow_mut(), ui));
@@ -1679,12 +1693,8 @@ fn start_discovery(s: &mut State, ui: Ui) {
         report(ui, "Busy, try again in a moment");
         return;
     }
-    let params = DiscoverParams {
-        components: ui.sounds.get_value().clamp(1, MAX_SOUNDS) as usize,
-        group: ui.group.get_value(),
-        range_s: s.selection.map(|sel| (sel.start_s, sel.end_s)),
-        ..DiscoverParams::default()
-    };
+    let mut params = s.options.discover_params();
+    params.range_s = s.selection.map(|sel| (sel.start_s, sel.end_s));
     let audio = doc.audio.clone();
     let cfg = s.project.stft;
     let noise = s.project.analysis_noise();
@@ -1819,34 +1829,76 @@ fn toggle_play(s: &mut State) {
     }
 }
 
-/// Exports the processed recording on a background thread.
+/// Exports the processed recording on a background thread, normalized if
+/// File > Settings > Export says so.
 fn start_export(s: &mut State, path: PathBuf, format: ExportFormat) {
     let Some(doc) = &s.doc else { return };
     let audio = doc.audio.clone();
     let project = s.project.clone();
+    let normalize = s.options.normalize_target();
     let tx = s.tx.clone();
     s.busy = Some("Exporting ...".into());
     std::thread::spawn(move || {
-        let run = || -> anyhow::Result<PathBuf> {
+        let run = || -> anyhow::Result<Exported> {
             let mut w = create_writer(
                 &path,
                 ExportOptions::new(format),
                 audio.sample_rate,
                 audio.channels.len(),
             )?;
-            let total = audio.len().max(1);
             let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-            process_all(&audio, &project, EngineConfig::default().chunk_frames, threads, |r| {
-                let _ = tx.send(Background::ExportProgress(
-                    (r.start_sample + r.audio[0].len()) * 100 / total,
-                ));
-                w.write(&r.audio)
-            })?;
+            // The scratch file of a normalized export goes next to the
+            // output: that disk has room for the result anyway.
+            let scratch = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let done = process_all_normalized(
+                &audio,
+                &project,
+                EngineConfig::default().chunk_frames,
+                threads,
+                normalize,
+                scratch,
+                |fraction| {
+                    let _ = tx.send(Background::ExportProgress((fraction * 100.0) as usize));
+                },
+                |block| w.write(block),
+            )?;
             w.finish()?;
-            Ok(path.clone())
+            Ok(Exported {
+                path: path.clone(),
+                gain_db: normalize.map(|_| done.gain_db()),
+            })
         };
         let _ = tx.send(Background::Exported(run()));
     });
+}
+
+/// Opens File > Settings. Changes show at once; Cancel restores the
+/// options from before, OK stores the new ones.
+fn open_settings(st: &Shared, ui: Ui) {
+    let before = st.borrow().options;
+    let preview: Rc<dyn Fn(Options)> = {
+        let st = st.clone();
+        Rc::new(move |o| {
+            // The dialog is modal and runs its own event loop, so the
+            // state is free whenever a control reports a change.
+            if let Ok(mut s) = st.try_borrow_mut() {
+                s.options = o;
+            }
+            request_repaint();
+        })
+    };
+    // No borrow may be held across the modal dialog.
+    let chosen = settings::show(&ui.frame, before, Rc::clone(&preview));
+    match chosen {
+        Some(o) => {
+            o.save();
+            preview(o);
+        }
+        None => preview(before),
+    }
 }
 
 /// Periodic work on the GUI thread: collect background results, update the
@@ -1909,7 +1961,10 @@ fn tick(s: &mut State, ui: Ui) {
                 report(
                     ui,
                     &match r {
-                        Ok(p) => format!("Exported {}", p.display()),
+                        Ok(Exported { path, gain_db: None }) => format!("Exported {}", path.display()),
+                        Ok(Exported { path, gain_db: Some(g) }) => {
+                            format!("Exported {}, normalized by {g:+.1} dB", path.display())
+                        }
                         Err(e) => format!("Export failed: {e:#}"),
                     },
                 );
@@ -1980,6 +2035,8 @@ fn paint(s: &State, dc: &AutoBufferedPaintDC) {
     // resized since the last event).
     let mut vp = *vp;
     vp.clamp(w);
+    vp.view.db_min = s.options.db_floor as f32;
+    vp.view.db_max = s.options.db_ceiling as f32;
     let engine = &doc.engine;
     let rgb = render_rgb(
         &vp.view,

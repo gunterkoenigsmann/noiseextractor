@@ -39,6 +39,7 @@ pub mod export;
 pub mod filter;
 pub mod listen;
 pub mod noise;
+pub mod normalize;
 pub mod render;
 pub mod rhythm;
 pub mod share;
