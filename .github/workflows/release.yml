@@ -115,6 +115,7 @@ jobs:
           squashfs-root/usr/bin/noiseextractor-cli spectrogram "$wav" -o spec.png
           test -s out.wav && test -s spec.png
           grep -q '^MimeType=audio/x-wav;' squashfs-root/noiseextractor.desktop
+          grep -q 'application/x-noiseextractor-project' squashfs-root/usr/share/mime/packages/noiseextractor.xml
           # The command line tool through the AppImage itself: with --cli,
           # and through a symlink named noiseextractor-cli
           # (packaging/linux/AppRun).
@@ -139,13 +140,25 @@ jobs:
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -q
               apt-get install -y -q --no-install-recommends /dist/*.deb xvfb xauth
+              # Installed after the package so that their dpkg triggers
+              # see its files, as on a desktop that has them already.
+              apt-get install -y -q --no-install-recommends shared-mime-info bash-completion
               cd "$(mktemp -d)"
               noiseextractor-cli --version
               noiseextractor-cli denoise /packaging/smoke-test.wav -o out.wav
               test -s out.wav
               test -s /usr/share/applications/noiseextractor.desktop
+              # The project type is known to the MIME database ...
+              grep -q "application/x-noiseextractor-project:\*\.nxp" /usr/share/mime/globs2
+              # ... and both completion scripts load.
+              bash -c ". /usr/share/bash-completion/bash_completion
+                . /usr/share/bash-completion/completions/noiseextractor
+                . /usr/share/bash-completion/completions/noiseextractor-cli
+                complete -p noiseextractor noiseextractor-cli"
+              noiseextractor-cli new-project p.nxp
               set +e
-              xvfb-run -a timeout 20 noiseextractor /packaging/smoke-test.wav
+              # A recording and a project, as a file manager passes them.
+              xvfb-run -a timeout 20 noiseextractor /packaging/smoke-test.wav p.nxp
               status=$?
               echo "exit status: $status"
               test "$status" -eq 124

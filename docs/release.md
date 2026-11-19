@@ -33,9 +33,13 @@ Every package holds the GUI and the command line tool `noiseextractor-cli`:
 
 The packages offer the program under "Open with" for the audio types it
 reads (`FILE_TYPES` in `crates/core/src/audio.rs`); it never becomes the
-default program. `crates/core/tests/packaging.rs` checks that the desktop
-file, `Info.plist` and the installer list exactly these types, and that the
-snap's desktop file (`snap/gui`) matches the other one.
+default program for them. Project files (`*.nxp`, `PROJECT_FILE_TYPE` in
+`crates/core/src/project_file.rs`) are a type of our own, which the
+packages register with noiseextractor as their program; the `.deb` also
+installs shell completion. `crates/core/tests/packaging.rs` checks that the
+desktop file, the MIME declaration, `Info.plist` and the installer list
+exactly these types, and that the snap's desktop file (`snap/gui`) matches
+the other one. [files.md](files.md) has the details per package.
 
 ## What each run checks
 

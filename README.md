@@ -112,7 +112,7 @@ libraries.
 
 | Action | How |
 | --- | --- |
-| Open a recording | File > Open audio (Ctrl+O), or pass it on the command line |
+| Open a recording | File > Open audio (Ctrl+O), "Open with" in the file manager, or pass it on the command line (`noiseextractor rec.flac birds.nxp` opens a recording and a project) |
 | Mark a sound | Drag a rectangle in the spectrogram |
 | Turn it into a filter | *Suppress selection* or *Extract selection* |
 | Switch filters on / off | Click a filter's box, or press Space to switch all picked filters |
@@ -128,7 +128,7 @@ libraries.
 | Show / hide panes (filters, detection settings, overview, log) | View menu, or the pane's close button; panes can be dragged to other edges or floated, and the layout is remembered |
 | Find the sounds a recording is made of | *Find sounds* (Ctrl+F); how many patterns to look for and whether they are grouped is set in File > Settings > Find sounds (only the selected stretch is used to learn, if there is a selection); *Keep*, *Merge with...*, *Split* and *Discard suggestions* edit the result |
 | Learn the background noise | Mark a noise-only stretch, *Learn noise from selection* |
-| Save the filter list | File > Save project (Ctrl+S). The project remembers its recording (relative to the project file when both live in one folder tree, so the folder can be moved), and opening the project opens that recording again; if it is gone, the filters apply to the recording that is open |
+| Save the filter list | File > Save project (Ctrl+S); projects are `*.nxp` files, which a double click opens ([docs/files.md](docs/files.md)). The project remembers its recording (relative to the project file when both live in one folder tree, so the folder can be moved), and opening the project opens that recording again; if it is gone, the filters apply to the recording that is open |
 | Reopen a recent recording or project | File > Recent recordings / Recent projects (nine of each are remembered; a file that is gone is dropped from the list) |
 | Write the result | File > Export processed audio (Ctrl+E); the file type list (or the extension you type) picks WAV, FLAC, Ogg Vorbis, MP3, Opus or Apple Lossless, see [Export formats](#export-formats) |
 | Make a quiet extracted sound louder in the export | File > Settings > Export > *Normalize the exported audio*: the whole file is scaled by one gain so its loudest sample reaches the chosen level (default -1 dBFS); the levels inside it keep their ratios |
@@ -145,16 +145,19 @@ between runs.
 batch jobs or tests:
 
 ```sh
-noiseextractor-cli denoise in.flac -o clean.wav --noise-from 0.0:1.5 --save-project p.json
+noiseextractor-cli denoise in.flac -o clean.wav --noise-from 0.0:1.5 --save-project birds.nxp
 noiseextractor-cli mark in.flac --time 12.3:13.1 --freq 2000:4500 --name blackbird \
-    --extract --project p.json --save-project p.json
-noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract --save-project p.json
-noiseextractor-cli process in.flac --project p.json -o out.wav
-noiseextractor-cli process in.flac --project p.json --solo 2,3 -o two-sounds.wav   # or --without 2,3
-noiseextractor-cli process in.flac --project p.json -o out.opus --bitrate 96   # see Export formats
-noiseextractor-cli process in.flac --project p.json --solo 2 --normalize -o loud.wav  # peak at -1 dBFS (or --normalize=-3)
-noiseextractor-cli spectrogram in.flac --project p.json -o view.png --max-hz 10000
+    --extract --project birds.nxp --save-project birds.nxp
+noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract --save-project birds.nxp
+noiseextractor-cli process in.flac --project birds.nxp -o out.wav
+noiseextractor-cli process in.flac --project birds.nxp --solo 2,3 -o two-sounds.wav   # or --without 2,3
+noiseextractor-cli process in.flac --project birds.nxp -o out.opus --bitrate 96   # see Export formats
+noiseextractor-cli process in.flac --project birds.nxp --solo 2 --normalize -o loud.wav  # peak at -1 dBFS (or --normalize=-3)
+noiseextractor-cli spectrogram in.flac --project birds.nxp -o view.png --max-hz 10000
 ```
+
+`noiseextractor-cli completions bash` (or zsh, fish, powershell, elvish) prints
+a shell completion script; [docs/files.md](docs/files.md) shows where to put it.
 
 `mark` prints which harmonic ratios it found, where the marked sound comes
 from (level and delay per channel, for multi-channel files) and where else in

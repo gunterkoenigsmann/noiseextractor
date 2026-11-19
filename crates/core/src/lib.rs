@@ -40,6 +40,7 @@ pub mod filter;
 pub mod listen;
 pub mod noise;
 pub mod normalize;
+pub mod project_file;
 pub mod render;
 pub mod rhythm;
 pub mod share;

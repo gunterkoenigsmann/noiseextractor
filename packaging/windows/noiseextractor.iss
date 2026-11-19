@@ -60,6 +60,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "projects"; Description: "Open noiseextractor projects (.nxp) with noiseextractor"; GroupDescription: "File associations:"
 Name: "openwith"; Description: "Offer noiseextractor in ""Open with"" for audio files (WAV, FLAC, Ogg, MP3, M4A, AAC)"; GroupDescription: "File associations:"
 
 [Files]
@@ -90,6 +91,18 @@ Root: HKA; Subkey: "Software\Classes\Applications\noiseextractor.exe\SupportedTy
 Root: HKA; Subkey: "Software\Classes\Applications\noiseextractor.exe\SupportedTypes"; ValueType: string; ValueName: ".mp3"; ValueData: ""; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\Applications\noiseextractor.exe\SupportedTypes"; ValueType: string; ValueName: ".m4a"; ValueData: ""; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\Applications\noiseextractor.exe\SupportedTypes"; ValueType: string; ValueName: ".aac"; ValueData: ""; Tasks: openwith
+
+; Projects (noiseextractor_core::project_file::PROJECT_FILE_TYPE): the
+; extension is ours, so noiseextractor becomes its default program (the
+; default value of the .nxp key, removed again on uninstall). Must match the
+; extension in project_file.rs; crates/core/tests/packaging.rs checks it.
+Root: HKA; Subkey: "Software\Classes\noiseextractor.project"; ValueType: string; ValueName: ""; ValueData: "noiseextractor project"; Flags: uninsdeletekey; Tasks: projects
+Root: HKA; Subkey: "Software\Classes\noiseextractor.project\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\noiseextractor.ico"; Tasks: projects
+Root: HKA; Subkey: "Software\Classes\noiseextractor.project\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\noiseextractor.exe"" ""%1"""; Tasks: projects
+Root: HKA; Subkey: "Software\Classes\.nxp"; ValueType: string; ValueName: ""; ValueData: "noiseextractor.project"; Flags: uninsdeletevalue; Tasks: projects
+Root: HKA; Subkey: "Software\Classes\.nxp"; ValueType: string; ValueName: "Content Type"; ValueData: "application/x-noiseextractor-project"; Flags: uninsdeletevalue; Tasks: projects
+Root: HKA; Subkey: "Software\Classes\.nxp\OpenWithProgids"; ValueType: string; ValueName: "noiseextractor.project"; ValueData: ""; Flags: uninsdeletevalue; Tasks: projects
+Root: HKA; Subkey: "Software\Classes\Applications\noiseextractor.exe\SupportedTypes"; ValueType: string; ValueName: ".nxp"; ValueData: ""; Flags: uninsdeletevalue; Tasks: projects
 
 [Icons]
 Name: "{autoprograms}\noiseextractor"; Filename: "{app}\noiseextractor.exe"; IconFilename: "{app}\noiseextractor.ico"

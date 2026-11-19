@@ -78,6 +78,7 @@ use noiseextractor_core::export::{
 use noiseextractor_core::filter::{EventFilter, Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::noise::{mean_power, NoiseEstimate};
 use noiseextractor_core::normalize::process_all_normalized;
+use noiseextractor_core::project_file::{self, StartFiles};
 use noiseextractor_core::render::{render_rgb, ORANGE};
 use noiseextractor_core::similar::SimilarParams;
 use noiseextractor_core::stft::{Stft, StftConfig};
@@ -151,8 +152,14 @@ fn audio_wildcard() -> String {
         noiseextractor_core::audio::file_dialog_patterns()
     )
 }
-/// Project files.
-const PROJECT_WILDCARD: &str = "noiseextractor projects (*.nxp.json)|*.nxp.json;*.json|All files|*";
+/// Project files: `*.nxp`, and the `*.json` names of older versions (see
+/// `noiseextractor_core::project_file`).
+fn project_wildcard() -> String {
+    format!(
+        "noiseextractor projects|{}|All files|*",
+        project_file::project_dialog_patterns()
+    )
+}
 
 /// A loaded recording with its processing engine and output stream.
 struct Doc {
@@ -183,6 +190,10 @@ enum Background {
     Exported(anyhow::Result<Exported>),
     /// The search for the recording's sounds finished.
     Discovered(anyhow::Result<Discovery>),
+    /// macOS asked to open files (Finder's double click, "Open With", a
+    /// drop on the Dock icon): these arrive as an event, not as
+    /// command-line arguments.
+    OpenFiles(Vec<PathBuf>),
 }
 
 /// A finished export.
@@ -201,6 +212,9 @@ struct State {
     project: Project,
     /// Where the project was loaded from / saved to.
     project_path: Option<PathBuf>,
+    /// Files the system asked to open ([`Background::OpenFiles`]), opened
+    /// by the polling timer once it no longer holds the state.
+    open_requests: Vec<PathBuf>,
     /// Visible window onto the recording.
     viewport: Option<Viewport>,
     /// The current marked rectangle.
@@ -365,15 +379,24 @@ fn request_repaint() {
     REPAINT_PENDING.with(|p| p.set(true));
 }
 
-/// Program entry: builds the window and runs the event loop. An optional
-/// command-line argument names an audio file to open.
+/// Program entry: builds the window and runs the event loop. The
+/// command-line arguments name a recording, a project or both (in any
+/// order), as file managers pass them for "Open with" and double clicks.
 fn main() {
-    let _ = wxdragon::main(|_| {
+    let _ = wxdragon::main(|app| {
         let (tx, rx) = channel();
+        // macOS hands files from Finder to a running app as an event (also
+        // at launch); elsewhere this registers nothing. The callback must
+        // be `Send`, so it only forwards the files to the GUI thread.
+        let open_tx = tx.clone();
+        app.on_open_files(move |files| {
+            let _ = open_tx.send(Background::OpenFiles(files.into_iter().map(PathBuf::from).collect()));
+        });
         let state: Shared = Rc::new(RefCell::new(State {
             doc: None,
             project: Project::default(),
             project_path: None,
+            open_requests: Vec::new(),
             viewport: None,
             selection: None,
             drag: None,
@@ -403,9 +426,7 @@ fn main() {
         }
         bind_events(&state, ui);
         refresh_filter_list(&state.borrow(), ui);
-        if let Some(path) = std::env::args().nth(1) {
-            start_loading(&mut state.borrow_mut(), PathBuf::from(path));
-        }
+        open_files(&state, ui, std::env::args_os().skip(1).map(PathBuf::from));
         ui.frame.show(true);
         ui.frame.centre();
     });
@@ -730,12 +751,18 @@ fn bind_events(state: &Shared, ui: Ui) {
             }
         }
         ID_OPEN_PROJECT => {
-            if let Some(path) = file_dialog(ui, "Open project", PROJECT_WILDCARD, false) {
+            if let Some(path) = file_dialog(ui, "Open project", &project_wildcard(), false) {
                 open_project(&st, ui, &path);
             }
         }
         ID_SAVE_PROJECT => {
-            if let Some(path) = file_dialog(ui, "Save project", PROJECT_WILDCARD, true) {
+            if let Some(path) = file_dialog(ui, "Save project", &project_wildcard(), true) {
+                // GTK's dialog does not add the extension of the chosen
+                // filter, and file managers only recognise "*.nxp".
+                let path = project_file::with_project_extension(&path);
+                if path.exists() && !confirm_replace(ui, &path) {
+                    return;
+                }
                 let mut s = st.borrow_mut();
                 match s.project.save(&path) {
                     Ok(()) => {
@@ -1163,8 +1190,14 @@ fn bind_events(state: &Shared, ui: Ui) {
     let timer = Timer::new(&ui.frame);
     let st = state.clone();
     timer.on_tick(move |_| {
+        let mut requests = Vec::new();
         if let Ok(mut s) = st.try_borrow_mut() {
             tick(&mut s, ui);
+            requests = std::mem::take(&mut s.open_requests);
+        }
+        // Outside the borrow: opening a project may show an error dialog.
+        if !requests.is_empty() {
+            open_files(&st, ui, requests);
         }
 
         // Outside the borrow, so the paint handler can read the state.
@@ -1212,6 +1245,18 @@ fn file_dialog(ui: Ui, title: &str, wildcard: &str, save: bool) -> Option<PathBu
     } else {
         None
     }
+}
+
+/// Asks whether to replace the existing file `path`. Needed where the
+/// program changes the name the save dialog checked (by adding the
+/// extension), since the dialog only asked about the name typed.
+fn confirm_replace(ui: Ui, path: &Path) -> bool {
+    let text = format!("{} already exists. Replace it?", path.display());
+    MessageDialog::builder(&ui.frame, &text, "noiseextractor")
+        .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconWarning)
+        .build()
+        .show_modal()
+        == ID_YES
 }
 
 /// Asks where and in which format to export. `source_name` (the
@@ -1334,11 +1379,38 @@ fn install_audio(s: &mut State, ui: Ui, path: &Path, audio: AudioData, peaks: Pe
     ui.overview.refresh(false, None);
 }
 
+/// Opens files given on the command line or by the system: one recording
+/// and one project, in any order (see [`StartFiles`]).
+fn open_files(state: &Shared, ui: Ui, paths: impl IntoIterator<Item = PathBuf>) {
+    let files = StartFiles::from_args(paths);
+    match (&files.project, files.audio) {
+        // A recording given with the project replaces the one it names.
+        (Some(project), audio) => open_project_with(state, ui, project, audio),
+        (None, Some(audio)) => start_loading(&mut state.borrow_mut(), audio),
+        (None, None) => {}
+    }
+    for path in &files.ignored {
+        report(
+            ui,
+            &format!(
+                "Opens one recording and one project at a time; ignored {}",
+                path.display()
+            ),
+        );
+    }
+}
+
 /// Loads a project file together with the recording it names. A project
 /// that names no recording (saved by older versions), or names the one
 /// already open, or whose recording is gone, is applied to the current
 /// recording instead.
 fn open_project(st: &Shared, ui: Ui, path: &Path) {
+    open_project_with(st, ui, path, None);
+}
+
+/// Like [`open_project`], but opens `recording` instead of the project's
+/// own recording when one is given (both chosen in the file manager).
+fn open_project_with(st: &Shared, ui: Ui, path: &Path, recording: Option<PathBuf>) {
     let project = match Project::load(path) {
         Ok(p) => p,
         Err(e) => return error_box(ui, &format!("{e:#}")),
@@ -1348,7 +1420,7 @@ fn open_project(st: &Shared, ui: Ui, path: &Path) {
     s.project_path = Some(path.to_path_buf());
     s.focus_filter(if project.filters.is_empty() { None } else { Some(0) });
     let current = s.doc.as_ref().map(|d| d.path.clone());
-    let wanted = project.recording_to_open(current.as_deref()).map(Path::to_path_buf);
+    let wanted = recording.or_else(|| project.recording_to_open(current.as_deref()).map(Path::to_path_buf));
     s.project = project;
     match wanted {
         Some(audio) if audio.is_file() => {
@@ -1965,6 +2037,7 @@ fn tick(s: &mut State, ui: Ui) {
                     apply_project(s, ui);
                 }
             }
+            Background::OpenFiles(files) => s.open_requests.extend(files),
             Background::Analysed(sel, params, a) => {
                 // Every object that still has this selection and these
                 // settings takes the result; one that changed since waits
