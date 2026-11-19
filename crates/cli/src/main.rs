@@ -13,6 +13,7 @@
 //!     --save-project p.json
 //! noiseextractor-cli process in.flac --project p.json -o out.wav
 //! noiseextractor-cli process in.flac --project p.json --solo 2,3 -o birds.wav
+//! noiseextractor-cli process in.flac --project p.json -o birds.opus --bitrate 96
 //! noiseextractor-cli spectrogram in.flac --project p.json -o view.png
 //! ```
 
@@ -22,9 +23,9 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use noiseextractor_core::analysis::Selection;
-use noiseextractor_core::audio::WavStreamWriter;
 use noiseextractor_core::discover::{discover, DiscoverParams, Discovery};
 use noiseextractor_core::engine::{process_all, ChunkLayout, ChunkResult};
+use noiseextractor_core::export::{create_writer, format_for_output, ExportOptions};
 use noiseextractor_core::filter::{Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::listen::{Listen, Pick};
 use noiseextractor_core::noise::{mean_power, GainRule, NoiseEstimate};
@@ -50,6 +51,14 @@ struct Cli {
     /// Worker threads (default: number of CPU cores).
     #[arg(long, global = true)]
     threads: Option<usize>,
+    /// Output format: wav, flac, vorbis, mp3, opus or alac (default: from
+    /// the output file's extension: .wav .flac .ogg .mp3 .opus .m4a).
+    #[arg(long, global = true)]
+    format: Option<String>,
+    /// Bit rate in kbit/s for the lossy formats (Vorbis, MP3, Opus); the
+    /// default is a transparent quality setting.
+    #[arg(long, global = true)]
+    bitrate: Option<u32>,
     /// STFT frames per processing chunk.
     #[arg(long, global = true, default_value_t = 256)]
     chunk_frames: usize,
@@ -58,14 +67,15 @@ struct Cli {
 /// Subcommands.
 #[derive(Subcommand)]
 enum Command {
-    /// Apply all enabled filters of a project and write a 32-bit float WAV.
+    /// Apply all enabled filters of a project and write the result (WAV,
+    /// FLAC, Ogg Vorbis, MP3, Opus or Apple Lossless, see --format).
     Process {
         /// Input audio file.
         input: PathBuf,
         /// Project file (default: background noise reduction only).
         #[arg(long)]
         project: Option<PathBuf>,
-        /// Output WAV file.
+        /// Output audio file; its extension picks the format.
         #[arg(short, long)]
         output: PathBuf,
         /// Write only the sounds of filters N,M,... (1 = first in the
@@ -81,7 +91,7 @@ enum Command {
     Denoise {
         /// Input audio file.
         input: PathBuf,
-        /// Output WAV file.
+        /// Output audio file; its extension picks the format.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Maximum attenuation in dB.
@@ -204,6 +214,14 @@ fn run(cli: Cli) -> Result<()> {
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     anyhow::ensure!(cli.chunk_frames >= 1, "--chunk-frames must be at least 1");
+    // Decided before the (possibly long) processing so that a typo in the
+    // output name fails at once.
+    let export = |output: &Path| -> Result<ExportOptions> {
+        Ok(ExportOptions {
+            format: format_for_output(output, cli.format.as_deref())?,
+            bitrate_kbps: cli.bitrate,
+        })
+    };
     match cli.command {
         Command::Process {
             input,
@@ -212,6 +230,7 @@ fn run(cli: Cli) -> Result<()> {
             solo,
             without,
         } => {
+            let options = export(&output)?;
             let audio = load(&input)?;
             let mut project = match project {
                 Some(p) => Project::load(&p)?,
@@ -235,7 +254,7 @@ fn run(cli: Cli) -> Result<()> {
                 project = project.for_listening(mode, &picks);
             }
             project.prepare(&audio);
-            write_processed(&audio, &project, cli.chunk_frames, threads, &output)
+            write_processed(&audio, &project, cli.chunk_frames, threads, &output, options)
         }
         Command::Denoise {
             input,
@@ -245,6 +264,7 @@ fn run(cli: Cli) -> Result<()> {
             noise_from,
             save_project,
         } => {
+            let options = output.as_deref().map(export).transpose()?;
             let audio = load(&input)?;
             let mut project = Project::default();
             let FilterKind::NoiseReduction(nr) = &mut project.filters[0].kind else {
@@ -262,9 +282,9 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(p) = save_project {
                 project.save(&p)?;
             }
-            match output {
-                Some(o) => write_processed(&audio, &project, cli.chunk_frames, threads, &o),
-                None => Ok(()),
+            match (output, options) {
+                (Some(o), Some(options)) => write_processed(&audio, &project, cli.chunk_frames, threads, &o, options),
+                _ => Ok(()),
             }
         }
         Command::Mark {
@@ -411,15 +431,16 @@ fn learn_noise(audio: &AudioData, cfg: &noiseextractor_core::StftConfig, start_s
     Ok(mean_power(&power, cfg.bins()))
 }
 
-/// Processes everything and streams the result into a WAV file.
+/// Processes everything and streams the result into `output`.
 fn write_processed(
     audio: &AudioData,
     project: &Project,
     chunk_frames: usize,
     threads: usize,
     output: &Path,
+    options: ExportOptions,
 ) -> Result<()> {
-    let mut writer = WavStreamWriter::create(output, audio.sample_rate, audio.channels.len() as u16)?;
+    let mut writer = create_writer(output, options, audio.sample_rate, audio.channels.len())?;
     let total = audio.len().max(1);
     let mut last_percent = usize::MAX;
     process_all(audio, project, chunk_frames, threads, |r| {
