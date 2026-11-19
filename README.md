@@ -130,7 +130,7 @@ libraries.
 | Learn the background noise | Mark a noise-only stretch, *Learn noise from selection* |
 | Save the filter list | File > Save project (Ctrl+S) |
 | Reopen a recent recording or project | File > Recent recordings / Recent projects (nine of each are remembered; a file that is gone is dropped from the list) |
-| Write the result | File > Export processed audio (Ctrl+E) |
+| Write the result | File > Export processed audio (Ctrl+E); the file type list (or the extension you type) picks WAV, FLAC, Ogg Vorbis, MP3, Opus or Apple Lossless, see [Export formats](#export-formats) |
 | Make a quiet extracted sound louder in the export | File > Settings > Export > *Normalize the exported audio*: the whole file is scaled by one gain so its loudest sample reaches the chosen level (default -1 dBFS); the levels inside it keep their ratios |
 | Make the spectrogram brighter / show quieter detail | File > Settings > Spectrogram (the levels drawn black and at full colour; changes show at once) |
 | Look up what the colours mean | Help > Colours and mouse |
@@ -151,6 +151,7 @@ noiseextractor-cli mark in.flac --time 12.3:13.1 --freq 2000:4500 --name blackbi
 noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract --save-project p.json
 noiseextractor-cli process in.flac --project p.json -o out.wav
 noiseextractor-cli process in.flac --project p.json --solo 2,3 -o two-sounds.wav   # or --without 2,3
+noiseextractor-cli process in.flac --project p.json -o out.opus --bitrate 96   # see Export formats
 noiseextractor-cli process in.flac --project p.json --solo 2 --normalize -o loud.wav  # peak at -1 dBFS (or --normalize=-3)
 noiseextractor-cli spectrogram in.flac --project p.json -o view.png --max-hz 10000
 ```
@@ -161,6 +162,27 @@ the recording the same sound occurs, so you can check what a filter will grab be
 applying it. `discover` prints the sounds it found, numbered, with the
 patterns they consist of (tonal or noise-like, frequency band, direction);
 `--enable` switches the given ones on.
+
+## Export formats
+
+The output file's extension picks the format (`--format` overrides it on the
+command line). All encoders are compiled into the program, so every format
+works the same on Linux, Windows and macOS.
+
+| Format | Extension | What you get |
+| --- | --- | --- |
+| WAV | `.wav` | 32-bit float, exactly what the filters produced |
+| FLAC | `.flac` | 24-bit, lossless |
+| Ogg Vorbis | `.ogg` | quality 6 (≈190 kbit/s stereo), or `--bitrate` |
+| MP3 | `.mp3` | LAME VBR `-V2` (≈190 kbit/s stereo), or constant `--bitrate`; mono or stereo; rates above 48 kHz are resampled |
+| Opus | `.opus` | 64 kbit/s per channel, or `--bitrate`; always 48 kHz (resampled); mono or stereo |
+| Apple Lossless | `.m4a` | 16-bit with dither, lossless from there on; plays in iTunes/Music and on iPhones |
+
+AAC is missing on purpose: AAC encoders are still licensed through a patent
+pool, and the one good free encoder (FDK AAC) has a licence that is not
+compatible with the GPL. Apple Lossless, by contrast, has been open source
+(Apache 2.0) and royalty free since 2011. Exported Opus files cannot be
+opened again yet (the decoder library has no Opus support).
 
 ## How filters combine
 
