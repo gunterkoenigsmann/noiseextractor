@@ -34,20 +34,34 @@ pub struct EngineConfig {
     pub chunk_frames: usize,
     /// Number of worker threads.
     pub workers: usize,
-    /// Maximum number of chunk results kept in memory.
-    pub max_cached_chunks: usize,
+    /// Memory (bytes) the cached chunk results may take. How many chunks
+    /// that is depends on the STFT and the number of channels, see
+    /// [`ChunkLayout::result_bytes`]; a few chunks per worker are always
+    /// allowed, or the workers would evict each other's results.
+    pub cache_bytes: usize,
 }
 
 impl Default for EngineConfig {
     /// 256 frames per chunk (≈ 2.7 s at 48 kHz with the default STFT), one
-    /// worker per core except one for the GUI, and ~400 MB worth of cache.
+    /// worker per core except one for the GUI, and 320 MB of cache (about
+    /// 150 chunks or 7 minutes of a stereo recording with the default STFT).
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
         Self {
             chunk_frames: 256,
             workers: cores.saturating_sub(1).max(1),
-            max_cached_chunks: 160,
+            cache_bytes: 320 << 20,
         }
+    }
+}
+
+impl EngineConfig {
+    /// How many chunk results of `layout` with `bins` bins and `channels`
+    /// channels fit into [`EngineConfig::cache_bytes`], but at least four
+    /// per worker.
+    pub fn max_cached_chunks(&self, layout: ChunkLayout, bins: usize, channels: usize) -> usize {
+        let per_chunk = layout.result_bytes(bins, channels).max(1);
+        (self.cache_bytes / per_chunk).max(4 * self.workers.max(1))
     }
 }
 
@@ -124,6 +138,13 @@ impl ChunkLayout {
             start.min(self.total_samples),
             (start + self.chunk_samples()).min(self.total_samples),
         )
+    }
+
+    /// Approximate memory taken by one [`ChunkResult`] with `bins` bins
+    /// and `channels` channels: four one-byte display layers per frame and
+    /// bin plus the processed audio as `f32`.
+    pub fn result_bytes(&self, bins: usize, channels: usize) -> usize {
+        self.chunk_frames * bins * 4 + self.chunk_samples() * channels * 4
     }
 
     /// Chunk containing `sample`.
@@ -275,7 +296,7 @@ pub fn process_chunk(
 pub fn find_occurrences(
     project: &Project,
     mono: &[f32],
-    channels: &[Vec<f32>],
+    channels: &[impl AsRef<[f32]>],
     stft: &Stft,
     range: std::ops::Range<i64>,
 ) -> Vec<Vec<Occurrence>> {
@@ -320,10 +341,7 @@ pub fn process_all(
         let results: Vec<ChunkResult> = std::thread::scope(|s| {
             let handles: Vec<_> = batch
                 .iter()
-                .map(|&i| {
-                    let mono = &mono;
-                    s.spawn(move || process_chunk(audio, mono, &Stft::new(project.stft), project, layout, i, 0))
-                })
+                .map(|&i| s.spawn(move || process_chunk(audio, mono, &Stft::new(project.stft), project, layout, i, 0)))
                 .collect();
             handles
                 .into_iter()
@@ -409,14 +427,14 @@ struct State {
 
 /// Data shared between the engine handle and its workers.
 struct Shared {
-    /// The recording.
+    /// The recording (with the mono mix used for analysis and masks).
     audio: Arc<AudioData>,
-    /// Mono mix used for analysis and masks.
-    mono: Arc<Vec<f32>>,
     /// Chunk geometry.
     layout: ChunkLayout,
     /// Engine tuning.
     config: EngineConfig,
+    /// Chunk results kept at most, from [`EngineConfig::max_cached_chunks`].
+    max_cached: usize,
     /// Everything mutable.
     state: Mutex<State>,
     /// Wakes idle workers when there may be new work.
@@ -438,16 +456,16 @@ impl Engine {
     /// Starts the workers. The project must be prepared
     /// ([`Project::prepare`]) so its event filters carry their analysis.
     pub fn new(audio: Arc<AudioData>, project: Project, config: EngineConfig) -> Self {
-        let mono = Arc::new(audio.mono());
         let layout = ChunkLayout {
             hop: project.stft.hop,
             chunk_frames: config.chunk_frames,
             total_samples: audio.len(),
         };
+        let max_cached = config.max_cached_chunks(layout, project.stft.bins(), audio.channels.len());
         let shared = Arc::new(Shared {
             audio,
-            mono,
             layout,
+            max_cached,
             state: Mutex::new(State {
                 project: Arc::new(project),
                 generation: 1,
@@ -478,8 +496,13 @@ impl Engine {
     }
 
     /// The mono mix used for analysis.
-    pub fn mono(&self) -> &Arc<Vec<f32>> {
-        &self.shared.mono
+    pub fn mono(&self) -> &[f32] {
+        self.shared.audio.mono()
+    }
+
+    /// How many chunk results the engine keeps at most.
+    pub fn max_cached_chunks(&self) -> usize {
+        self.shared.max_cached
     }
 
     /// How the recording is cut into chunks.
@@ -615,7 +638,7 @@ fn worker(shared: Arc<Shared>) {
                 if st.shutdown {
                     return;
                 }
-                if let Some(c) = pick_job(&mut st, shared.layout, shared.config.max_cached_chunks) {
+                if let Some(c) = pick_job(&mut st, shared.layout, shared.max_cached) {
                     st.in_progress.insert(c);
                     break (c, st.project.clone(), st.generation);
                 }
@@ -625,7 +648,7 @@ fn worker(shared: Arc<Shared>) {
         let stft = stft.get_or_insert_with(|| Stft::new(project.stft));
         let result = process_chunk(
             &shared.audio,
-            &shared.mono,
+            shared.audio.mono(),
             stft,
             &project,
             shared.layout,
@@ -901,7 +924,7 @@ mod tests {
     #[test]
     fn stereo_channels_are_processed_separately() {
         let mono = noisy_tone(8000, 1.0);
-        let left = mono.channels[0].clone();
+        let left = mono.channels[0].to_vec();
         let right: Vec<f32> = left.iter().map(|x| -0.5 * x).collect();
         let audio = AudioData::new(8000, vec![left, right]);
         let mut p = small_project();
@@ -1048,7 +1071,7 @@ mod tests {
             EngineConfig {
                 chunk_frames: 16,
                 workers: 2,
-                max_cached_chunks: 1000,
+                cache_bytes: usize::MAX,
             },
         );
         let total = engine.layout().chunk_count();
@@ -1078,5 +1101,60 @@ mod tests {
             assert!((u8_to_db(db_to_u8(db)) - db).abs() <= 0.25);
         }
         assert_eq!(db_to_u8(-200.0), 0);
+    }
+
+    #[test]
+    fn cache_budget_counts_bytes_and_keeps_a_few_chunks_per_worker() {
+        let layout = ChunkLayout {
+            hop: 512,
+            chunk_frames: 256,
+            total_samples: 1 << 30,
+        };
+        // 256 frames × 1025 bins × 4 layers + 131072 samples × 2 channels × 4 bytes
+        assert_eq!(layout.result_bytes(1025, 2), 1_049_600 + 1_048_576);
+        let config = EngineConfig {
+            chunk_frames: 256,
+            workers: 3,
+            cache_bytes: 100 * 2_098_176,
+        };
+        assert_eq!(config.max_cached_chunks(layout, 1025, 2), 100);
+        // A bigger FFT makes chunks bigger, so fewer fit.
+        assert_eq!(
+            config.max_cached_chunks(layout, 4097, 2),
+            100 * 2_098_176 / (256 * 4097 * 4 + 1_048_576)
+        );
+        let tiny = EngineConfig {
+            cache_bytes: 1,
+            ..config
+        };
+        assert_eq!(tiny.max_cached_chunks(layout, 1025, 2), 12);
+    }
+
+    #[test]
+    fn audio_in_scratch_files_is_processed_like_audio_on_the_heap() {
+        let dir = tempfile::tempdir().unwrap();
+        let heap = noisy_tone(8000, 2.0);
+        let path = dir.path().join("t.wav");
+        let right: Vec<f32> = heap.channels[0].iter().map(|x| 0.5 * x).collect();
+        let heap = AudioData::new(8000, vec![heap.channels[0].to_vec(), right]);
+        heap.save_wav(&path).unwrap();
+        let storage = crate::samples::StorageOptions {
+            spill_above_bytes: 0,
+            dir: dir.path().to_path_buf(),
+        };
+        let mapped = AudioData::load_with(&path, &storage).unwrap();
+        assert!(mapped.is_mapped());
+        let run = |audio: &AudioData| {
+            let mut out = vec![Vec::new(); 2];
+            process_all(audio, &small_project(), 16, 2, |r| {
+                for (o, a) in out.iter_mut().zip(&r.audio) {
+                    o.extend_from_slice(a);
+                }
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        assert_eq!(run(&mapped), run(&heap));
     }
 }

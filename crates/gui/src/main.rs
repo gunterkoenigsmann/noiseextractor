@@ -1195,7 +1195,7 @@ fn start_loading(s: &mut State, path: PathBuf) {
     s.busy = Some(format!("Loading {} ...", path.display()));
     std::thread::spawn(move || {
         let result = AudioData::load(&path).map(|audio| {
-            let peaks = Peaks::new(&audio.mono());
+            let peaks = Peaks::new(audio.mono());
             (audio, peaks)
         });
         let _ = tx.send(Background::Loaded(path, result));
@@ -1474,8 +1474,8 @@ fn target_filter(s: &mut State, target: Target) -> Option<&mut EventFilter> {
 /// matches. The old analysis stays in use until then.
 fn start_analysis(s: &mut State, target: Target) {
     let Some(doc) = &s.doc else { return };
-    let mono = doc.engine.mono().clone();
-    // The individual tracks tell where the marked sound comes from.
+    // Shares the samples (and their mono mix) with the engine; the
+    // individual tracks tell where the marked sound comes from.
     let audio = doc.audio.clone();
     let sr = doc.audio.sample_rate;
     let cfg = s.project.stft;
@@ -1484,7 +1484,15 @@ fn start_analysis(s: &mut State, target: Target) {
     let Some(e) = target_filter(s, target) else { return };
     let (sel, params) = (e.selection, e.params.clone());
     std::thread::spawn(move || {
-        let a = analyze_selection(&mono, &audio.channels, sr, &Stft::new(cfg), &sel, &noise, &params);
+        let a = analyze_selection(
+            audio.mono(),
+            &audio.channels,
+            sr,
+            &Stft::new(cfg),
+            &sel,
+            &noise,
+            &params,
+        );
         let _ = tx.send(Background::Analysed(sel, params, Arc::new(a)));
     });
 }

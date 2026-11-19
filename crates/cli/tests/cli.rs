@@ -397,7 +397,7 @@ fn process_with(input: &Path, project: &Path, output: &Path, extra: &[&str]) -> 
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    AudioData::load(output).unwrap().channels.remove(0)
+    AudioData::load(output).unwrap().channels[0].to_vec()
 }
 
 #[test]

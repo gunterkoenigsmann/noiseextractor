@@ -13,6 +13,9 @@ serde_json.workspace = true
 realfft = "3.5"
 hound = "3.5"
 symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac"] }
+# Long recordings are decoded into mapped scratch files (src/samples.rs).
+memmap2 = "0.9"
+tempfile = "3"
+bytemuck = "1"
 
 [dev-dependencies]
-tempfile = "3"

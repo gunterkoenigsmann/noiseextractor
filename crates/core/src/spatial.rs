@@ -143,11 +143,11 @@ impl PairSums {
 
 /// Analyses all channels over the frames of `cells` and sums, for every
 /// channel after the first, the membership-weighted cues per bin.
-fn pair_sums(channels: &[Vec<f32>], stft: &Stft, cells: &Cells) -> Vec<PairSums> {
+fn pair_sums(channels: &[impl AsRef<[f32]>], stft: &Stft, cells: &Cells) -> Vec<PairSums> {
     let width = cells.weights.len() / cells.frames.max(1);
     let spectra: Vec<Vec<Vec<Complex32>>> = channels
         .iter()
-        .map(|ch| stft.analyze(ch, cells.first_frame, cells.frames).frames)
+        .map(|ch| stft.analyze(ch.as_ref(), cells.first_frame, cells.frames).frames)
         .collect();
     let reference = &spectra[0];
     spectra[1..]
@@ -180,7 +180,12 @@ fn delay_phase(k: usize, tau: f32, fft_size: f32) -> f32 {
 ///
 /// Returns `None` for fewer than two channels or when the cells carry no
 /// weight or no energy.
-pub fn measure(channels: &[Vec<f32>], stft: &Stft, cells: &Cells, max_delay_samples: f32) -> Option<Signature> {
+pub fn measure(
+    channels: &[impl AsRef<[f32]>],
+    stft: &Stft,
+    cells: &Cells,
+    max_delay_samples: f32,
+) -> Option<Signature> {
     if channels.len() < 2 || cells.frames == 0 {
         return None;
     }
@@ -277,7 +282,7 @@ pub struct Deviation {
 /// reference's [`PairCue::delay_uncertainty`] count as none, since the
 /// reference itself may be off by that much.
 pub fn per_bin_deviation(
-    channels: &[Vec<f32>],
+    channels: &[impl AsRef<[f32]>],
     stft: &Stft,
     cells: &Cells,
     reference: &Signature,
@@ -365,7 +370,7 @@ pub fn agreement_of(
 /// (0..1, 1 for bins without weight or energy): [`per_bin_deviation`]
 /// judged by [`agreement_of`] with fixed tolerances.
 pub fn per_bin_agreement(
-    channels: &[Vec<f32>],
+    channels: &[impl AsRef<[f32]>],
     stft: &Stft,
     cells: &Cells,
     reference: &Signature,

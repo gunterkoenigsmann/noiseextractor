@@ -28,11 +28,11 @@ use noiseextractor_core::engine::{process_all, ChunkLayout, ChunkResult};
 use noiseextractor_core::filter::{Filter, FilterAction, FilterKind, Project};
 use noiseextractor_core::listen::{Listen, Pick};
 use noiseextractor_core::noise::{mean_power, GainRule, NoiseEstimate};
-use noiseextractor_core::render::{render_rgb, View};
+use noiseextractor_core::render::{column_chunks, render_columns, Target, View};
 use noiseextractor_core::similar::find_in_range;
 use noiseextractor_core::stft::Stft;
 use noiseextractor_core::AudioData;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -407,7 +407,7 @@ fn learn_noise(audio: &AudioData, cfg: &noiseextractor_core::StftConfig, start_s
     let a = (start_s * audio.sample_rate as f64 / cfg.hop as f64) as i64;
     let b = (end_s * audio.sample_rate as f64 / cfg.hop as f64) as i64;
     anyhow::ensure!(b > a, "noise range is empty");
-    let power = stft.analyze(&audio.mono(), a, (b - a) as usize).power();
+    let power = stft.analyze(audio.mono(), a, (b - a) as usize).power();
     Ok(mean_power(&power, cfg.bins()))
 }
 
@@ -491,7 +491,7 @@ fn print_report(project: &Project, audio: &AudioData) {
                     let hz = sample_rate as f32 / (project.stft.hop as f32 * r.period);
                     println!("  pulsed at {hz:.1} Hz: searching by rhythm and band");
                 }
-                let found = find_in_range(tpl, &mono, &audio.channels, &stft, 0..total_frames, &e.similar);
+                let found = find_in_range(tpl, mono, &audio.channels, &stft, 0..total_frames, &e.similar);
                 println!("  same sound found {} times:", found.len());
                 for o in found {
                     let t = o.frame as f64 * project.stft.hop as f64 / sample_rate as f64;
@@ -555,16 +555,6 @@ fn write_spectrogram(
     log: bool,
 ) -> Result<()> {
     anyhow::ensure!(width > 0 && height > 0, "image must not be empty");
-    // Keep only the display layers; the audio is not needed for a picture.
-    let mut chunks: HashMap<usize, Arc<ChunkResult>> = HashMap::new();
-    process_all(audio, project, chunk_frames, threads, |r| {
-        let slim = ChunkResult {
-            audio: Vec::new(),
-            ..clone_layers(r)
-        };
-        chunks.insert(r.index, Arc::new(slim));
-        Ok(())
-    })?;
     let layout = ChunkLayout {
         hop: project.stft.hop,
         chunk_frames,
@@ -579,15 +569,45 @@ fn write_spectrogram(
         db_min: -100.0,
         db_max: -10.0,
     };
-    let rgb = render_rgb(
-        &view,
-        width,
-        height,
-        layout,
-        audio.sample_rate,
-        project.stft.fft_size,
-        &|c| chunks.get(&c).cloned(),
-    );
+    let mut rgb = vec![0u8; width as usize * height as usize * 3];
+    // Columns are drawn as soon as all chunks they read have arrived, and
+    // chunks no later column reads are dropped: keeping every chunk's
+    // display layers would take 4 bytes per frame and bin, about 23 MB
+    // per minute at 48 kHz.
+    let mut chunks: BTreeMap<usize, Arc<ChunkResult>> = BTreeMap::new();
+    let mut next_x = 0;
+    let draw = |chunks: &BTreeMap<usize, Arc<ChunkResult>>, columns: std::ops::Range<u32>, rgb: &mut [u8]| {
+        let target = Target {
+            img: rgb,
+            width,
+            height,
+        };
+        let fetch = |c: usize| chunks.get(&c).cloned();
+        render_columns(
+            &view,
+            target,
+            columns,
+            layout,
+            audio.sample_rate,
+            project.stft.fft_size,
+            &fetch,
+        );
+    };
+    process_all(audio, project, chunk_frames, threads, |r| {
+        // Only the display layers; the audio is not needed for a picture.
+        chunks.insert(r.index, Arc::new(clone_layers(r)));
+        let mut end = next_x;
+        while end < width && column_chunks(&view, layout, end).is_none_or(|c| *c.end() <= r.index) {
+            end += 1;
+        }
+        draw(&chunks, next_x..end, &mut rgb);
+        next_x = end;
+        if let Some(first) = column_chunks(&view, layout, next_x) {
+            chunks.retain(|&c, _| c >= *first.start());
+        }
+        Ok(())
+    })?;
+    draw(&chunks, next_x..width, &mut rgb);
     let file = std::fs::File::create(output).with_context(|| format!("cannot write {}", output.display()))?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     enc.set_color(png::ColorType::Rgb);
