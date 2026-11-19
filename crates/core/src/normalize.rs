@@ -141,8 +141,8 @@ pub fn process_all_normalized(
         let buf = &mut bytes[..n * channels * 4];
         reader.read_exact(buf).context("scratch file ended early")?;
         let mut block = vec![Vec::with_capacity(n); channels];
-        for (k, sample) in buf.chunks_exact(4).enumerate() {
-            let x = f32::from_ne_bytes([sample[0], sample[1], sample[2], sample[3]]);
+        for (k, sample) in buf.as_chunks::<4>().0.iter().enumerate() {
+            let x = f32::from_ne_bytes(*sample);
             block[k % channels].push(x * gain);
         }
         sink(&block)?;
