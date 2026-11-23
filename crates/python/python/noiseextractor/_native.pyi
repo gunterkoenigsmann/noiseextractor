@@ -1,6 +1,6 @@
 # Type stubs of the extension module (crates/python/src/lib.rs). Users
 # call the documented wrappers in __init__.py instead.
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 __version__: str
 
@@ -31,8 +31,9 @@ def process(
 ) -> dict: ...
 def mark(
     input: str,
-    time: Tuple[float, float],
-    freq: Tuple[float, float],
+    time: Optional[Tuple[float, float]],
+    freq: Optional[Tuple[float, float]],
+    outline: Optional[List[Tuple[float, float]]],
     name: str,
     extract: bool,
     project: Optional[str],

@@ -189,6 +189,20 @@ def _range(r: Optional[Sequence[float]], what: str) -> Optional[Tuple[float, flo
     return float(a), float(b)
 
 
+def _outline(points: Optional[Iterable[Sequence[float]]]) -> Optional[list]:
+    """A list of ``(seconds, Hz)`` corners of a free-form outline, checked."""
+    if points is None:
+        return None
+    corners = []
+    for p in points:
+        try:
+            t, hz = p
+        except (TypeError, ValueError):
+            raise ValueError(f"outline corners must be (seconds, Hz) pairs, not {p!r}") from None
+        corners.append((float(t), float(hz)))
+    return corners
+
+
 def _numbers(ns: Optional[Iterable[int]]) -> list:
     """A list of filter numbers (from 1); a single int is accepted too."""
     if ns is None:
@@ -314,15 +328,17 @@ def _mark_report(d: dict) -> MarkReport:
 def mark(
     input: PathLike,
     *,
-    time: Tuple[float, float],
-    freq: Tuple[float, float],
+    time: Optional[Tuple[float, float]] = None,
+    freq: Optional[Tuple[float, float]] = None,
+    outline: Optional[Sequence[Tuple[float, float]]] = None,
     name: str = "Marked noise",
     extract: bool = False,
     project: Optional[PathLike] = None,
     save_project: Optional[PathLike] = None,
 ) -> MarkReport:
-    """Marks a part of one sound, a rectangle in the spectrogram, and turns
-    it into a filter for the whole sound.
+    """Marks a part of one sound in the spectrogram, a rectangle (``time``
+    and ``freq``) or a free-form ``outline``, and turns it into a filter for
+    the whole sound.
 
     The analysis follows the marked part's pitch, finds its overtones and
     resonances and the frequencies that rise and fall with it, takes its
@@ -335,6 +351,13 @@ def mark(
         input: Audio file.
         time: ``(start, end)`` of the marked part in seconds.
         freq: ``(low, high)`` of the marked part in Hz.
+        outline: Instead of ``time`` and ``freq``: the corners of a polygon
+            around the marked part as ``(seconds, Hz)`` pairs (at least 3;
+            the last is joined to the first). Only what lies inside counts
+            as marked, so a sound that is not a rectangle in the
+            spectrogram (a U-shaped sweep, a slanted chirp, a call next to
+            another one) can be marked without its neighbours, as with the
+            desktop application's free-form selection.
         name: Name of the new filter.
         extract: Extract the sound (keep only it with ``process(...,
             solo=[n])``) instead of suppressing it.
@@ -346,9 +369,13 @@ def mark(
     """
     t = _range(time, "time")
     f = _range(freq, "freq")
-    assert t is not None and f is not None
+    corners = _outline(outline)
+    if corners is None and (t is None or f is None):
+        raise ValueError("mark needs time and freq, or outline")
+    if corners is not None and (t is not None or f is not None):
+        raise ValueError("give either time and freq, or outline, not both")
     return _mark_report(
-        _native.mark(os.fspath(input), t, f, name, bool(extract), _path(project), _path(save_project))
+        _native.mark(os.fspath(input), t, f, corners, name, bool(extract), _path(project), _path(save_project))
     )
 
 
