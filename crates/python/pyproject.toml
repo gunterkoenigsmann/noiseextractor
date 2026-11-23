@@ -10,10 +10,11 @@ name = "noiseextractor"
 description = "Noise reduction and sound extraction for audio recordings: denoise field recordings, remove or isolate a bird song, cricket, hum or traffic noise with soft spectral masks that keep attack, decay and timbre"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "GPL-3.0-or-later"
-# A copy of the repository's LICENSE (python.yml checks that they agree):
-# a license file must lie inside the package directory.
-license-files = ["LICENSE"]
+license = "LGPL-3.0-or-later"
+# Copies of the repository's LICENSE (the GPL, whose terms the LGPL adds
+# its permissions to) and COPYING.LESSER (python.yml checks that they
+# agree): license files must lie inside the package directory.
+license-files = ["LICENSE", "COPYING.LESSER"]
 authors = [{ name = "Gunter Königsmann" }]
 keywords = [
     "audio",

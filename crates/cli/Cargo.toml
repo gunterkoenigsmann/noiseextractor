@@ -3,7 +3,8 @@ name = "noiseextractor-cli"
 description = "Command-line front end of noiseextractor: run filter projects on audio files"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# LGPL, so that other programs may link it (the GUI stays GPL, see README).
+license = "LGPL-3.0-or-later"
 repository.workspace = true
 
 [lib]

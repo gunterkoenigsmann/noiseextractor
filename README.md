@@ -269,4 +269,14 @@ down to 0.17 GB for either, and it no longer grows with the length.
 
 ## License
 
-GPL-3.0-or-later, see [LICENSE](LICENSE).
+* The engine (`crates/core`), the command-line tool (`crates/cli`) and the
+  Python package (`crates/python`) are licensed under the **GNU Lesser
+  General Public License, version 3 or later** ([COPYING.LESSER](COPYING.LESSER),
+  which adds its permissions to the GPL in [LICENSE](LICENSE)). Programs
+  under any license may use them as a library; changes to them must be
+  shared under the same terms.
+* The desktop application (`crates/gui`), the packaging and everything
+  else in this repository are licensed under the **GNU General Public
+  License, version 3 or later** ([LICENSE](LICENSE)).
+* The recordings in `crates/core/tests/fixtures` are test data under the
+  GPL (see the README there); they are not part of any package.

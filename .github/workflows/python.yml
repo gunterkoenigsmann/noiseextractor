@@ -55,9 +55,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - &license
-        name: The package's LICENSE is the repository's
+        name: The package's license files are the repository's
         shell: bash
-        run: cmp LICENSE crates/python/LICENSE
+        run: |
+          cmp LICENSE crates/python/LICENSE
+          cmp COPYING.LESSER crates/python/COPYING.LESSER
       - uses: actions/setup-python@v6
         with:
           python-version: |
