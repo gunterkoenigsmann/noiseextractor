@@ -1,7 +1,9 @@
 //! "Which other parts of the spectrum belong to the sound I marked?"
 //!
 //! The user drags a rectangle (time × frequency) around part of a sound –
-//! say the fundamental of a bird call. This module looks for other
+//! say the fundamental of a bird call – or draws a free-form outline
+//! around it (see [`Selection::outline`]; only the cells inside count as
+//! marked, see [`MarkedCells`]). This module looks for other
 //! time-frequency regions that are likely produced by the same source, using
 //! two kinds of evidence:
 //!
@@ -30,9 +32,13 @@ use crate::stats::{pearson, smoothstep};
 use crate::stft::{Stft, StftConfig};
 use serde::{Deserialize, Serialize};
 
-/// A rectangle in the spectrogram, in physical units so it survives changes
-/// of FFT size.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// A marked region of the spectrogram, in physical units so it survives
+/// changes of FFT size: a rectangle (time × frequency) or, drawn with the
+/// free-form tool, the polygon in [`Selection::outline`]. The rectangle
+/// fields always hold the bounding box, so code that only needs the time
+/// span (playing the selection, the overview, learning noise) or a bin
+/// range need not care which tool drew it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Selection {
     /// Start time in seconds.
     pub start_s: f64,
@@ -42,36 +48,263 @@ pub struct Selection {
     pub low_hz: f32,
     /// Upper frequency bound in Hz.
     pub high_hz: f32,
+    /// Free-form selections: the corners `(seconds, Hz)` of the polygon
+    /// the user drew, closed implicitly from the last point back to the
+    /// first. Empty for a rectangle. Left out of project files when empty,
+    /// so rectangles are saved exactly as before and projects older than
+    /// the free-form tool load unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outline: Vec<(f64, f32)>,
 }
 
+/// Fewest corners a free-form outline needs to enclose an area.
+pub const MIN_OUTLINE_POINTS: usize = 3;
+
 impl Selection {
-    /// Returns the same rectangle with start ≤ end and low ≤ high, which is
-    /// what you get no matter in which direction the user dragged.
+    /// A rectangle from `start_s` to `end_s` seconds and `low_hz` to
+    /// `high_hz` (normalized, so the order of the bounds does not matter).
+    pub fn rect(start_s: f64, end_s: f64, low_hz: f32, high_hz: f32) -> Self {
+        Self {
+            start_s,
+            end_s,
+            low_hz,
+            high_hz,
+            outline: Vec::new(),
+        }
+        .normalized()
+    }
+
+    /// A free-form selection enclosed by the polygon `outline` (corners as
+    /// `(seconds, Hz)`). `None` if the polygon cannot enclose anything:
+    /// fewer than [`MIN_OUTLINE_POINTS`] corners, or no extent in time or
+    /// in frequency (all corners on one line parallel to an axis).
+    pub fn free_form(outline: Vec<(f64, f32)>) -> Option<Self> {
+        if outline.len() < MIN_OUTLINE_POINTS || outline.iter().any(|&(t, f)| !t.is_finite() || !f.is_finite()) {
+            return None;
+        }
+        let (mut start_s, mut end_s) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut low_hz, mut high_hz) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &(t, f) in &outline {
+            start_s = start_s.min(t);
+            end_s = end_s.max(t);
+            low_hz = low_hz.min(f);
+            high_hz = high_hz.max(f);
+        }
+        (end_s > start_s && high_hz > low_hz).then_some(Self {
+            start_s,
+            end_s,
+            low_hz,
+            high_hz,
+            outline,
+        })
+    }
+
+    /// Whether this selection was drawn free-form (has an outline).
+    pub fn is_free_form(&self) -> bool {
+        !self.outline.is_empty()
+    }
+
+    /// Returns the same selection with start ≤ end and low ≤ high, which is
+    /// what you get no matter in which direction the user dragged. The
+    /// outline (if any) is kept as drawn.
     pub fn normalized(self) -> Self {
         Self {
             start_s: self.start_s.min(self.end_s),
             end_s: self.start_s.max(self.end_s),
             low_hz: self.low_hz.min(self.high_hz),
             high_hz: self.low_hz.max(self.high_hz),
+            outline: self.outline,
         }
     }
 
     /// Global frame range `[first, last)` covered by the selection.
     pub fn frames(&self, cfg: StftConfig, sample_rate: u32) -> (i64, i64) {
-        let s = self.normalized();
+        let s = self.clone().normalized();
         let to_frame = |t: f64| t * sample_rate as f64 / cfg.hop as f64;
         let first = to_frame(s.start_s).floor() as i64;
         let last = (to_frame(s.end_s).ceil() as i64).max(first + 1);
         (first, last)
     }
 
-    /// Bin range `[low, high]` (inclusive) covered by the selection.
+    /// Bin range `[low, high]` (inclusive) covered by the selection (its
+    /// bounding box, for a free-form one).
     pub fn bins(&self, cfg: StftConfig, sample_rate: u32) -> (usize, usize) {
-        let s = self.normalized();
+        self.hz_to_bins(
+            self.low_hz.min(self.high_hz),
+            self.low_hz.max(self.high_hz),
+            cfg,
+            sample_rate,
+        )
+    }
+
+    /// Inclusive bin range covering `low_hz ..= high_hz`: the bins the
+    /// frequencies fall into, rounded outwards, so a band narrower than a
+    /// bin still covers one.
+    fn hz_to_bins(&self, low_hz: f32, high_hz: f32, cfg: StftConfig, sample_rate: u32) -> (usize, usize) {
         let max = cfg.bins() - 1;
-        let lo = (cfg.hz_to_bin(s.low_hz, sample_rate).floor().max(0.0) as usize).min(max);
-        let hi = (cfg.hz_to_bin(s.high_hz, sample_rate).ceil().max(0.0) as usize).clamp(lo, max);
+        let lo = (cfg.hz_to_bin(low_hz, sample_rate).floor().max(0.0) as usize).min(max);
+        let hi = (cfg.hz_to_bin(high_hz, sample_rate).ceil().max(0.0) as usize).clamp(lo, max);
         (lo, hi)
+    }
+
+    /// Whether the point `(seconds, Hz)` lies inside the selection.
+    pub fn contains(&self, t: f64, hz: f32) -> bool {
+        let s = self.clone().normalized();
+        if !(s.start_s..=s.end_s).contains(&t) || !(s.low_hz..=s.high_hz).contains(&hz) {
+            return false;
+        }
+        if !self.is_free_form() {
+            return true;
+        }
+        // Even-odd rule: a point is inside if a ray from it crosses the
+        // outline an odd number of times. Corners are counted half-open
+        // (one end of each edge only), so a ray through a corner is not
+        // counted twice.
+        let mut inside = false;
+        let n = self.outline.len();
+        for i in 0..n {
+            let (ta, fa) = self.outline[i];
+            let (tb, fb) = self.outline[(i + 1) % n];
+            if (fa > hz) != (fb > hz) {
+                let t_cross = ta + (tb - ta) * f64::from((hz - fa) / (fb - fa));
+                if t < t_cross {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
+    }
+
+    /// The bins the selection covers in each of its frames (see
+    /// [`Selection::frames`]): the cells the analysis treats as marked.
+    ///
+    /// A rectangle covers [`Selection::bins`] in every frame. A free-form
+    /// selection is cut at each frame's centre time, and every stretch of
+    /// frequencies inside the outline there becomes a bin range, rounded
+    /// outwards like [`Selection::bins`] so that a thin stroke still
+    /// covers a bin. A U-shaped outline thus marks two ranges in the
+    /// frames of the U's arms.
+    pub fn cells(&self, cfg: StftConfig, sample_rate: u32) -> MarkedCells {
+        let (f0, f1) = self.frames(cfg, sample_rate);
+        let (k0, k1) = self.bins(cfg, sample_rate);
+        let frames = (f1 - f0) as usize;
+        if !self.is_free_form() {
+            return MarkedCells::rect(frames, (k0, k1));
+        }
+        let s = self.clone().normalized();
+        // The outermost frames are centred slightly outside the outline
+        // (the frame range is rounded outwards); cutting there would find
+        // nothing, so the cut is clamped into the outline's time span.
+        // A margin of a millionth of the span keeps the cut off the very
+        // corners, where it would only touch the outline in a point.
+        let margin = (s.end_s - s.start_s) * 1e-6;
+        let rows = (f0..f1)
+            .map(|frame| {
+                let t =
+                    (frame as f64 * cfg.hop as f64 / sample_rate as f64).clamp(s.start_s + margin, s.end_s - margin);
+                // An odd crossing left over can only come from rounding at a
+                // corner; it encloses nothing and is ignored.
+                let crossings = self.crossings(t);
+                let (pairs, _) = crossings.as_chunks::<2>();
+                pairs
+                    .iter()
+                    .map(|&[lo, hi]| self.hz_to_bins(lo, hi, cfg, sample_rate))
+                    .collect()
+            })
+            .collect();
+        MarkedCells::from_rows(rows)
+    }
+
+    /// Frequencies (ascending) at which the vertical line at time `t`
+    /// crosses the outline. By the even-odd rule, consecutive pairs of
+    /// them enclose the stretches inside the selection.
+    fn crossings(&self, t: f64) -> Vec<f32> {
+        let n = self.outline.len();
+        let mut hz: Vec<f32> = (0..n)
+            .filter_map(|i| {
+                let (ta, fa) = self.outline[i];
+                let (tb, fb) = self.outline[(i + 1) % n];
+                // Half-open in time like in `contains`; edges parallel to
+                // the frequency axis are never crossed by a vertical line.
+                ((ta > t) != (tb > t)).then(|| fa + (fb - fa) * ((t - ta) / (tb - ta)) as f32)
+            })
+            .collect();
+        hz.sort_by(f32::total_cmp);
+        hz
+    }
+}
+
+/// The time-frequency cells of a selection, frame by frame: what the user
+/// marked. Rows are indexed from the selection's first frame (see
+/// [`Selection::frames`]); each holds disjoint, ascending, inclusive bin
+/// ranges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkedCells {
+    /// Bin ranges per frame.
+    rows: Vec<Vec<(usize, usize)>>,
+    /// Lowest marked bin of all frames (0 if nothing is marked).
+    pub k0: usize,
+    /// Highest marked bin of all frames (0 if nothing is marked).
+    pub k1: usize,
+}
+
+impl MarkedCells {
+    /// The same bins `k0 ..= k1` in each of `frames` frames.
+    pub fn rect(frames: usize, (k0, k1): (usize, usize)) -> Self {
+        Self {
+            rows: vec![vec![(k0, k1)]; frames],
+            k0,
+            k1,
+        }
+    }
+
+    /// Cells from bin ranges per frame (any order; overlapping and
+    /// touching ranges are merged).
+    pub fn from_rows(rows: Vec<Vec<(usize, usize)>>) -> Self {
+        let rows: Vec<Vec<(usize, usize)>> = rows
+            .into_iter()
+            .map(|mut row| {
+                row.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(row.len());
+                for (lo, hi) in row {
+                    match merged.last_mut() {
+                        Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+                        _ => merged.push((lo, hi)),
+                    }
+                }
+                merged
+            })
+            .collect();
+        let k0 = rows.iter().filter_map(|r| r.first()).map(|r| r.0).min().unwrap_or(0);
+        let k1 = rows.iter().filter_map(|r| r.last()).map(|r| r.1).max().unwrap_or(0);
+        Self { rows, k0, k1 }
+    }
+
+    /// Number of frames.
+    pub fn frames(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The bin ranges of frame `t` (empty beyond the last frame).
+    pub fn row(&self, t: usize) -> &[(usize, usize)] {
+        self.rows.get(t).map_or(&[], Vec::as_slice)
+    }
+
+    /// The marked bins of frame `t`, ascending, limited to `bins` bins.
+    pub fn bins_in(&self, t: usize, bins: usize) -> impl Iterator<Item = usize> + '_ {
+        self.row(t)
+            .iter()
+            .flat_map(move |&(lo, hi)| lo..=hi.min(bins.saturating_sub(1)))
+    }
+
+    /// Whether bin `k` of frame `t` is marked.
+    pub fn contains(&self, t: usize, k: usize) -> bool {
+        self.row(t).iter().any(|&(lo, hi)| (lo..=hi).contains(&k))
+    }
+
+    /// Whether no cell at all is marked.
+    pub fn is_empty(&self) -> bool {
+        self.rows.iter().all(Vec::is_empty)
     }
 }
 
@@ -228,9 +461,9 @@ pub fn analyze_selection(
     .noise_power(&power, bins);
     let off = (f0 - ctx_start) as usize;
     let span = &power[off..off + (f1 - f0) as usize];
-    let (k0, k1) = selection.bins(cfg, sample_rate);
-    let mut analysis = analyze_power(span, f0, &noise_power, (k0, k1), params);
-    if channels.len() >= 2 && apply_direction(&mut analysis, channels, stft, (k0, k1), params) {
+    let marked = selection.cells(cfg, sample_rate);
+    let mut analysis = analyze_marked(span, f0, &noise_power, &marked, params);
+    if channels.len() >= 2 && apply_direction(&mut analysis, channels, stft, (marked.k0, marked.k1), params) {
         // The membership changed, so the template has to follow.
         analysis.template = crate::similar::Template::build(span, f0, &noise_power, &analysis.members());
         analysis.model = crate::share::SourceModel::build(span, &noise_power, &analysis, params.harmonic_tolerance);
@@ -348,15 +581,39 @@ pub fn apply_direction(
     true
 }
 
-/// Core of the analysis on precomputed power frames `power` (global frame
-/// index of the first one is `first_frame`), the noise power per bin and the
-/// marked bin range (inclusive). Split out so it can be tested on synthetic
-/// spectra.
+/// [`analyze_marked`] for a rectangle: the bins `k0 ..= k1` (inclusive)
+/// in every frame of `power`.
 pub fn analyze_power(
     power: &[Vec<f32>],
     first_frame: i64,
     noise: &[f32],
     (k0, k1): (usize, usize),
+    params: &AnalysisParams,
+) -> RegionAnalysis {
+    analyze_marked(
+        power,
+        first_frame,
+        noise,
+        &MarkedCells::rect(power.len(), (k0, k1)),
+        params,
+    )
+}
+
+/// Core of the analysis on precomputed power frames `power` (global frame
+/// index of the first one is `first_frame`), the noise power per bin and the
+/// cells the user marked (rows indexed like `power`). Split out so it can
+/// be tested on synthetic spectra.
+///
+/// Only the marked cells count as the user's: they make up the selected
+/// mask, the envelope and the pitch track (the loudest marked bin per
+/// frame). With a free-form selection drawn tightly around one sound, a
+/// neighbour inside the bounding box but outside the outline is thus not
+/// taken for part of the sound.
+pub fn analyze_marked(
+    power: &[Vec<f32>],
+    first_frame: i64,
+    noise: &[f32],
+    marked: &MarkedCells,
     params: &AnalysisParams,
 ) -> RegionAnalysis {
     let frames = power.len();
@@ -381,14 +638,18 @@ pub fn analyze_power(
         .collect();
 
     let mut selected = vec![vec![0.0f32; bins]; frames];
-    for t in 0..frames {
-        for k in k0..=k1.min(bins - 1) {
-            selected[t][k] = presence[t][k];
+    for (t, row) in selected.iter_mut().enumerate() {
+        for k in marked.bins_in(t, bins) {
+            row[k] = presence[t][k];
         }
     }
 
     // Envelope of the marked part and the frames in which it is active.
-    let envelope: Vec<f32> = weighted.iter().map(|f| f[k0..=k1.min(bins - 1)].iter().sum()).collect();
+    let envelope: Vec<f32> = weighted
+        .iter()
+        .enumerate()
+        .map(|(t, f)| marked.bins_in(t, bins).map(|k| f[k]).sum())
+        .collect();
     let peak = envelope.iter().cloned().fold(0.0f32, f32::max);
     let active: Vec<usize> = (0..frames)
         .filter(|&t| peak > 0.0 && envelope[t] > 0.1 * peak)
@@ -400,8 +661,9 @@ pub fn analyze_power(
     let mut pitch_track = vec![None; frames];
     for &t in &active {
         let row = &weighted[t];
-        let (mut best, mut best_v) = (k0, 0.0f32);
-        for (k, &v) in row.iter().enumerate().take(k1.min(bins - 1) + 1).skip(k0) {
+        let (mut best, mut best_v) = (0, 0.0f32);
+        for k in marked.bins_in(t, bins) {
+            let v = row[k];
             if v > best_v {
                 best = k;
                 best_v = v;
@@ -428,9 +690,8 @@ pub fn analyze_power(
     // A noise band has no pitch: its loudest bin is random. Following it
     // would report "partials" that are just other parts of the band
     // (issue #24), so such a selection is treated as the band itself.
-    let kk1 = k1.min(bins - 1);
-    let broadband = is_broadband(&pitch_track, &active, &weighted, (k0, kk1), params.harmonic_tolerance)
-        .then(|| noise_band(&weighted, &active, (k0, kk1)))
+    let broadband = is_broadband(&pitch_track, &active, &weighted, marked, params.harmonic_tolerance)
+        .then(|| noise_band(&weighted, &active, marked))
         .flatten();
     if broadband.is_some() {
         pitch_track.iter_mut().for_each(|p| *p = None);
@@ -583,7 +844,7 @@ fn is_broadband(
     pitch_track: &[Option<f32>],
     active: &[usize],
     weighted: &[Vec<f32>],
-    (k0, k1): (usize, usize),
+    marked: &MarkedCells,
     tolerance: f32,
 ) -> bool {
     // Mean share of the energy near the peak over the active frames.
@@ -592,12 +853,16 @@ fn is_broadband(
     for &t in active {
         let Some(p) = pitch_track[t] else { continue };
         let row = &weighted[t];
-        let total: f32 = row[k0..=k1].iter().map(|v| v * v).sum();
+        let total: f32 = marked.bins_in(t, row.len()).map(|k| row[k] * row[k]).sum();
         if total <= 0.0 {
             continue;
         }
         let (lo, hi) = band(p, (p * tolerance).max(2.0), row.len());
-        let near: f32 = row[lo.max(k0)..=hi.min(k1)].iter().map(|v| v * v).sum();
+        let near: f32 = marked
+            .bins_in(t, row.len())
+            .filter(|k| (lo..=hi).contains(k))
+            .map(|k| row[k] * row[k])
+            .sum();
         share_sum += near / total;
         frames += 1;
     }
@@ -622,14 +887,18 @@ fn is_broadband(
     peak_share < BROADBAND_MAX_PEAK_SHARE && jump_share > BROADBAND_MIN_JUMP_SHARE
 }
 
-/// Extent of a noise band: the bins in `k0 ..= k1` between which lie 95 %
-/// of the band's energy above the noise over the active frames (2.5 % cut
-/// off at either end, so a weak neighbour overlapping the selection's edge
-/// does not stretch the band). `None` if there is no such energy.
-fn noise_band(weighted: &[Vec<f32>], active: &[usize], (k0, k1): (usize, usize)) -> Option<(usize, usize)> {
-    let energy: Vec<f32> = (k0..=k1)
-        .map(|k| active.iter().map(|&t| weighted[t][k] * weighted[t][k]).sum())
-        .collect();
+/// Extent of a noise band: the marked bins between which lie 95 % of the
+/// band's energy above the noise over the active frames (2.5 % cut off at
+/// either end, so a weak neighbour overlapping the selection's edge does
+/// not stretch the band). `None` if there is no such energy.
+fn noise_band(weighted: &[Vec<f32>], active: &[usize], marked: &MarkedCells) -> Option<(usize, usize)> {
+    let k0 = marked.k0;
+    let mut energy = vec![0.0f32; marked.k1.saturating_sub(k0) + 1];
+    for &t in active {
+        for k in marked.bins_in(t, weighted[t].len()) {
+            energy[k - k0] += weighted[t][k] * weighted[t][k];
+        }
+    }
     let total: f32 = energy.iter().sum();
     if total <= 0.0 {
         return None;
@@ -729,6 +998,7 @@ mod tests {
             end_s: 1.7,
             low_hz: 280.0,
             high_hz: 470.0,
+            outline: Vec::new(),
         };
         let a = analyze_selection(
             &x,
@@ -807,6 +1077,7 @@ mod tests {
             end_s: 1.7,
             low_hz: 280.0,
             high_hz: 470.0,
+            outline: Vec::new(),
         };
         let run = |channels: &[Vec<f32>]| {
             analyze_selection(
@@ -909,6 +1180,7 @@ mod tests {
             end_s: 1.7,
             low_hz: 280.0,
             high_hz: 470.0,
+            outline: Vec::new(),
         };
         let a = analyze_selection(
             &mono,
@@ -969,6 +1241,7 @@ mod tests {
             end_s: 1.9,
             low_hz: 550.0,
             high_hz: 780.0,
+            outline: Vec::new(),
         };
         let a = analyze_selection(
             &x,
@@ -1037,6 +1310,7 @@ mod tests {
             end_s: 1.8,
             low_hz: 2000.0,
             high_hz: 22000.0,
+            outline: Vec::new(),
         };
         let a = analyze_selection(
             &x,
@@ -1082,6 +1356,7 @@ mod tests {
             end_s: 1.8,
             low_hz: 600.0,
             high_hz: 2800.0,
+            outline: Vec::new(),
         };
         let a = analyze_selection(
             &x,
@@ -1111,6 +1386,7 @@ mod tests {
             end_s: 1.7,
             low_hz: 5000.0,
             high_hz: 6000.0,
+            outline: Vec::new(),
         };
         let a = analyze_selection(
             &x,
@@ -1137,6 +1413,7 @@ mod tests {
             end_s: 0.8,
             low_hz: 250.0,
             high_hz: 500.0,
+            outline: Vec::new(),
         };
         let a = analyze_selection(
             &x,
@@ -1186,6 +1463,219 @@ mod tests {
         assert_eq!(r, vec![0.5, 1.5, 2.0, 3.0, 4.0]);
     }
 
+    /// The corners of a band `half_width` Hz either side of the curve
+    /// `f(t)`, sampled every `step` seconds from `t0` to `t1`: along the
+    /// lower edge forwards, then along the upper edge back.
+    fn band_outline(f: impl Fn(f64) -> f32, (t0, t1): (f64, f64), step: f64, half_width: f32) -> Vec<(f64, f32)> {
+        let n = ((t1 - t0) / step).round() as usize;
+        let times: Vec<f64> = (0..=n).map(|i| t0 + i as f64 * step).collect();
+        let lower = times.iter().map(|&t| (t, f(t) - half_width));
+        let upper = times.iter().rev().map(|&t| (t, f(t) + half_width));
+        lower.chain(upper).collect()
+    }
+
+    /// A "U": 600 Hz at the arms' tops, 300 Hz at the bottom.
+    const U: [(f64, f32); 6] = [
+        (1.0, 600.0),
+        (1.0, 300.0),
+        (2.0, 300.0),
+        (2.0, 600.0),
+        (1.8, 600.0),
+        (1.2, 600.0),
+    ];
+
+    /// A U with a gap between its arms: corners of the outline.
+    fn u_outline() -> Vec<(f64, f32)> {
+        vec![
+            (1.0, 600.0),
+            (1.0, 300.0),
+            (2.0, 300.0),
+            (2.0, 600.0),
+            (1.8, 600.0),
+            (1.8, 400.0),
+            (1.2, 400.0),
+            (1.2, 600.0),
+        ]
+    }
+
+    #[test]
+    fn free_form_needs_an_area_and_gets_its_bounding_box() {
+        assert!(Selection::free_form(vec![(0.0, 100.0), (1.0, 200.0)]).is_none());
+        assert!(Selection::free_form(vec![(0.0, 100.0), (1.0, 100.0), (2.0, 100.0)]).is_none());
+        assert!(Selection::free_form(vec![(0.0, 100.0), (f64::NAN, 1.0), (2.0, 300.0)]).is_none());
+        let s = Selection::free_form(U.to_vec()).unwrap();
+        assert!(s.is_free_form());
+        assert_eq!((s.start_s, s.end_s, s.low_hz, s.high_hz), (1.0, 2.0, 300.0, 600.0));
+        assert!(!Selection::rect(1.0, 0.0, 5.0, 1.0).is_free_form());
+    }
+
+    #[test]
+    fn contains_follows_the_outline() {
+        let u = Selection::free_form(u_outline()).unwrap();
+        assert!(u.contains(1.1, 500.0), "left arm");
+        assert!(u.contains(1.9, 500.0), "right arm");
+        assert!(u.contains(1.5, 350.0), "bottom");
+        assert!(!u.contains(1.5, 500.0), "the gap between the arms");
+        assert!(!u.contains(0.5, 350.0), "before the U");
+        // A rectangle contains its whole bounding box.
+        assert!(Selection::rect(1.0, 2.0, 300.0, 600.0).contains(1.5, 500.0));
+    }
+
+    #[test]
+    fn cells_of_a_rectangle_are_its_bins_in_every_frame() {
+        let cfg = StftConfig {
+            fft_size: 1000,
+            hop: 100,
+        };
+        let s = Selection::rect(1.0, 2.0, 100.0, 500.0);
+        let c = s.cells(cfg, 1000);
+        assert_eq!(c.frames(), 10);
+        assert!((0..10).all(|t| c.row(t) == [(100, 500)]));
+        assert_eq!((c.k0, c.k1), (100, 500));
+    }
+
+    #[test]
+    fn cells_of_a_u_mark_both_arms_but_not_the_gap() {
+        // 1 Hz per bin, 10 frames per second.
+        let cfg = StftConfig {
+            fft_size: 2000,
+            hop: 200,
+        };
+        let u = Selection::free_form(u_outline()).unwrap();
+        let c = u.cells(cfg, 2000);
+        assert_eq!(c.frames(), 10);
+        // Frame 0 (t = 1.0 s, clamped just inside): the left arm, all of it.
+        assert_eq!(c.row(0), [(300, 600)]);
+        // Frame 5 (t = 1.5 s): only the bottom of the U.
+        assert_eq!(c.row(5), [(300, 400)]);
+        assert!(c.contains(5, 350) && !c.contains(5, 500));
+        assert_eq!((c.k0, c.k1), (300, 600));
+        // Fully inside: a rectangle drawn free-form covers what the
+        // rectangle tool would.
+        let r = Selection::free_form(vec![(1.0, 100.0), (2.0, 100.0), (2.0, 500.0), (1.0, 500.0)]).unwrap();
+        assert_eq!(
+            r.cells(cfg, 2000),
+            Selection::rect(1.0, 2.0, 100.0, 500.0).cells(cfg, 2000)
+        );
+    }
+
+    #[test]
+    fn marked_cells_merge_overlapping_ranges() {
+        let c = MarkedCells::from_rows(vec![vec![(20, 30), (5, 10), (11, 12), (25, 40)], vec![]]);
+        assert_eq!(c.row(0), [(5, 12), (20, 40)]);
+        assert!(c.row(1).is_empty() && c.row(7).is_empty());
+        assert_eq!((c.k0, c.k1), (5, 40));
+        assert_eq!(c.bins_in(0, 8).collect::<Vec<_>>(), vec![5, 6, 7]);
+        assert!(!c.is_empty() && MarkedCells::from_rows(vec![vec![]]).is_empty());
+    }
+
+    #[test]
+    fn selections_keep_their_project_file_format() {
+        // A rectangle is saved exactly as before the free-form tool ...
+        let rect = serde_json::to_string(&Selection::rect(1.0, 2.0, 100.0, 500.0)).unwrap();
+        assert!(!rect.contains("outline"), "{rect}");
+        // ... so older projects load as rectangles ...
+        let old: Selection =
+            serde_json::from_str(r#"{"start_s":1.0,"end_s":2.0,"low_hz":100.0,"high_hz":500.0}"#).unwrap();
+        assert_eq!(old, Selection::rect(1.0, 2.0, 100.0, 500.0));
+        // ... and a free-form selection keeps its outline.
+        let u = Selection::free_form(u_outline()).unwrap();
+        let back: Selection = serde_json::from_str(&serde_json::to_string(&u).unwrap()).unwrap();
+        assert_eq!(back, u);
+    }
+
+    /// A call whose pitch sweeps down from 600 Hz to 300 Hz and back up
+    /// (a "U" in the spectrogram) with its octave, plus a louder tone at
+    /// 500 Hz from 0.6 to 1.4 s that sits inside the U's bounding box (not
+    /// longer, or the noise estimate would take it for background).
+    fn u_call(sr: u32, secs: f32) -> Vec<f32> {
+        let n = (sr as f32 * secs) as usize;
+        let mut rng = 4242u64;
+        let mut phase = 0.0f32;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                phase += 2.0 * std::f32::consts::PI * u_pitch(t as f64, secs as f64) / sr as f32;
+                let env = (std::f32::consts::PI * t / secs).sin();
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let noise = ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.002;
+                // Raised-cosine fades of 0.1 s at either end of the tone.
+                let fade = |x: f32| 0.5 - 0.5 * (std::f32::consts::PI * x.clamp(0.0, 1.0)).cos();
+                let tone = fade((t - 0.6) / 0.1) * fade((1.4 - t) / 0.1);
+                env * (0.3 * phase.sin() + 0.15 * (2.0 * phase).sin())
+                    + tone * 0.6 * (2.0 * std::f32::consts::PI * 500.0 * t).sin()
+                    + noise
+            })
+            .collect()
+    }
+
+    /// Pitch of [`u_call`] at `t` seconds.
+    fn u_pitch(t: f64, secs: f64) -> f32 {
+        let x = 2.0 * t / secs - 1.0;
+        (300.0 + 300.0 * x * x) as f32
+    }
+
+    #[test]
+    fn free_form_selection_follows_a_u_shaped_call_past_a_louder_tone() {
+        let (sr, secs) = (16000, 2.0);
+        let x = u_call(sr, secs);
+        let cfg = StftConfig {
+            fft_size: 1024,
+            hop: 256,
+        };
+        let stft = Stft::new(cfg);
+        let run = |sel: &Selection| {
+            analyze_selection(
+                &x,
+                NO_CHANNELS,
+                sr,
+                &stft,
+                sel,
+                &NoiseEstimate::default(),
+                &AnalysisParams::default(),
+            )
+        };
+        // Around the call only, 60 Hz either side of its pitch.
+        let lasso = Selection::free_form(band_outline(|t| u_pitch(t, secs as f64), (0.2, 1.8), 0.05, 60.0)).unwrap();
+        // The rectangle around the same call takes in the tone, too.
+        let rect = Selection::rect(lasso.start_s, lasso.end_s, lasso.low_hz, lasso.high_hz);
+        let (free, boxed) = (run(&lasso), run(&rect));
+
+        // In the middle the call is at 300 Hz, far from the tone.
+        let mid = free.first_frame + (free.frames / 2) as i64;
+        let i = (mid - free.first_frame) as usize;
+        let k_tone = cfg.hz_to_bin(500.0, sr).round() as usize;
+        let k_call = cfg.hz_to_bin(300.0, sr);
+        assert!(
+            boxed.frame(mid).unwrap().0[k_tone] > 0.5,
+            "the rectangle marks the tone"
+        );
+        assert_eq!(
+            free.frame(mid).unwrap().0[k_tone],
+            0.0,
+            "the outline leaves the tone out"
+        );
+        // So the pitch is tracked on the call, not on the louder tone ...
+        let tracked = free.pitch_track[i].expect("pitch in the middle");
+        assert!(
+            (tracked - k_call).abs() < 2.0,
+            "tracked bin {tracked}, call at {k_call}"
+        );
+        let boxed_track = boxed.pitch_track[i].expect("pitch in the middle");
+        assert!(
+            (boxed_track - k_tone as f32).abs() < 2.0,
+            "the rectangle follows the tone"
+        );
+        // ... and the call's octave is found along it.
+        let ratios: Vec<f32> = free.partials.iter().map(|p| p.ratio).collect();
+        assert!(ratios.contains(&2.0), "octave not found: {ratios:?}");
+        let k_octave = cfg.hz_to_bin(600.0, sr).round() as usize;
+        assert!(
+            free.frame(mid).unwrap().1[k_octave] > 0.5,
+            "octave at the bottom of the U"
+        );
+    }
+
     #[test]
     fn selection_normalizes_drag_direction() {
         let s = Selection {
@@ -1193,6 +1683,7 @@ mod tests {
             end_s: 1.0,
             low_hz: 900.0,
             high_hz: 100.0,
+            outline: Vec::new(),
         }
         .normalized();
         assert_eq!((s.start_s, s.end_s, s.low_hz, s.high_hz), (1.0, 2.0, 100.0, 900.0));

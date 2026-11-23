@@ -87,6 +87,7 @@ fn the_cricket_pulses_are_a_broadband_sound_without_partials() {
         end_s: 5.2,
         low_hz: 2000.0,
         high_hz: 20000.0,
+        outline: Vec::new(),
     };
     let a = analyze_selection(
         audio.mono(),
@@ -129,6 +130,7 @@ fn the_loud_cricket_bursts_come_from_the_marked_place() {
         end_s: 5.2,
         low_hz: 2000.0,
         high_hz: 20000.0,
+        outline: Vec::new(),
     };
     let a = analyze_selection(
         mono,
@@ -175,6 +177,7 @@ fn cricket_bursts_are_found_whole_and_without_blips() {
         end_s: 5.2,
         low_hz: 2000.0,
         high_hz: 20000.0,
+        outline: Vec::new(),
     };
     let a = analyze_selection(
         mono,

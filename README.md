@@ -19,6 +19,12 @@ extract them, together with everything the program finds to belong to them.
   A sound without a pitch (insect pulses, a hiss, rustling) is recognised as
   a noise band: then no partials are searched, the marked band itself is the
   sound, and the analysis reports its extent instead of a pitch.
+* **Free-form selections.** Sounds that are not rectangular in the
+  spectrogram (a U-shaped sweep, a slanted chirp, a call next to another
+  one) can be marked by drawing around them instead (toolbar, Filter >
+  *Free-form selection*, Ctrl+D). Only what lies inside the outline counts
+  as marked: a louder neighbour inside the rectangle that would enclose the
+  sound no longer steers the pitch track.
 * **Find the same sound elsewhere.** The marked sound, together with
   everything found to belong to it, becomes a spectro-temporal template. It
   is matched against the whole recording (normalised cross-correlation,
@@ -131,7 +137,7 @@ libraries.
 | Action | How |
 | --- | --- |
 | Open a recording | File > Open audio (Ctrl+O), "Open with" in the file manager, or pass it on the command line (`noiseextractor rec.flac birds.nxp` opens a recording and a project) |
-| Mark a sound | Drag a rectangle in the spectrogram |
+| Mark a sound | Drag a rectangle in the spectrogram, or draw around the sound after switching to *Free-form selection* (toolbar, Filter menu, Ctrl+D; Ctrl+R switches back to rectangles). Releasing the button closes the outline |
 | Turn it into a filter | *Suppress selection* or *Extract selection* |
 | Switch filters on / off | Click a filter's box, or press Space to switch all picked filters |
 | See what a filter does | Pick it in the filter list: its target is drawn (green / red / orange), for a noise reduction what it takes away (red); *Show in spectrogram* keeps it drawn when another filter is picked |
@@ -166,6 +172,8 @@ batch jobs or tests:
 noiseextractor-cli denoise in.flac -o clean.wav --noise-from 0.0:1.5 --save-project birds.nxp
 noiseextractor-cli mark in.flac --time 12.3:13.1 --freq 2000:4500 --name blackbird \
     --extract --project birds.nxp --save-project birds.nxp
+noiseextractor-cli mark in.flac --outline "1.0,600;1.5,250;2.0,600;2.0,700;1.5,350;1.0,700" \
+    --name swoop --project birds.nxp --save-project birds.nxp   # free-form: SECONDS,HZ corners
 noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract --save-project birds.nxp
 noiseextractor-cli process in.flac --project birds.nxp -o out.wav
 noiseextractor-cli process in.flac --project birds.nxp --solo 2,3 -o two-sounds.wav   # or --without 2,3
@@ -257,7 +265,7 @@ down to 0.17 GB for either, and it no longer grows with the length.
 * Tolerate repetitions that are faster/slower or transposed by more than a
   few bins (time-stretch and pitch-scale invariant matching).
 * Smoother adaptive noise estimate across chunk borders.
-* Undo/redo and editing a filter's rectangle after creating it.
+* Undo/redo and editing a filter's rectangle or outline after creating it.
 
 ## License
 

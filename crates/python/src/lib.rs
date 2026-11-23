@@ -369,13 +369,7 @@ fn mark(
     save_project: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
     let mut project = load_project(project.as_deref())?;
-    let selection = Selection {
-        start_s: time.0,
-        end_s: time.1,
-        low_hz: freq.0,
-        high_hz: freq.1,
-    }
-    .normalized();
+    let selection = Selection::rect(time.0, time.1, freq.0, freq.1);
     check(
         selection.end_s > selection.start_s && selection.high_hz > selection.low_hz,
         || "the marked time and frequency ranges must not be empty".into(),

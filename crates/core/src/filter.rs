@@ -1116,6 +1116,7 @@ mod tests {
                 end_s: 1.0,
                 low_hz: 0.0,
                 high_hz: 1.0,
+                outline: Vec::new(),
             },
             action,
         );
@@ -1441,6 +1442,7 @@ mod tests {
                 end_s: 2.0,
                 low_hz: 2000.0,
                 high_hz: 4000.0,
+                outline: Vec::new(),
             },
             FilterAction::Extract,
         ));

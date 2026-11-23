@@ -11,8 +11,10 @@
 //! when something changed.
 //!
 //! Mouse and keys on the spectrogram:
-//! * drag: mark a rectangle (time × frequency); the analysis immediately
-//!   shows what it thinks belongs to it (red / orange),
+//! * drag: mark a rectangle (time × frequency), or with the free-form
+//!   tool (toolbar, Filter > Free-form selection, Ctrl+D) draw around the
+//!   sound; the analysis immediately shows what it thinks belongs to it
+//!   (red / orange),
 //! * click: move the play head,
 //! * right-button drag: scrub (hear short pieces of audio under the
 //!   pointer, see `scrub.rs`),
@@ -95,7 +97,8 @@ use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use view::{format_time, Viewport};
+use view::{format_time, SelectTool, Stroke, Viewport};
+use wxdragon::dc::{Point as DcPoint, PolygonFillMode};
 use wxdragon::prelude::*;
 
 // Menu command ids.
@@ -135,6 +138,16 @@ const ID_ADD_EXTRACT: i32 = ID_HIGHEST + 21;
 const ID_LEARN_NOISE: i32 = ID_HIGHEST + 22;
 /// Filter > Find sounds (also a button in the filter pane).
 const ID_FIND_SOUNDS: i32 = ID_HIGHEST + 23;
+/// Filter > Rectangle selection ([`SelectTool::Rectangle`]).
+const ID_SELECT_RECT: i32 = ID_HIGHEST + 24;
+/// Filter > Free-form selection ([`SelectTool::FreeForm`]).
+const ID_SELECT_FREE: i32 = ID_HIGHEST + 25;
+
+/// The selection tools with their menu ids, in menu order.
+const SELECT_MENU: [(SelectTool, i32); 2] = [
+    (SelectTool::Rectangle, ID_SELECT_RECT),
+    (SelectTool::FreeForm, ID_SELECT_FREE),
+];
 
 /// The listening modes with their menu ids, in menu order.
 const LISTEN_MENU: [(Listen, i32); 3] = [
@@ -217,10 +230,14 @@ struct State {
     open_requests: Vec<PathBuf>,
     /// Visible window onto the recording.
     viewport: Option<Viewport>,
-    /// The current marked rectangle.
+    /// The current marked region (rectangle or free-form).
     selection: Option<Selection>,
     /// Mouse drag in progress: start and current pixel positions.
     drag: Option<((f32, f32), (f32, f32))>,
+    /// How a drag marks a region: rectangle or free-form.
+    select_tool: SelectTool,
+    /// The outline being drawn while a free-form drag is in progress.
+    stroke: Option<Stroke>,
     /// When the selected object is to be analysed again after its
     /// detection settings changed (debounced while a slider moves).
     reanalyse_at: Option<Instant>,
@@ -400,6 +417,8 @@ fn main() {
             viewport: None,
             selection: None,
             drag: None,
+            select_tool: SelectTool::default(),
+            stroke: None,
             reanalyse_at: None,
             last_params: Default::default(),
             scrub: None,
@@ -506,6 +525,17 @@ fn build_ui() -> Ui {
     // The filter pane's most used buttons, as menu commands so the toolbar
     // and keyboard can reach them too.
     let filter_menu = Menu::builder()
+        .append_radio_item(
+            ID_SELECT_RECT,
+            "&Rectangle selection\tCtrl+R",
+            "Dragging in the spectrogram marks a rectangle",
+        )
+        .append_radio_item(
+            ID_SELECT_FREE,
+            "&Free-form selection\tCtrl+D",
+            "Draw around the sound in the spectrogram (for shapes a rectangle does not fit)",
+        )
+        .append_separator()
         .append_item(
             ID_ADD_SUPPRESS,
             "&Suppress selection",
@@ -691,7 +721,8 @@ fn build_ui() -> Ui {
 /// What the spectrogram's colours mean and what the mouse does (Help >
 /// Colours and mouse).
 const LEGEND: &str = "Blue: remaining signal\nGreen: your selection\nRed: found to belong to it, also elsewhere, \
-                      or a found sound you picked\nOrange: both\n\nDrag to select, click to set the play head, \
+                      or a found sound you picked\nOrange: both\n\nDrag to select (Ctrl+D: draw around the sound instead, Ctrl+R: rectangles again), \
+                      click to set the play head, \
                       right-drag to scrub, the wheel zooms (Shift scrolls, Ctrl: frequency), Space plays.\n\
                       Ctrl+2 / Ctrl+3: hear the picked sound alone / removed, Ctrl+1: everything.";
 
@@ -792,6 +823,13 @@ fn bind_events(state: &Shared, ui: Ui) {
             }
         }
         ID_PLAY => toggle_play(&mut st.borrow_mut()),
+        id if SELECT_MENU.iter().any(|&(_, m)| m == id) => {
+            let tool = SELECT_MENU
+                .iter()
+                .find(|&&(_, m)| m == id)
+                .map_or(SelectTool::Rectangle, |&(t, _)| t);
+            set_select_tool(&mut st.borrow_mut(), ui, tool);
+        }
         id if LISTEN_MENU.iter().any(|&(_, m)| m == id) => {
             let mode = LISTEN_MENU
                 .iter()
@@ -870,6 +908,7 @@ fn bind_events(state: &Shared, ui: Ui) {
         ui.canvas.capture_mouse();
         if let Ok(mut s) = st.try_borrow_mut() {
             s.drag = Some((p, p));
+            s.stroke = (s.select_tool == SelectTool::FreeForm).then(|| Stroke::new(p));
         }
     });
     let st = state.clone();
@@ -878,6 +917,9 @@ fn bind_events(state: &Shared, ui: Ui) {
         let Ok(mut s) = st.try_borrow_mut() else { return };
         if let Some((start, _)) = s.drag {
             s.drag = Some((start, p));
+            if let Some(stroke) = s.stroke.as_mut() {
+                stroke.push(p);
+            }
             request_repaint();
         }
         if s.scrub.is_some() {
@@ -900,7 +942,11 @@ fn bind_events(state: &Shared, ui: Ui) {
         let Ok(mut s) = st.try_borrow_mut() else { return };
         let Some((start, cur)) = s.drag.take() else { return };
         let end = p.unwrap_or(cur);
-        finish_drag(&mut s, ui, start, end);
+        let stroke = s.stroke.take().map(|mut stroke| {
+            stroke.push(end);
+            stroke
+        });
+        finish_drag(&mut s, ui, start, end, stroke);
         request_repaint();
     });
     // Right button: scrub.
@@ -1543,6 +1589,30 @@ fn listen_picks(picked: &[usize], editing_selection: bool) -> Vec<Pick> {
     }
 }
 
+/// Switches the selection tool and keeps the Filter menu's radio items
+/// and the toolbar in step (either may have been used). The current
+/// selection stays; the tool only changes how the next drag marks.
+fn set_select_tool(s: &mut State, ui: Ui, tool: SelectTool) {
+    s.select_tool = tool;
+    if let Some(bar) = ui.frame.get_menu_bar() {
+        for (t, id) in SELECT_MENU {
+            bar.check_item(id, t == tool);
+        }
+    }
+    if let Some(tb) = ui.toolbar {
+        for (t, id) in SELECT_MENU {
+            tb.toggle_tool(id, t == tool);
+        }
+    }
+    report(
+        ui,
+        match tool {
+            SelectTool::Rectangle => "Drag a rectangle over the sound",
+            SelectTool::FreeForm => "Draw around the sound; releasing the button closes the outline",
+        },
+    );
+}
+
 /// Switches the listening mode, keeps the View menu's radio items in
 /// step (the mode may also be chosen elsewhere, e.g. a toolbar) and
 /// reprocesses; playback goes on and is heard in the new mode as soon as
@@ -1593,11 +1663,16 @@ fn with_current_filter(st: &Shared, _ui: Ui, change: impl FnOnce(&mut Filter)) {
 }
 
 /// Ends a mouse drag: a click moves the play head, a drag marks a
-/// selection and starts its analysis.
-fn finish_drag(s: &mut State, ui: Ui, start: (f32, f32), end: (f32, f32)) {
+/// selection and starts its analysis. `stroke` is the path drawn with the
+/// free-form tool (`None` with the rectangle tool).
+fn finish_drag(s: &mut State, ui: Ui, start: (f32, f32), end: (f32, f32), stroke: Option<Stroke>) {
     let Some(vp) = s.viewport else { return };
     let (_, h) = canvas_size(ui);
-    if (start.0 - end.0).abs() < 3.0 && (start.1 - end.1).abs() < 3.0 {
+    let click = match &stroke {
+        Some(stroke) => stroke.is_click(),
+        None => (start.0 - end.0).abs() < view::CLICK_SLOP_PX && (start.1 - end.1).abs() < view::CLICK_SLOP_PX,
+    };
+    if click {
         // A click: move the play head (and keep playing from there).
         s.playhead = vp.sample_at(end.0);
         if let Some(p) = s.doc.as_ref().and_then(|d| d.player.as_ref()) {
@@ -1607,9 +1682,18 @@ fn finish_drag(s: &mut State, ui: Ui, start: (f32, f32), end: (f32, f32)) {
         }
         return;
     }
-    let sel = vp.drag_to_selection(start, end, h);
-    s.selection = Some(sel);
-    // Show the rectangle immediately; the analysis fills in the masks. The
+    let sel = match &stroke {
+        Some(stroke) => match vp.stroke_to_selection(stroke.points(), h) {
+            Some(sel) => sel,
+            None => {
+                report(ui, "That outline encloses nothing; draw around the sound");
+                return;
+            }
+        },
+        None => vp.drag_to_selection(start, end, h),
+    };
+    s.selection = Some(sel.clone());
+    // Show the outline immediately; the analysis fills in the masks. The
     // detection settings last chosen carry over to the new selection.
     let mut preview = Filter {
         enabled: false,
@@ -1671,7 +1755,7 @@ fn start_analysis(s: &mut State, target: Target) {
     let noise = s.project.analysis_noise();
     let tx = s.tx.clone();
     let Some(e) = target_filter(s, target) else { return };
-    let (sel, params) = (e.selection, e.params.clone());
+    let (sel, params) = (e.selection.clone(), e.params.clone());
     std::thread::spawn(move || {
         let a = analyze_selection(
             audio.mono(),
@@ -1815,7 +1899,7 @@ fn start_discovery(s: &mut State, ui: Ui) {
         return;
     }
     let mut params = s.options.discover_params();
-    params.range_s = s.selection.map(|sel| (sel.start_s, sel.end_s));
+    params.range_s = s.selection.as_ref().map(|sel| (sel.start_s, sel.end_s));
     let audio = doc.audio.clone();
     let cfg = s.project.stft;
     let noise = s.project.analysis_noise();
@@ -1893,7 +1977,7 @@ fn move_filter(st: &Shared, ui: Ui, delta: i32) {
 /// to the mean spectrum of the selected time range.
 fn learn_noise(st: &Shared, ui: Ui) {
     let mut s = st.borrow_mut();
-    let (Some(sel), Some(doc)) = (s.selection, s.doc.as_ref()) else {
+    let (Some(sel), Some(doc)) = (s.selection.as_ref(), s.doc.as_ref()) else {
         report(ui, "Select a stretch that contains only background noise first");
         return;
     };
@@ -1941,7 +2025,7 @@ fn toggle_play(s: &mut State) {
         s.playhead = player.position();
         return;
     }
-    match s.selection {
+    match &s.selection {
         Some(sel) => {
             let sr = doc.audio.sample_rate as f64;
             player.play((sel.start_s * sr) as usize, Some((sel.end_s * sr) as usize));
@@ -2133,6 +2217,7 @@ fn tick(s: &mut State, ui: Ui) {
         playhead: Some(s.playhead),
         selection: s
             .selection
+            .as_ref()
             .map(|sel| ((sel.start_s * sr) as usize, (sel.end_s * sr) as usize)),
         view: s.viewport.map(|vp| vp.visible_range(w)),
     });
@@ -2188,11 +2273,33 @@ fn paint(s: &State, dc: &AutoBufferedPaintDC) {
 
     dc.set_brush(Colour::rgb(0, 0, 0), BrushStyle::Transparent);
     if let Some(sel) = &s.selection {
-        let (x, y, rw, rh) = vp.selection_rect(sel, h);
         dc.set_pen(Colour::rgb(120, 255, 120), 1, PenStyle::ShortDash);
-        dc.draw_rectangle(x, y, rw, rh);
+        if sel.is_free_form() {
+            let corners: Vec<DcPoint> = vp
+                .selection_outline(sel, h)
+                .into_iter()
+                .map(|(x, y)| DcPoint::new(x, y))
+                .collect();
+            dc.draw_polygon(&corners, 0, 0, PolygonFillMode::OddEven);
+        } else {
+            let (x, y, rw, rh) = vp.selection_rect(sel, h);
+            dc.draw_rectangle(x, y, rw, rh);
+        }
     }
-    if let Some(((x0, y0), (x1, y1))) = s.drag {
+    if let Some(stroke) = &s.stroke {
+        // The outline being drawn, closed back to its start the way it
+        // will be when the button is released.
+        dc.set_pen(Colour::rgb(255, 255, 255), 1, PenStyle::Dot);
+        let mut points: Vec<DcPoint> = stroke
+            .points()
+            .iter()
+            .map(|&(x, y)| DcPoint::new(x as i32, y as i32))
+            .collect();
+        points.extend(points.first().copied());
+        if points.len() >= 2 {
+            dc.draw_lines(&points, 0, 0);
+        }
+    } else if let Some(((x0, y0), (x1, y1))) = s.drag {
         dc.set_pen(Colour::rgb(255, 255, 255), 1, PenStyle::Dot);
         dc.draw_rectangle(
             x0.min(x1) as i32,

@@ -952,6 +952,7 @@ mod tests {
                     end_s: 1.3,
                     low_hz: 850.0,
                     high_hz: 1550.0,
+                    outline: Vec::new(),
                 },
                 FilterAction::Extract,
             ),
@@ -962,6 +963,7 @@ mod tests {
                     end_s: 1.0,
                     low_hz: 2300.0,
                     high_hz: 2500.0,
+                    outline: Vec::new(),
                 },
                 FilterAction::Suppress,
             ),
@@ -1034,6 +1036,7 @@ mod tests {
                     end_s: 0.75,
                     low_hz: 380.0,
                     high_hz: 500.0,
+                    outline: Vec::new(),
                 },
                 FilterAction::Suppress,
             );
