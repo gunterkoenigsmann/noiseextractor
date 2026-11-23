@@ -47,7 +47,7 @@ builds the extension module too, without linking libpython (PyO3's
 
 A release tag `vX.Y.Z` builds and tests all wheels. Uploading them to
 PyPI as version `X.Y.Z` needs a one-time setup by the owner of the PyPI
-project, after which every release tag publishes:
+project (done for v0.2.0), after which every release tag publishes:
 
 1. On pypi.org, *Your account*, *Publishing*: add a pending trusted
    publisher of type GitHub with project name `noiseextractor`, owner
@@ -57,11 +57,12 @@ project, after which every release tag publishes:
 2. On GitHub, *Settings*, *Environments*: create the environment `pypi`
    (optionally with required reviewers, so that each upload waits for a
    click).
-3. On GitHub, *Settings*, *Secrets and variables*, *Actions*,
-   *Variables*: add the repository variable `PYPI_PUBLISH` with the value
-   `true`. Without it the publish job is skipped, so release tags work
-   before PyPI is set up.
 
 No token is stored anywhere: PyPI trusts the workflow through GitHub's
-OIDC token. To publish an existing tag later, re-run the tag's *Python
-package* workflow run after the setup.
+OIDC token.
+
+To upload a release whose upload failed or was skipped: *Actions*,
+*Python package*, *Run workflow*, with `tag` set to the release tag (e.g.
+`v0.2.0`) and *publish* ticked. It builds and tests that tag's code with
+the current workflow and uploads it; files already on PyPI are skipped.
+(Re-running the tag's old run would use the workflow as it was then.)
