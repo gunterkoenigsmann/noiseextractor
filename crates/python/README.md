@@ -144,5 +144,8 @@ while it works and takes `threads=` (default: one per CPU core).
 
 ## License
 
-GPL-3.0-or-later. Source, issues and the desktop application:
+LGPL-3.0-or-later: you may use the package from programs under any
+license, open or closed; changes to noiseextractor itself must be shared
+under the same license. (The desktop application is GPL-3.0-or-later.)
+Source, issues and the desktop application:
 <https://github.com/gunterkoenigsmann/noiseextractor>.

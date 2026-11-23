@@ -11,6 +11,16 @@
   `crates/core` (headless) or through the CLI (`crates/cli/tests`).
 * Found a bug you are not fixing right now? File a GitHub issue.
 
+## Licenses
+
+* `crates/core`, `crates/cli` and `crates/python` are LGPL-3.0-or-later
+  (Gunter's decision, 2026-11-23), so other programs may use them as a
+  library; everything else, the GUI in particular, stays GPL-3.0-or-later.
+  Don't give those three crates a GPL-only dependency, and don't move code
+  from the GUI or from losslessaudiocut (GPL) into them without asking the
+  maintainer. Keep `crates/python/LICENSE` and `COPYING.LESSER` identical
+  to the repository's (CI compares them).
+
 ## Layout
 
 * `crates/core`: all signal processing and state that does not need a window.

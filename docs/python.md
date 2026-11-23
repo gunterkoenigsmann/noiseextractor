@@ -18,7 +18,7 @@ what such searches find, so keep them plain ("remove background noise",
 | `crates/python/src/lib.rs` | The extension module `noiseextractor._native` (PyO3). Thin: plain Python values in and out, float32 sample buffers as `bytes` (no NumPy needed on the Rust side), the work in `noiseextractor-core` and `noiseextractor-cli`'s library with the interpreter lock released. |
 | `crates/python/python/noiseextractor/` | The API users see: `denoise`, `process`, `mark`, `discover`, `spectrogram`, `new_project`, `load`, `denoise_array`, `process_array`, the result dataclasses, and the `noiseextractor-cli` entry point (`_cli.py`, which runs `noiseextractor_cli::run` in-process). |
 | `crates/python/pyproject.toml` | Package metadata for maturin. The version comes from `Cargo.toml`. |
-| `crates/python/LICENSE` | Copy of the repository's `LICENSE` (a license file must lie inside the package directory); CI checks that they agree. |
+| `crates/python/LICENSE`, `crates/python/COPYING.LESSER` | Copies of the repository's license files (license files must lie inside the package directory); CI checks that they agree. The package is LGPL-3.0-or-later, like `crates/core` and `crates/cli`. |
 | `crates/python/tests/` | pytest tests, run against an installed wheel. |
 | `.github/workflows/python.yml` | Builds, tests and publishes the wheels and the sdist. |
 
