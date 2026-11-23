@@ -22,3 +22,11 @@ rustc-ice-*.txt
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Python package (crates/python): the native module `maturin develop`
+# puts next to the sources, bytecode, virtual environments and wheels.
+crates/python/python/noiseextractor/*.so
+crates/python/python/noiseextractor/*.pyd
+__pycache__/
+.venv/
+dist/

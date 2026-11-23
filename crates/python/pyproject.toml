@@ -1,0 +1,73 @@
+# The Python package `noiseextractor`: a Python API and the command line
+# tool `noiseextractor-cli`, both on top of the same Rust code as the
+# desktop application. Built with maturin (docs/python.md).
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "noiseextractor"
+description = "Noise reduction and sound extraction for audio recordings: denoise field recordings, remove or isolate a bird song, cricket, hum or traffic noise with soft spectral masks that keep attack, decay and timbre"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+# A copy of the repository's LICENSE (python.yml checks that they agree):
+# a license file must lie inside the package directory.
+license-files = ["LICENSE"]
+authors = [{ name = "Gunter Königsmann" }]
+keywords = [
+    "audio",
+    "noise reduction",
+    "noise removal",
+    "denoise",
+    "denoising",
+    "noise suppression",
+    "source separation",
+    "sound extraction",
+    "spectral subtraction",
+    "spectrogram",
+    "bird song",
+    "bioacoustics",
+    "field recording",
+    "hum removal",
+    "wav",
+    "flac",
+    "mp3",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Multimedia :: Sound/Audio :: Editors",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+# From Cargo.toml (the workspace version).
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/gunterkoenigsmann/noiseextractor"
+Documentation = "https://github.com/gunterkoenigsmann/noiseextractor/blob/main/crates/python/README.md"
+Issues = "https://github.com/gunterkoenigsmann/noiseextractor/issues"
+
+[project.scripts]
+noiseextractor-cli = "noiseextractor._cli:main"
+
+[project.optional-dependencies]
+# NumPy is optional: the *_array functions accept and return NumPy arrays
+# when it is installed and array.array otherwise.
+numpy = ["numpy"]
+test = ["pytest>=8"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "noiseextractor._native"

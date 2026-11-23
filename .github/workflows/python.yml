@@ -1,0 +1,233 @@
+# The Python package `noiseextractor` (crates/python, docs/python.md):
+# wheels for Linux (x86_64, aarch64; manylinux_2_28), macOS (arm64,
+# x86_64) and Windows (x64), each with the Python API and the
+# `noiseextractor-cli` command, abi3 (one wheel per platform for every
+# CPython from 3.10 on). Every wheel is installed and tested with the
+# oldest and the newest supported Python.
+#
+# When it runs:
+#
+#   - pull requests that touch the package or the Rust code it wraps, and
+#     pushes to main: build and test, no upload.
+#   - tag vX.Y.Z: build, test and, once PyPI publishing is set up (the
+#     repository variable PYPI_PUBLISH is "true", see docs/python.md),
+#     publish version X.Y.Z.
+#   - workflow_dispatch: build and test the chosen branch.
+#
+# Uploading uses PyPI's trusted publishing (no token): the project on
+# pypi.org trusts this workflow file and the GitHub environment `pypi`.
+name: Python package
+
+on:
+  # No path filter for pushes: GitHub would skip release tags with one.
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/python.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: python-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - &license
+        name: The package's LICENSE is the repository's
+        shell: bash
+        run: cmp LICENSE crates/python/LICENSE
+      - uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.10
+            3.13
+      # Inside the manylinux_2_28 container, so the wheel runs on every
+      # distribution with glibc 2.28 or newer. The C encoders (LAME,
+      # libvorbis, libopus) are compiled from their vendored sources; the
+      # container has a C compiler and CMake.
+      - name: Build
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/python
+          target: ${{ matrix.arch }}
+          manylinux: "2_28"
+          args: --release --locked --out ${{ github.workspace }}/dist
+      - id: python
+        run: |
+          echo "old=$(command -v python3.10)" >> "$GITHUB_OUTPUT"
+          echo "new=$(command -v python3.13)" >> "$GITHUB_OUTPUT"
+      - &test
+        name: Test the wheel
+        shell: bash
+        env:
+          PY_OLD: ${{ steps.python.outputs.old }}
+          PY_NEW: ${{ steps.python.outputs.new }}
+        run: |
+          ls -l dist
+          # The oldest and the newest supported Python (abi3 covers the
+          # rest); the newest with NumPy, the oldest without, so both
+          # kinds of arrays are tested.
+          n=0
+          for py in "$PY_OLD" "$PY_NEW"; do
+            n=$((n + 1))
+            venv="$RUNNER_TEMP/venv-$n"
+            "$py" -m venv "$venv"
+            bin="$venv/bin"; [ -d "$bin" ] || bin="$venv/Scripts"
+            extra=""; [ "$py" = "$PY_NEW" ] && extra=numpy
+            "$bin/python" -m pip install -q dist/*.whl pytest $extra
+            # From a scratch directory, so the source tree's package (which
+            # lacks the native module) cannot shadow the installed one.
+            (cd "$RUNNER_TEMP" && "$bin/python" -m pytest -q -rs "$GITHUB_WORKSPACE/crates/python/tests")
+            "$bin/noiseextractor-cli" --version
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-latest }
+          - { arch: x86_64, runner: macos-15-intel }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      # Rust, the C encoders and the wheel tag all follow it.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - *license
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.10
+            3.13
+      - name: Build
+        run: |
+          python -m pip install -q "maturin>=1.9,<2"
+          cd crates/python
+          maturin build --release --locked --out "$GITHUB_WORKSPACE/dist"
+          # Nothing but system libraries may be linked.
+          unzip -o -q "$GITHUB_WORKSPACE"/dist/*.whl -d "$RUNNER_TEMP/whl"
+          otool -L "$RUNNER_TEMP"/whl/noiseextractor/_native*.so | tee "$RUNNER_TEMP/libs.txt"
+          if tail -n +2 "$RUNNER_TEMP/libs.txt" | grep -v -E '^\s+(/usr/lib/|/System/|@rpath/noiseextractor\._native)'; then
+            echo "::error::The module links a library outside the system."
+            exit 1
+          fi
+      - id: python
+        run: |
+          echo "old=$(command -v python3.10)" >> "$GITHUB_OUTPUT"
+          echo "new=$(command -v python3.13)" >> "$GITHUB_OUTPUT"
+      - *test
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-macos-${{ matrix.arch }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - *license
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.10
+            3.13
+      - name: Build
+        shell: bash
+        run: |
+          python -m pip install -q "maturin>=1.9,<2"
+          cd crates/python
+          maturin build --release --locked --out "$GITHUB_WORKSPACE/dist"
+      - id: python
+        shell: bash
+        run: |
+          echo "old=$(py -3.10 -c 'import sys; print(sys.executable)')" >> "$GITHUB_OUTPUT"
+          echo "new=$(py -3.13 -c 'import sys; print(sys.executable)')" >> "$GITHUB_OUTPUT"
+      - *test
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-windows-x64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/python
+          command: sdist
+          args: --out ${{ github.workspace }}/dist
+      # pip falls back to the sdist where no wheel fits; make sure it builds.
+      - name: A wheel builds from it
+        run: python3 -m pip wheel --no-deps -w "$RUNNER_TEMP/from-sdist" dist/*.tar.gz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: [linux, macos, windows, sdist]
+    # Only release tags, and only once the PyPI project trusts this
+    # workflow (docs/python.md, "Releasing").
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/noiseextractor/
+    permissions:
+      # The OIDC token that trusted publishing exchanges for an upload token.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A re-run after a partial upload must not fail on the files that
+          # are already there.
+          skip-existing: true
