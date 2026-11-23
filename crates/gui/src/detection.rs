@@ -276,6 +276,7 @@ mod tests {
             end_s: 1.0,
             low_hz: 100.0,
             high_hz: 200.0,
+            outline: Vec::new(),
         })
     }
 

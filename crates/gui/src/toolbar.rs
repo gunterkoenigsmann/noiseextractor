@@ -32,8 +32,9 @@ pub enum Item {
         icon: Icon,
     },
     /// One of a group of mutually exclusive buttons (adjacent radio items
-    /// form a group); shows which mode is on. The state is set from the
-    /// program with `ToolBar::toggle_tool`, see `set_listen` in `main.rs`.
+    /// form a group; any other item ends it); shows which mode is on. The
+    /// state is set from the program with `ToolBar::toggle_tool`, see
+    /// `set_listen` and `set_select_tool` in `main.rs`.
     Radio {
         /// Menu command id, shared with the radio menu item.
         id: i32,
@@ -48,8 +49,8 @@ pub enum Item {
     Separator,
 }
 
-/// The toolbar's contents, left to right: files, playback, building
-/// filters, view.
+/// The toolbar's contents, left to right: files, playback, marking and
+/// building filters, view.
 pub const ITEMS: &[Item] = &[
     Item::Tool {
         id: crate::ID_OPEN_AUDIO,
@@ -101,6 +102,18 @@ pub const ITEMS: &[Item] = &[
         icon: Icon::HearWithout,
     },
     Item::Separator,
+    Item::Radio {
+        id: crate::ID_SELECT_RECT,
+        label: "Rectangle",
+        help: "Drag a rectangle to mark a sound (Ctrl+R)",
+        icon: Icon::SelectRect,
+    },
+    Item::Radio {
+        id: crate::ID_SELECT_FREE,
+        label: "Free-form",
+        help: "Draw around a sound to mark it, for shapes a rectangle does not fit (Ctrl+D)",
+        icon: Icon::SelectFree,
+    },
     Item::Tool {
         id: crate::ID_ADD_SUPPRESS,
         label: "Suppress",
@@ -195,6 +208,10 @@ pub enum Icon {
     HearSolo,
     /// A speaker with the (red) picked sound struck out.
     HearWithout,
+    /// A dashed (green) rectangle with the pointer at a corner.
+    SelectRect,
+    /// A dashed (green) lasso loop around a U-shaped sweep.
+    SelectFree,
     /// The (green) selection with a (red) minus.
     Suppress,
     /// The (green) selection with an arrow out of it.
@@ -212,7 +229,7 @@ pub enum Icon {
 impl Icon {
     /// All icons, for tests.
     #[cfg(test)]
-    const ALL: [Icon; 14] = [
+    const ALL: [Icon; 16] = [
         Icon::OpenAudio,
         Icon::OpenProject,
         Icon::Save,
@@ -221,6 +238,8 @@ impl Icon {
         Icon::HearAll,
         Icon::HearSolo,
         Icon::HearWithout,
+        Icon::SelectRect,
+        Icon::SelectFree,
         Icon::Suppress,
         Icon::Extract,
         Icon::LearnNoise,
@@ -266,6 +285,12 @@ impl Icon {
             ),
             Icon::HearWithout => format!(
                 r#"{speaker}<path d="M12 9a4 4 0 0 1 0 6M15 6a8 8 0 0 1 0 12" {line}/><path d="M13 20L23 4" stroke="{found}" stroke-width="2.5" stroke-linecap="round"/>"#
+            ),
+            Icon::SelectRect => format!(
+                r#"<rect x="2" y="4" width="16" height="13" fill="none" stroke="{sel}" stroke-width="2" stroke-dasharray="3 2"/><path d="M15 14l7 3-3 1-1 3z" fill="{fg}"/>"#
+            ),
+            Icon::SelectFree => format!(
+                r#"<path d="M3 5C2 14 6 21 12 21S22 14 21 5c-1-3-4-2-4 1 0 5-2 9-5 9S7 11 7 6C7 3 4 2 3 5z" fill="none" stroke="{sel}" stroke-width="2" stroke-dasharray="3 2" stroke-linejoin="round"/><path d="M5 6c1 7 3 12 7 12s6-5 7-12" fill="none" stroke="{found}" stroke-width="1.6" stroke-linecap="round"/>"#
             ),
             Icon::Suppress => format!(
                 r#"<rect x="2" y="4" width="20" height="16" fill="none" stroke="{sel}" stroke-width="2" stroke-dasharray="3 2"/><path d="M7 12h10" stroke="{found}" stroke-width="3" stroke-linecap="round"/>"#
@@ -386,6 +411,8 @@ mod tests {
             crate::ID_HEAR_ALL,
             crate::ID_HEAR_SOLO,
             crate::ID_HEAR_WITHOUT,
+            crate::ID_SELECT_RECT,
+            crate::ID_SELECT_FREE,
         ];
         for (id, label, _, _) in tools() {
             assert!(menu_ids.contains(&id), "{label} has no menu command");
@@ -422,24 +449,35 @@ mod tests {
         }
     }
 
+    /// The ids of each run of adjacent radio tools: the radio groups
+    /// wxWidgets forms.
+    fn radio_groups() -> Vec<Vec<i32>> {
+        let mut groups: Vec<Vec<i32>> = Vec::new();
+        let mut in_group = false;
+        for item in ITEMS {
+            match *item {
+                Item::Radio { id, .. } => {
+                    if !in_group {
+                        groups.push(Vec::new());
+                    }
+                    if let Some(group) = groups.last_mut() {
+                        group.push(id);
+                    }
+                    in_group = true;
+                }
+                _ => in_group = false,
+            }
+        }
+        groups
+    }
+
     #[test]
-    fn radio_tools_cover_every_listening_mode_in_one_group() {
-        // The listening modes are one radio group: adjacent, in menu order.
-        let radios: Vec<usize> = ITEMS
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| matches!(it, Item::Radio { .. }))
-            .map(|(i, _)| i)
-            .collect();
-        assert!(radios.windows(2).all(|w| w[1] == w[0] + 1), "radio tools split");
-        let ids: Vec<i32> = radios
-            .iter()
-            .map(|&i| match ITEMS[i] {
-                Item::Radio { id, .. } => id,
-                _ => unreachable!(),
-            })
-            .collect();
-        assert_eq!(ids, crate::LISTEN_MENU.map(|(_, id)| id));
+    fn radio_tools_form_the_menus_radio_groups() {
+        // The listening modes and the selection tools are one radio group
+        // each: adjacent, in menu order, kept apart.
+        let listen: Vec<i32> = crate::LISTEN_MENU.iter().map(|&(_, id)| id).collect();
+        let select: Vec<i32> = crate::SELECT_MENU.iter().map(|&(_, id)| id).collect();
+        assert_eq!(radio_groups(), vec![listen, select]);
     }
 
     #[test]

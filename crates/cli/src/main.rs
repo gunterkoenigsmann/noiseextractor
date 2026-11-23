@@ -9,6 +9,8 @@
 //! noiseextractor-cli denoise in.flac -o clean.wav --save-project birds.nxp
 //! noiseextractor-cli mark in.flac --time 12.3:13.1 --freq 2000:4500 \
 //!     --name "blackbird" --extract --project birds.nxp --save-project birds.nxp
+//! noiseextractor-cli mark in.flac --outline "1.0,400;1.5,250;2.0,400;2.0,600;1.5,450;1.0,600" \
+//!     --name "swoop" --project birds.nxp --save-project birds.nxp
 //! noiseextractor-cli discover in.flac --sounds 6 --enable 2 --extract \
 //!     --save-project birds.nxp
 //! noiseextractor-cli process in.flac --project birds.nxp -o out.wav
@@ -127,11 +129,16 @@ enum Command {
         /// Input audio file.
         input: PathBuf,
         /// Time range "START:END" in seconds.
-        #[arg(long)]
-        time: String,
+        #[arg(long, required_unless_present = "outline", requires = "freq")]
+        time: Option<String>,
         /// Frequency range "LOW:HIGH" in Hz.
-        #[arg(long)]
-        freq: String,
+        #[arg(long, requires = "time")]
+        freq: Option<String>,
+        /// Free-form region instead of a rectangle: the corners of a
+        /// polygon as "SECONDS,HZ" pairs separated by ";", e.g.
+        /// "1.0,400;1.5,250;2.0,400;2.0,600;1.5,450;1.0,600" for a U.
+        #[arg(long, conflicts_with_all = ["time", "freq"], allow_hyphen_values = true)]
+        outline: Option<String>,
         /// Name of the new filter.
         #[arg(long, default_value = "Marked noise")]
         name: String,
@@ -323,6 +330,7 @@ fn run(cli: Cli) -> Result<()> {
             input,
             time,
             freq,
+            outline,
             name,
             extract,
             project,
@@ -333,13 +341,15 @@ fn run(cli: Cli) -> Result<()> {
                 Some(p) => Project::load(&p)?,
                 None => Project::default(),
             };
-            let (start_s, end_s) = parse_range(&time)?;
-            let (low, high) = parse_range(&freq)?;
-            let selection = Selection {
-                start_s,
-                end_s,
-                low_hz: low as f32,
-                high_hz: high as f32,
+            let selection = match (outline, time, freq) {
+                (Some(outline), _, _) => parse_outline(&outline)?,
+                (None, Some(time), Some(freq)) => {
+                    let (start_s, end_s) = parse_range(&time)?;
+                    let (low, high) = parse_range(&freq)?;
+                    Selection::rect(start_s, end_s, low as f32, high as f32)
+                }
+                // clap insists on --outline or both --time and --freq.
+                _ => bail!("give --time and --freq, or --outline"),
             };
             let action = if extract {
                 FilterAction::Extract
@@ -456,6 +466,24 @@ fn parse_range(s: &str) -> Result<(f64, f64)> {
     let a: f64 = a.trim().parse().with_context(|| format!("not a number: {a:?}"))?;
     let b: f64 = b.trim().parse().with_context(|| format!("not a number: {b:?}"))?;
     Ok((a.min(b), a.max(b)))
+}
+
+/// Parses a free-form outline "SECONDS,HZ;SECONDS,HZ;..." (see `mark
+/// --outline`).
+fn parse_outline(s: &str) -> Result<Selection> {
+    let points = s
+        .split(';')
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| {
+            let (t, f) = p
+                .split_once(',')
+                .with_context(|| format!("expected SECONDS,HZ, got {p:?}"))?;
+            let t: f64 = t.trim().parse().with_context(|| format!("not a number: {t:?}"))?;
+            let f: f32 = f.trim().parse().with_context(|| format!("not a number: {f:?}"))?;
+            Ok((t, f))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Selection::free_form(points).context("an outline needs at least 3 corners enclosing an area")
 }
 
 /// Mean noise power spectrum of the stretch `start_s .. end_s`.

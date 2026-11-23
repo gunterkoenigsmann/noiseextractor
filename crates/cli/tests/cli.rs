@@ -112,6 +112,44 @@ fn mark_finds_overtone_and_extract_keeps_only_the_tone() {
 }
 
 #[test]
+fn mark_outline_saves_a_free_form_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    let project = dir.path().join("p.nxp");
+    write_test_audio(&input);
+    // A diamond around the tone (660 Hz, 1.0 .. 2.0 s).
+    let out = bin()
+        .arg("mark")
+        .arg(&input)
+        .args(["--outline", "1.1,660;1.5,560;1.9,660;1.5,780", "--save-project"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        report.contains("2.000 x pitch"),
+        "octave missing from report:\n{report}"
+    );
+    let p = Project::load(&project).unwrap();
+    let Some(noiseextractor_core::FilterKind::Event(e)) = p.filters.last().map(|f| &f.kind) else {
+        panic!("no event filter saved");
+    };
+    assert_eq!(e.selection.outline.len(), 4);
+    assert_eq!((e.selection.start_s, e.selection.high_hz), (1.1, 780.0));
+
+    // Too few corners, or --outline together with a rectangle, are errors.
+    for args in [
+        &["--outline", "1.1,660;1.5,560"][..],
+        &["--outline", "1.1,660;1.5,560;1.9,660", "--time", "1:2", "--freq", "1:2"],
+        &[][..],
+    ] {
+        let out = bin().arg("mark").arg(&input).args(args).output().unwrap();
+        assert!(!out.status.success(), "accepted {args:?}");
+    }
+}
+
+#[test]
 fn spectrogram_and_new_project_write_files() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.wav");
