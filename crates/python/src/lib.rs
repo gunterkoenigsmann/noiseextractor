@@ -351,29 +351,43 @@ fn report_dict<'py>(py: Python<'py>, r: &EventReport) -> PyResult<Bound<'py, PyD
     Ok(d)
 }
 
-/// Marks a time and frequency rectangle as a sound, analyses what belongs
-/// to it and where else it occurs, and adds it as a filter to `project`
-/// (or a new project). Returns the report dict; saves the extended project
-/// to `save_project` if given.
+/// Marks a part of a sound, analyses what belongs to it and where else it
+/// occurs, and adds it as a filter to `project` (or a new project). The
+/// part is a time and frequency rectangle (`time` and `freq`) or a
+/// free-form `outline` of `(seconds, Hz)` corners; the Python wrapper
+/// passes exactly one of them. Returns the report dict; saves the
+/// extended project to `save_project` if given.
 #[pyfunction]
-#[pyo3(signature = (input, time, freq, name, extract, project, save_project))]
+#[pyo3(signature = (input, time, freq, outline, name, extract, project, save_project))]
 #[allow(clippy::too_many_arguments)]
 fn mark(
     py: Python<'_>,
     input: PathBuf,
-    time: (f64, f64),
-    freq: (f32, f32),
+    time: Option<(f64, f64)>,
+    freq: Option<(f32, f32)>,
+    outline: Option<Vec<(f64, f32)>>,
     name: String,
     extract: bool,
     project: Option<PathBuf>,
     save_project: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
     let mut project = load_project(project.as_deref())?;
-    let selection = Selection::rect(time.0, time.1, freq.0, freq.1);
-    check(
-        selection.end_s > selection.start_s && selection.high_hz > selection.low_hz,
-        || "the marked time and frequency ranges must not be empty".into(),
-    )?;
+    let selection = match (outline, time, freq) {
+        (Some(outline), None, None) => Selection::free_form(outline).ok_or_else(|| {
+            CallError::Value("an outline needs at least 3 (seconds, Hz) corners enclosing an area".into())
+        })?,
+        (None, Some(time), Some(freq)) => {
+            let selection = Selection::rect(time.0, time.1, freq.0, freq.1);
+            check(
+                selection.end_s > selection.start_s && selection.high_hz > selection.low_hz,
+                || "the marked time and frequency ranges must not be empty".into(),
+            )?;
+            selection
+        }
+        _ => {
+            return Err(CallError::Value("mark needs either time and freq, or outline".into()).into());
+        }
+    };
     let action = if extract {
         FilterAction::Extract
     } else {

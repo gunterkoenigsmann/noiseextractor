@@ -12,6 +12,7 @@ signal processing itself is tested in depth by the Rust crates.
 from __future__ import annotations
 
 import array
+import json
 import math
 import struct
 import subprocess
@@ -143,6 +144,28 @@ def test_mark_finds_the_overtone_and_extracting_keeps_only_the_tone(recording, t
     (tone,), _ = read_wav(out)
     assert rms(tone[3000:12000]) < 0.2 * rms(samples[3000:12000]), "noise kept"
     assert rms(tone[20000:28000]) > 0.7 * rms(samples[20000:28000]), "tone lost"
+
+
+def test_mark_with_an_outline_saves_a_free_form_filter(recording, tmp_path) -> None:
+    path, _ = recording
+    project = tmp_path / "outline.nxp"
+    # A diamond around the 660 Hz tone instead of a rectangle.
+    diamond = [(1.2, 660), (1.4, 560), (1.6, 660), (1.4, 780)]
+    report = nx.mark(path, outline=diamond, name="tone", save_project=project)
+    lo, hi = report.pitch_hz
+    assert 600 < lo <= hi < 720
+    assert any(abs(p.ratio - 2.0) < 0.05 for p in report.partials), report.text
+    saved = json.loads(project.read_text())
+    selection = saved["filters"][-1]["kind"]["Event"]["selection"]
+    assert [tuple(c) for c in selection["outline"]] == [(t, float(f)) for t, f in diamond]
+    with pytest.raises(ValueError, match="3"):
+        nx.mark(path, outline=[(1.2, 660), (1.6, 660)])
+    with pytest.raises(ValueError, match="not both"):
+        nx.mark(path, outline=diamond, time=(1, 2), freq=(1, 2))
+    with pytest.raises(ValueError, match="pairs"):
+        nx.mark(path, outline=[1.2, 1.4, 1.6])
+    with pytest.raises(ValueError, match="or outline"):
+        nx.mark(path, time=(1, 2))
 
 
 def test_discover_suggests_and_enables(recording, tmp_path) -> None:

@@ -68,6 +68,17 @@ nx.process("garden.flac", "without-blackbird.wav", project="garden.nxp", without
 To suppress a sound (a dog, a cough), mark it without `extract=True` and
 run `nx.process("in.flac", "out.flac", project="garden.nxp")`.
 
+A sound that is not a rectangle in the spectrogram (a U-shaped sweep, a
+slanted chirp, a call right next to another one) can be marked by the
+corners of a polygon around it instead, as `(seconds, Hz)` pairs; only
+what lies inside counts as marked:
+
+```python
+nx.mark("garden.flac", outline=[(1.0, 600), (1.5, 250), (2.0, 600),
+                                (2.0, 700), (1.5, 350), (1.0, 700)],
+        name="swoop", project="garden.nxp", save_project="garden.nxp")
+```
+
 ## Find the sounds automatically
 
 ```python
@@ -119,7 +130,7 @@ noiseextractor-cli --help
 | Function | What |
 |---|---|
 | `denoise(input, output, *, reduction_db=18, rule="lsa", noise_from=None, normalize=None, format=None, bitrate=None, save_project=None)` | Background noise reduction. |
-| `mark(input, *, time, freq, name, extract=False, project=None, save_project=None)` | Mark part of a sound; returns a `MarkReport` and adds a filter to the project. |
+| `mark(input, *, time, freq, name, extract=False, project=None, save_project=None)` | Mark part of a sound; returns a `MarkReport` and adds a filter to the project. Instead of `time` and `freq`, `outline=[(seconds, Hz), ...]` marks a free-form region. |
 | `discover(input, *, sounds=6, time=None, grouping=True, enable=None, extract=False, project=None, save_project=None)` | Suggest a filter per sound found; returns `Suggestion`s. |
 | `process(input, output, *, project=None, solo=None, without=None, normalize=None, format=None, bitrate=None)` | Apply a project; `solo`/`without` keep or drop filters' sounds (numbered from 1). |
 | `denoise_array(samples, rate, ...)`, `process_array(samples, rate, ...)` | The same on samples in memory. |
