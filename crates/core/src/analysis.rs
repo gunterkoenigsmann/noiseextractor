@@ -202,9 +202,13 @@ impl Selection {
             .map(|frame| {
                 let t =
                     (frame as f64 * cfg.hop as f64 / sample_rate as f64).clamp(s.start_s + margin, s.end_s - margin);
-                self.crossings(t)
-                    .chunks_exact(2)
-                    .map(|pair| self.hz_to_bins(pair[0], pair[1], cfg, sample_rate))
+                // An odd crossing left over can only come from rounding at a
+                // corner; it encloses nothing and is ignored.
+                let crossings = self.crossings(t);
+                let (pairs, _) = crossings.as_chunks::<2>();
+                pairs
+                    .iter()
+                    .map(|&[lo, hi]| self.hz_to_bins(lo, hi, cfg, sample_rate))
                     .collect()
             })
             .collect();
