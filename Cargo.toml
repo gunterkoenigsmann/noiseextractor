@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "crates/gui"]
+members = ["crates/core", "crates/cli", "crates/gui", "crates/python"]
 # The GUI pulls in wxWidgets (built from source on first build) and cpal, so
 # `cargo test` at the workspace root only builds the headless crates by
 # default. Use `cargo build -p noiseextractor` to build the GUI.
-default-members = ["crates/core", "crates/cli", "crates/gui"]
+default-members = ["crates/core", "crates/cli", "crates/gui", "crates/python"]
 
 [workspace.package]
 version = "0.1.0"

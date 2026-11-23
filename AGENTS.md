@@ -29,6 +29,16 @@
   of the maintainer's own recordings, GPL; keep them to a few hundred kB
   and list them in the README there).
 * `crates/cli`: thin front end; `tests/cli.rs` holds end-to-end tests.
+  It is a library plus a two-line `main.rs`, so the Python package runs
+  the same command in-process; `report.rs` turns analysis results into
+  data and the text `mark`/`discover` print.
+* `crates/python`: the `noiseextractor` package on PyPI (PyO3, maturin;
+  `docs/python.md`). Thin Rust layer (`src/lib.rs`, plain values in and
+  out, interpreter lock released), typed API in
+  `python/noiseextractor/__init__.py`, pytest tests in `tests/` run
+  against the built wheel by `.github/workflows/python.yml`. A new CLI
+  feature usually wants a Python function too, with a test and a line in
+  the package README (which PyPI shows).
 * `crates/gui`: wxDragon front end with AUI panes (`panes.rs`). The view
   models are pure and unit-tested (`view.rs`, `overview.rs`, `scrub.rs`,
   `detection.rs`, the `Log` in `log.rs`, `Declick` in `player.rs`,
