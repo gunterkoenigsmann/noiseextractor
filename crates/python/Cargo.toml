@@ -1,0 +1,31 @@
+[package]
+name = "noiseextractor-python"
+description = "Python bindings of noiseextractor (the `noiseextractor` package on PyPI), built with maturin."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# The extension module `noiseextractor._native` (see pyproject.toml).
+name = "_native"
+crate-type = ["cdylib"]
+# A test binary would have to link libpython; the Python tests in tests/
+# exercise this crate through the built package instead (pytest).
+test = false
+doctest = false
+
+[dependencies]
+noiseextractor-core.workspace = true
+noiseextractor-cli = { path = "../cli" }
+anyhow.workspace = true
+# abi3-py310: one wheel per platform for every CPython from 3.10 on.
+# generate-import-lib: Windows links python3.dll without a Python
+# installation that ships its import library.
+# extension-module: never link libpython, also in plain `cargo build
+# --workspace` runs.
+pyo3 = { version = "0.30.1", features = ["abi3-py310", "generate-import-lib", "extension-module"] }
+
+[build-dependencies]
+pyo3-build-config = "0.30.1"

@@ -93,6 +93,24 @@ On Linux there is also a snap (`sudo snap install noiseextractor`, or
 `noiseextractor.cli`). It is rebuilt every week so that it picks up Ubuntu's
 security updates; [docs/snap.md](docs/snap.md) has the details.
 
+## Python package
+
+```sh
+pip install noiseextractor
+```
+
+```python
+import noiseextractor as nx
+nx.denoise("field-recording.flac", "clean.flac")
+r = nx.mark("garden.flac", time=(12.3, 13.1), freq=(2000, 4500),
+            name="blackbird", extract=True, save_project="garden.nxp")
+nx.process("garden.flac", "blackbird.wav", project="garden.nxp")
+```
+
+The same filters from Python, on files or on NumPy arrays, plus the
+command-line tool below. See the package's
+[README](crates/python/README.md) and [docs/python.md](docs/python.md).
+
 ## Building
 
 You need a stable Rust toolchain, CMake and a C++ compiler. The GUI uses
