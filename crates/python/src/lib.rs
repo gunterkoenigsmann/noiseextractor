@@ -528,11 +528,8 @@ fn floats(data: &[u8]) -> CallResult<Vec<f32>> {
     check(data.len().is_multiple_of(4), || {
         "sample buffers hold 4 bytes per sample".into()
     })?;
-    Ok(data
-        .chunks_exact(4)
-        // chunks_exact(4) yields slices of exactly four bytes.
-        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
-        .collect())
+    // The length was checked above, so no bytes are left over.
+    Ok(data.as_chunks::<4>().0.iter().map(|b| f32::from_ne_bytes(*b)).collect())
 }
 
 /// Processes in-memory samples with `project` and returns the channels as
