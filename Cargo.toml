@@ -7,7 +7,7 @@ members = ["crates/core", "crates/cli", "crates/gui", "crates/python"]
 default-members = ["crates/core", "crates/cli", "crates/gui", "crates/python"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gunterkoenigsmann/noiseextractor"
